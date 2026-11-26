@@ -227,8 +227,8 @@ fn segment_pages_bind_empty_and_scoped_rows_to_one_authority() {
         let empty = query_segments_stream_page_backend(
             &backend,
             &SegmentScanQuery {
-                pane_id,
                 after_id,
+                pane_id,
                 ..SegmentScanQuery::default()
             },
         )

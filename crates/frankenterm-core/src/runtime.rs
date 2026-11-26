@@ -13234,8 +13234,9 @@ impl RuntimeHandle {
         shutdown_timeout: Duration,
     ) -> ShutdownSummary {
         let _ = cx.checkpoint();
-        self.shutdown_with_timeout_impl(shutdown_timeout, |_| async { Ok(()) })
-            .await
+        // The shutdown state machine is over 16 KiB. Box it once here, so
+        // neither this future nor any wrapper above it carries it inline.
+        Box::pin(self.shutdown_with_timeout_impl(shutdown_timeout, |_| async { Ok(()) })).await
     }
 
     /// Settle caller-owned durable state before publishing a clean session.
@@ -13260,8 +13261,8 @@ impl RuntimeHandle {
         Fut: Future<Output = std::result::Result<(), String>>,
     {
         let _ = cx.checkpoint();
-        self.shutdown_with_timeout_impl(shutdown_timeout, settle_external)
-            .await
+        // Boxed for the same reason as in shutdown_with_timeout_with_cx.
+        Box::pin(self.shutdown_with_timeout_impl(shutdown_timeout, settle_external)).await
     }
 
     /// Request graceful shutdown with an explicit task-join timeout.

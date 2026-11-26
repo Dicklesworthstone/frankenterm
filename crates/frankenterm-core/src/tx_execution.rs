@@ -9541,13 +9541,13 @@ mod tests {
                 1 => mission.lifecycle_state = crate::plan::MissionLifecycleState::Running,
                 2 => mission.updated_at_ms = Some(1_001),
                 3 => {
-                    mission.assignments[0].approval_state = crate::plan::ApprovalState::NotRequired
+                    mission.assignments[0].approval_state = crate::plan::ApprovalState::NotRequired;
                 }
                 4 => {
                     mission.assignments[0].outcome = Some(crate::plan::Outcome::Success {
                         reason_code: "claimed completion".into(),
                         completed_at_ms: 1_001,
-                    })
+                    });
                 }
                 5 => mission.pause_resume_state.total_pause_count = 1,
                 _ => {
@@ -9562,7 +9562,7 @@ mod tests {
                             reason: None,
                             requested_at_ms: 1_000,
                             expires_at_ms: None,
-                        })
+                        });
                 }
             }
             assert_eq!(

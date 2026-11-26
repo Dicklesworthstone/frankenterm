@@ -2313,10 +2313,10 @@ mod tests {
         );
 
         let mut debug = Redactor::with_debug_markers();
-        debug.custom_patterns = vec![
-            Regex::new("hidden").unwrap(),
-            Regex::new("custom_pattern").unwrap(),
-        ];
+        debug.custom_patterns = ["hidden", "custom_pattern"]
+            .into_iter()
+            .map(|pattern| Regex::new(pattern).unwrap())
+            .collect();
         assert_eq!(
             debug.redact_bounded("hidden", 128),
             Some(debug.redact("hidden"))

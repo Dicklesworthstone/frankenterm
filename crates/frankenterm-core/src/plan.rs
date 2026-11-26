@@ -9506,7 +9506,7 @@ mod tests {
     fn mission_authoring_bounds_metadata_text_and_action_kind() {
         let request = authored_draft_request();
         for id in [
-            "".to_string(),
+            String::new(),
             "not an id".to_string(),
             "é".to_string(),
             "x".repeat(129),
@@ -9527,7 +9527,7 @@ mod tests {
             );
         }
         for title in [
-            "".to_string(),
+            String::new(),
             " title".to_string(),
             "line\nspoof".to_string(),
             "x".repeat(257),
@@ -9964,7 +9964,7 @@ mod tests {
         let mission = pending_approval_mission(1);
         let request = approval_request(MissionAssignmentApprovalDecision::Approve);
         for actor in [
-            "".to_string(),
+            String::new(),
             " operator".to_string(),
             "actor\nspoof".to_string(),
             "x".repeat(129),
@@ -9981,7 +9981,7 @@ mod tests {
             );
         }
         for reason_code in [
-            "".to_string(),
+            String::new(),
             "contains spaces".to_string(),
             "path/secret".to_string(),
             "é".to_string(),
