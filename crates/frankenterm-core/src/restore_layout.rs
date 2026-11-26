@@ -1237,6 +1237,18 @@ fn windows_drive_path_from_file_uri_path(path: &str) -> Option<String> {
 }
 
 fn normalize_restored_cwd(cwd: &str) -> Result<String, &'static str> {
+    normalize_restored_cwd_for_host(cwd, crate::wezterm::local_hostname())
+}
+
+/// [`normalize_restored_cwd`] against an explicit local hostname. A file URI
+/// authority naming this machine is local, as in
+/// [`CwdInfo`](crate::wezterm::CwdInfo): shell integration, including
+/// `ft setup`'s, reports OSC 7 cwds as `file://$HOST/...`, and the mux prefers
+/// that URI over the cwd it derives itself.
+fn normalize_restored_cwd_for_host(
+    cwd: &str,
+    local_hostname: Option<&str>,
+) -> Result<String, &'static str> {
     let raw_limit = if cwd.starts_with("file://") {
         MAX_ENCODED_RESTORED_CWD_BYTES
     } else {
@@ -1254,7 +1266,7 @@ fn normalize_restored_cwd(cwd: &str) -> Result<String, &'static str> {
                 .find('/')
                 .ok_or("file URI working directory has no absolute path")?;
             let authority = &rest[..slash];
-            if !authority.eq_ignore_ascii_case("localhost") {
+            if !crate::wezterm::cwd_host_is_local(authority, local_hostname) {
                 return Err("non-local file URI working directory requires a mux domain");
             }
             (&rest[slash..], true)
@@ -2568,6 +2580,10 @@ mod tests {
             r"C:\Users\x"
         );
         assert_eq!(
+            normalize_restored_cwd_for_host("file://SURFACE/C:/Users/x", Some("surface")).unwrap(),
+            r"C:\Users\x"
+        );
+        assert_eq!(
             normalize_restored_cwd(r"C:\Users\x").unwrap(),
             r"C:\Users\x"
         );
@@ -3312,7 +3328,29 @@ mod tests {
 
     #[test]
     fn normalize_cwd_rejects_non_local_file_uri_authority() {
-        assert!(normalize_restored_cwd("file://myhost/home/user").is_err());
+        assert!(normalize_restored_cwd_for_host("file://myhost/home/user", None).is_err());
+        assert!(
+            normalize_restored_cwd_for_host("file://otherhost/home/user", Some("Mac-mini.local"))
+                .is_err()
+        );
+    }
+
+    // OSC 7 from shell integration (ft setup's included) names this machine.
+    // Before this, every pane carrying such a cwd failed restore preflight.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_cwd_accepts_this_machines_hostname_authority() {
+        for uri in [
+            "file://Mac-mini.local/home/user",
+            "file://mac-mini/home/user",
+            "file://LOCALHOST/home/user",
+        ] {
+            assert_eq!(
+                normalize_restored_cwd_for_host(uri, Some("Mac-mini.local")).unwrap(),
+                "/home/user",
+                "{uri}"
+            );
+        }
     }
 
     #[test]

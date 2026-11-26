@@ -887,7 +887,7 @@ impl CwdInfo {
 }
 
 /// This machine's hostname, read once.
-fn local_hostname() -> Option<&'static str> {
+pub(crate) fn local_hostname() -> Option<&'static str> {
     static LOCAL_HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     LOCAL_HOSTNAME
         .get_or_init(|| {
@@ -903,7 +903,7 @@ fn local_hostname() -> Option<&'static str> {
 /// Whether a cwd URI host names this machine: `localhost`, or the local
 /// hostname compared case-insensitively, also when one side is the other's
 /// first label (`mac-mini` for `Mac-mini.local`).
-fn cwd_host_is_local(host: &str, local_hostname: Option<&str>) -> bool {
+pub(crate) fn cwd_host_is_local(host: &str, local_hostname: Option<&str>) -> bool {
     fn first_label(name: &str) -> &str {
         name.split('.').next().unwrap_or(name)
     }
