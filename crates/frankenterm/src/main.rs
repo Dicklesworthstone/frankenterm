@@ -101812,23 +101812,23 @@ fn workspace_bootstrap_pending_from_checks(checks: &[DiagnosticCheck]) -> bool {
         })
 }
 
+/// Up to four steps from the checks' recommendations: every error's first,
+/// then warnings', each in check order. Errors go first so that warnings
+/// reported earlier in the list cannot crowd a hard failure's remedy out.
 fn recommended_steps_from_checks(checks: &[DiagnosticCheck]) -> Vec<OperatorNextStep> {
     let mut steps = Vec::new();
-    for check in checks.iter().filter(|check| {
-        matches!(
-            check.status,
-            DiagnosticStatus::Warning | DiagnosticStatus::Error
-        )
-    }) {
-        if let Some(recommendation) = check.recommendation.as_deref() {
-            push_unique_operator_step(
-                &mut steps,
-                format!("Resolve {}", check.name),
-                recommendation,
-            );
-        }
-        if steps.len() >= 4 {
-            break;
+    for status in [DiagnosticStatus::Error, DiagnosticStatus::Warning] {
+        for check in checks.iter().filter(|check| check.status == status) {
+            if steps.len() >= 4 {
+                return steps;
+            }
+            if let Some(recommendation) = check.recommendation.as_deref() {
+                push_unique_operator_step(
+                    &mut steps,
+                    format!("Resolve {}", check.name),
+                    recommendation,
+                );
+            }
         }
     }
     steps
@@ -102819,9 +102819,9 @@ mod operator_guidance_tests {
     use super::{
         DiagnosticCheck, DiagnosticStatus, bounded_terminal_diagnostic,
         build_doctor_operator_guidance, build_session_recovery_guidance,
-        build_status_health_operator_guidance, session_persistence_is_healthy,
-        session_recovery_diagnostic_check, session_restore_lifecycle_needs_reconciliation,
-        workspace_bootstrap_pending_from_checks,
+        build_status_health_operator_guidance, recommended_steps_from_checks,
+        session_persistence_is_healthy, session_recovery_diagnostic_check,
+        session_restore_lifecycle_needs_reconciliation, workspace_bootstrap_pending_from_checks,
     };
     use frankenterm_core::session_restore::SessionDoctorReport;
 
@@ -102903,6 +102903,40 @@ mod operator_guidance_tests {
                 .next_steps
                 .iter()
                 .any(|step| { step.command == "Fix filesystem permissions before retrying" })
+        );
+    }
+
+    #[test]
+    fn doctor_guidance_keeps_an_error_step_behind_four_earlier_warnings() {
+        let mut checks: Vec<DiagnosticCheck> = (1..=4)
+            .map(|n| {
+                DiagnosticCheck::warning(
+                    format!("warning {n}"),
+                    "detail",
+                    format!("Fix warning {n}"),
+                )
+            })
+            .collect();
+        checks.push(DiagnosticCheck::error(
+            "database",
+            "schema mismatch",
+            "Recover the database",
+        ));
+
+        let steps = recommended_steps_from_checks(&checks);
+        let commands: Vec<&str> = steps.iter().map(|step| step.command.as_str()).collect();
+        assert_eq!(
+            commands,
+            [
+                "Recover the database",
+                "Fix warning 1",
+                "Fix warning 2",
+                "Fix warning 3"
+            ]
+        );
+        assert_eq!(
+            build_doctor_operator_guidance(&checks, None).status,
+            "blocked"
         );
     }
 
