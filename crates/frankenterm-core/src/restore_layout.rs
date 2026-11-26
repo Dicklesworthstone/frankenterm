@@ -1223,6 +1223,19 @@ fn validate_pane_tree(
     }
 }
 
+/// A Windows file URI carries its drive after the authority's slash
+/// (`file:///C:/Users/x`, which is how WezTerm reports a Windows pane's cwd),
+/// so its URI path `/C:/Users/x` is not an absolute Windows path; the local
+/// path is `C:\Users\x`. `None` unless `path` starts with `/` and a drive
+/// letter, colon and slash.
+#[cfg(any(windows, test))]
+fn windows_drive_path_from_file_uri_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let bytes = rest.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/')
+        .then(|| rest.replace('/', "\\"))
+}
+
 fn normalize_restored_cwd(cwd: &str) -> Result<String, &'static str> {
     let raw_limit = if cwd.starts_with("file://") {
         MAX_ENCODED_RESTORED_CWD_BYTES
@@ -1258,6 +1271,12 @@ fn normalize_restored_cwd(cwd: &str) -> Result<String, &'static str> {
         strict_percent_decode(path)?
     } else {
         path.to_string()
+    };
+    #[cfg(windows)]
+    let decoded = if is_file_uri {
+        windows_drive_path_from_file_uri_path(&decoded).unwrap_or(decoded)
+    } else {
+        decoded
     };
     if decoded.len() > MAX_RESTORED_CWD_BYTES {
         return Err("decoded working directory exceeds the restore byte limit");
@@ -2514,6 +2533,46 @@ mod tests {
         );
         assert_eq!(normalize_restored_cwd("/home/user").unwrap(), "/home/user");
         assert_eq!(normalize_restored_cwd("file:///").unwrap(), "/");
+    }
+
+    #[test]
+    fn windows_drive_file_uri_paths_map_to_native_drive_paths() {
+        assert_eq!(
+            windows_drive_path_from_file_uri_path("/C:/Users/x y/").as_deref(),
+            Some(r"C:\Users\x y\")
+        );
+        assert_eq!(
+            windows_drive_path_from_file_uri_path("/d:/").as_deref(),
+            Some(r"d:\")
+        );
+        for not_a_drive in ["/home/user", "/C:", "/C:x", "/1:/x", "C:/x", "//C:/x", "/"] {
+            assert_eq!(
+                windows_drive_path_from_file_uri_path(not_a_drive),
+                None,
+                "{not_a_drive}"
+            );
+        }
+    }
+
+    // WezTerm reports a Windows pane's cwd as file:///C:/...; before the drive
+    // mapping, every such pane failed restore preflight as not absolute.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_cwd_maps_windows_drive_file_uris() {
+        assert_eq!(
+            normalize_restored_cwd("file:///C:/Users/x%20y/").unwrap(),
+            r"C:\Users\x y\"
+        );
+        assert_eq!(
+            normalize_restored_cwd("file://localhost/C:/Users/x").unwrap(),
+            r"C:\Users\x"
+        );
+        assert_eq!(
+            normalize_restored_cwd(r"C:\Users\x").unwrap(),
+            r"C:\Users\x"
+        );
+        assert!(normalize_restored_cwd("file:///C:").is_err());
+        assert!(normalize_restored_cwd("file:///Users/x").is_err());
     }
 
     #[test]
