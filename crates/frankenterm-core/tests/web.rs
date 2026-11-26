@@ -107,8 +107,8 @@ mod web_tests {
     }
 
     async fn fetch_raw(addr: SocketAddr, raw_request: &[u8]) -> std::io::Result<String> {
-        // These are finite JSON/error responses, not SSE. Bound the entire
-        // exchange (including connect/write/EOF), not just connection retries.
+        // Finite JSON/error responses and terminal SSE refusals only. Bound
+        // the entire exchange, including connect/write/EOF, not just retries.
         const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
         timeout(Duration::from_secs(5), async {
             let mut last_err = None;
@@ -3632,6 +3632,14 @@ mod web_tests {
                     )
                     .unwrap();
                 }
+                let epoch = storage
+                    .get_segment_stream_snapshot_with_cx(
+                        &frankenterm_core::cx::for_request(),
+                        Some(7),
+                    )
+                    .await
+                    .unwrap()
+                    .cursor_epoch;
                 let event_bus = Arc::new(EventBus::new(64));
                 let limits = WebRuntimeLimits {
                     stream_keepalive_secs: 1,
@@ -3665,7 +3673,7 @@ mod web_tests {
                         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                         .find(|frame| frame["kind"] == "ready")
                         .context("delta ready frame")?;
-                    let cursor = format!("delta-v1:pane:7:{baseline}");
+                    let cursor = format!("delta-v2:{epoch}:pane:7:{baseline}");
                     ensure!(ready["data"]["cursor"] == cursor, "scoped tail checkpoint");
                     ensure!(ready["data"]["resume_after_id"] == baseline, "ID baseline");
                     ensure!(
@@ -3703,10 +3711,12 @@ mod web_tests {
                     let ready_raw =
                         read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
                     ensure!(
-                        ready_raw.lines().any(|line| line == "id: delta-v1:pane:7:20"),
+                        ready_raw
+                            .lines()
+                            .any(|line| line == format!("id: delta-v2:{epoch}:pane:7:20")),
                         "a new fresh stream captures the current tail"
                     );
-                    seed_delta_stream_segment(&storage, 30, i64::MIN, "after_clock_rollback")?;
+                    seed_delta_stream_segment(&storage, 30, 1, "after_clock_rollback")?;
                     let _ = event_bus.publish(Event::SegmentCaptured {
                         pane_id: 7,
                         seq: 30,
@@ -3718,7 +3728,7 @@ mod web_tests {
 
                     // No bus notification: the periodic repair scan must use
                     // the same ID boundary without a wall-clock cutoff.
-                    seed_delta_stream_segment(&storage, 40, -1, "without_notification")?;
+                    seed_delta_stream_segment(&storage, 40, 0, "without_notification")?;
                     let raw =
                         read_event_stream_until(&mut stream, &mut response, "delta", 2).await?;
                     ensure!(delta_stream_ids(&raw) == [30, 40], "lost wakeup repaired once");
@@ -3745,6 +3755,258 @@ mod web_tests {
                     .expect("delta cursor assertions");
                 assert_eq!(event_bus.subscriber_count(), 0);
             }
+        });
+    }
+
+    #[test]
+    fn stream_deltas_rejects_foreign_and_ahead_cursors_before_acknowledging_output() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (original, _original_tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let (replacement, _replacement_tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let old_segment = original
+                .append_segment(7, "original_database_output", None)
+                .await
+                .unwrap();
+            let replacement_segment = replacement
+                .append_segment(7, "replacement_database_output", None)
+                .await
+                .unwrap();
+            assert_eq!(old_segment.id, replacement_segment.id);
+            let cx = frankenterm_core::cx::for_request();
+            let original_snapshot = original
+                .get_segment_stream_snapshot_with_cx(&cx, Some(7))
+                .await
+                .unwrap();
+            let replacement_snapshot = replacement
+                .get_segment_stream_snapshot_with_cx(&cx, Some(7))
+                .await
+                .unwrap();
+            assert_ne!(
+                original_snapshot.cursor_epoch,
+                replacement_snapshot.cursor_epoch
+            );
+            let old_cursor = format!(
+                "delta-v2:{}:pane:7:{}",
+                original_snapshot.cursor_epoch, old_segment.id
+            );
+            let replacement_cursor = format!(
+                "delta-v2:{}:pane:7:0",
+                replacement_snapshot.cursor_epoch
+            );
+            let ahead_cursor = format!(
+                "delta-v2:{}:pane:7:{}",
+                replacement_snapshot.cursor_epoch,
+                replacement_snapshot.max_segment_id + 1
+            );
+            let event_bus = Arc::new(EventBus::new(64));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(replacement.clone())
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(18), async {
+                let requests = [
+                    (
+                        format!(
+                            "GET /stream/deltas?pane_id=7&cursor={old_cursor}&since_id=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        ),
+                        &old_cursor,
+                        "cursor_epoch_mismatch",
+                    ),
+                    (
+                        format!(
+                            "GET /stream/deltas?pane_id=7&cursor={replacement_cursor} HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: {old_cursor}\r\nConnection: close\r\n\r\n"
+                        ),
+                        &old_cursor,
+                        "cursor_epoch_mismatch",
+                    ),
+                    (
+                        format!(
+                            "GET /stream/deltas?pane_id=7&cursor={ahead_cursor} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        ),
+                        &ahead_cursor,
+                        "cursor_ahead_of_high_water",
+                    ),
+                ];
+                for (request, cursor, reason) in requests {
+                    // Reading through EOF proves the terminal response closes
+                    // instead of leaving EventSource to retry an opaque error.
+                    let raw = fetch_raw(addr, request.as_bytes()).await?;
+                    ensure!(extract_status(&raw) == 200, "observable SSE response");
+                    let frame = raw
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|frame| frame["kind"] == "cursor_discontinuity")
+                        .context("terminal cursor discontinuity frame")?;
+                    ensure!(frame["data"]["terminal"] == true, "terminal disposition");
+                    ensure!(frame["data"]["reason"] == reason, "discontinuity reason");
+                    ensure!(
+                        frame["data"]["resume_cursor"] == cursor.as_str(),
+                        "the rejected boundary stays in its original epoch"
+                    );
+                    ensure!(
+                        stream_frame_kind_count(&raw, "cursor_discontinuity") == 1,
+                        "one terminal frame"
+                    );
+                    ensure!(
+                        stream_frame_kind_count(&raw, "ready") == 0,
+                        "no checkpoint adoption"
+                    );
+                    ensure!(delta_stream_ids(&raw).is_empty(), "no foreign or skipped output");
+                    ensure!(
+                        !raw.lines().any(|line| line.starts_with("id:")),
+                        "a refusal cannot advance Last-Event-ID"
+                    );
+                    ensure!(
+                        !raw.contains("replacement_database_output"),
+                        "replacement content is not delivered"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                replacement.shutdown().await?;
+                original.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("delta epoch teardown deadline")
+                .expect("delta epoch teardown");
+            scenario
+                .expect("delta epoch scenario deadline")
+                .expect("delta epoch assertions");
+            assert_eq!(event_bus.subscriber_count(), 0);
+        });
+    }
+
+    #[test]
+    fn stream_deltas_reconnects_after_all_acknowledged_segments_are_pruned() {
+        use anyhow::{Context, ensure};
+
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let original = storage
+                .append_segment(7, "acknowledged_before_retention", None)
+                .await
+                .unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let limits = WebRuntimeLimits {
+                stream_keepalive_secs: 1,
+                stream_max_max_hz: 1000,
+                ..frankenterm_core::web::resolve_runtime_limits(None)
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus))
+                    .with_storage_event_tail(false)
+                    .with_runtime_limits(limits),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+            let scenario = Box::pin(timeout(Duration::from_secs(12), async {
+                let mut stream = TcpStream::connect(addr).await?;
+                stream
+                    .write_all(
+                        b"GET /stream/deltas?pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                let mut response = Vec::new();
+                let raw = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                let ready = raw
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|frame| frame["kind"] == "ready")
+                    .context("initial ready checkpoint")?;
+                let cursor = ready["data"]["cursor"]
+                    .as_str()
+                    .context("initial epoch-scoped cursor")?
+                    .to_owned();
+                ensure!(ready["data"]["resume_after_id"] == original.id, "initial tail");
+                drop(stream);
+
+                ensure!(
+                    storage.prune_segments_before(i64::MAX).await? == 1,
+                    "full retention"
+                );
+                let snapshot = storage
+                    .get_segment_stream_snapshot_with_cx(
+                        &frankenterm_core::cx::for_request(),
+                        Some(7),
+                    )
+                    .await?;
+                ensure!(snapshot.tail_segment_id == 0, "retained pane is empty");
+                ensure!(
+                    snapshot.max_segment_id == original.id,
+                    "the durable allocation boundary survives retention"
+                );
+
+                // Reconnect while there are no retained rows at all. This
+                // cursor is still valid even though MAX(output_segments.id)
+                // would be zero, and must not be reset to a fresh boundary.
+                let request = format!(
+                    "GET /stream/deltas?pane_id=7&cursor={cursor}&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                );
+                let mut stream = TcpStream::connect(addr).await?;
+                stream.write_all(request.as_bytes()).await?;
+                let mut response = Vec::new();
+                let raw = read_event_stream_until(&mut stream, &mut response, "ready", 1).await?;
+                ensure!(
+                    raw.lines().any(|line| line == format!("id: {cursor}")),
+                    "the empty retained tail preserves the acknowledged cursor"
+                );
+
+                // Exercise the production writer, without a wakeup: a reused
+                // row ID would be silently filtered by the replay boundary.
+                let next = storage
+                    .append_segment(7, "captured_after_retention", None)
+                    .await?;
+                ensure!(next.id > original.id, "capture IDs never reuse deleted rows");
+                let raw = read_event_stream_until(&mut stream, &mut response, "delta", 1).await?;
+                ensure!(
+                    delta_stream_ids(&raw) == [next.id],
+                    "post-retention output arrives once"
+                );
+                ensure!(raw.contains("captured_after_retention"), "retained replay content");
+                ensure!(
+                    !raw.contains("acknowledged_before_retention"),
+                    "no stale row content"
+                );
+                ensure!(
+                    stream_frame_kind_count(&raw, "cursor_discontinuity") == 0,
+                    "ordinary retention preserves the database epoch"
+                );
+                drop(stream);
+                Ok::<_, anyhow::Error>(())
+            }))
+            .await;
+            let teardown = timeout(Duration::from_secs(5), async {
+                server.shutdown().await?;
+                storage.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            teardown
+                .expect("delta retention teardown deadline")
+                .expect("delta retention teardown");
+            scenario
+                .expect("delta retention scenario deadline")
+                .expect("delta retention assertions");
+            assert_eq!(event_bus.subscriber_count(), 0);
         });
     }
 

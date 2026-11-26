@@ -4,6 +4,15 @@ import { createPaneOutput, mountPaneOutput } from "../../crates/frankenterm-brow
 import { handleFleetKey } from "../../crates/frankenterm-browser-ui/web/app.mjs";
 import { readFileSync } from "node:fs";
 
+const OUTPUT_EPOCH = "0123456789abcdef0123456789abcdef";
+const OTHER_OUTPUT_EPOCH = "ffffffffffffffffffffffffffffffff";
+const deltaCursor = (id, pane = "7", epoch = OUTPUT_EPOCH) => `delta-v2:${epoch}:pane:${pane}:${id}`;
+
+function assertResume(source, id, pane = "7") {
+  assert.equal(source.url.searchParams.get("cursor"), deltaCursor(id, pane));
+  assert.equal(source.url.searchParams.has("since_id"), false);
+}
+
 function fixture(options = {}) {
   const sources = [];
   const timers = new Map();
@@ -54,15 +63,17 @@ function fixture(options = {}) {
 }
 
 // The server writes resume_after_id as an integer token, even above 2^53.
-function readyPayload(pane, resume) {
-  const cursor = `delta-v1:pane:${pane}:${resume}`;
+function readyPayload(pane, resume, epoch = OUTPUT_EPOCH) {
+  const cursor = deltaCursor(resume, pane, epoch);
   return `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${pane},"resume_after_id":${resume},"cursor":${JSON.stringify(cursor)}}}`;
 }
 
 function control(source, kind, data = { pane_id: 7 }, inheritedId) {
   if (kind === "ready") {
-    const after = source.lastDelta ?? source.url.searchParams.get("since_id") ?? "0";
-    source.emit(kind, readyPayload(data.pane_id, after), inheritedId);
+    const token = source.url.searchParams.get("cursor");
+    const after = source.lastDelta ?? token?.split(":").at(-1) ?? source.url.searchParams.get("since_id") ?? "0";
+    const epoch = source.lastEpoch ?? token?.split(":")[1] ?? OUTPUT_EPOCH;
+    source.emit(kind, readyPayload(data.pane_id, after, epoch), inheritedId);
     return;
   }
   source.emit(kind, JSON.stringify({ schema: "ft.stream.v1", stream: "deltas", kind, data }), inheritedId);
@@ -77,7 +88,8 @@ function delta(source, id, content, pane = "7", overrides = {}) {
   const payload = `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":` +
     `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id},"content":${JSON.stringify(content)}}}`;
   source.lastDelta = id;
-  source.emit("delta", overrides.payload ?? payload, overrides.cursor ?? `delta-v1:pane:${pane}:${id}`);
+  source.lastEpoch = overrides.epoch ?? OUTPUT_EPOCH;
+  source.emit("delta", overrides.payload ?? payload, overrides.cursor ?? deltaCursor(id, pane, source.lastEpoch));
 }
 
 test("selection opens one pane-scoped, read-only live stream", () => {
@@ -111,7 +123,7 @@ test("fresh ready checkpoints survive quiet reconnect, pause and suspension with
       else if (action === "pause") { f.output.pause(); f.output.resume(); }
       else { f.output.suspend(); f.output.restore(); }
       if (action === "native") assert.equal(f.sources.length, 1);
-      else assert.equal(f.latest().url.searchParams.get("since_id"), baseline);
+      else assertResume(f.latest(), baseline, pane);
       assert.equal(f.output.snapshot().unanchored, false);
       f.latest().emit("ready", readyPayload(pane, baseline));
       const next = (BigInt(baseline) + 1n).toString();
@@ -128,13 +140,13 @@ test("fresh ready checkpoints survive quiet reconnect, pause and suspension with
 test("fresh ready rejects missing, inconsistent, malformed and wrong-scope checkpoints", () => {
   const valid = readyPayload("7", "9007199254740993");
   const cases = [
-    [readyPayload("7", "null"), "delta-v1:pane:7:0"],
-    [readyPayload("7", '"9007199254740993"'), "delta-v1:pane:7:9007199254740993"],
-    [readyPayload("7", "9223372036854775808"), "delta-v1:pane:7:9223372036854775808"],
-    [valid, ""], [valid, "1"], [valid, "delta-v1:all:9007199254740993"],
-    [valid, "delta-v1:pane:8:9007199254740993"],
-    [valid, "delta-v1:pane:7:9007199254740992"],
-    [valid.replace('"cursor":', '"ignored_cursor":'), "delta-v1:pane:7:9007199254740993"],
+    [readyPayload("7", "null"), deltaCursor("0")],
+    [readyPayload("7", '"9007199254740993"'), deltaCursor("9007199254740993")],
+    [readyPayload("7", "9223372036854775808"), deltaCursor("9223372036854775808")],
+    [valid, ""], [valid, "1"], [valid, `delta-v2:${OUTPUT_EPOCH}:all:9007199254740993`],
+    [valid, deltaCursor("9007199254740993", "8")],
+    [valid, deltaCursor("9007199254740992")],
+    [valid.replace('"cursor":', '"ignored_cursor":'), deltaCursor("9007199254740993")],
   ];
   for (const [payload, cursor] of cases) {
     const f = fixture(); f.output.select("7");
@@ -158,7 +170,110 @@ test("ready-only reconnect cannot jump ahead of its validated checkpoint", () =>
   assert.equal(f.output.snapshot().cursor, "9007199254740993");
   assert.equal(f.output.snapshot().text, "");
   f.retry();
-  assert.equal(f.latest().url.searchParams.get("since_id"), "9007199254740993");
+  assertResume(f.latest(), "9007199254740993");
+});
+
+test("a changed epoch in ready, delta or inherited control IDs stops without replacing accepted output", () => {
+  for (const kind of ["ready", "delta", "gap", "lag", "error"]) {
+    const f = fixture(); f.output.select("7");
+    const source = f.latest();
+    delta(source, "9007199254740993", "original history", "7", { sequence: "4" });
+    if (kind === "ready") {
+      source.fail(false);
+      source.emit("ready", readyPayload("7", "9007199254740994", OTHER_OUTPUT_EPOCH));
+    } else if (kind === "delta") {
+      delta(source, "9007199254740994", "replacement database", "7", { epoch: OTHER_OUTPUT_EPOCH });
+    } else {
+      control(source, kind, { pane_id: 7, code: "storage_error" }, deltaCursor("9007199254740993", "7", OTHER_OUTPUT_EPOCH));
+    }
+    const state = f.output.snapshot();
+    assert.equal(state.status, "discontinuous", kind);
+    assert.equal(state.terminal, true);
+    assert.equal(state.cursor, "9007199254740993");
+    assert.equal(state.resumeCursor, deltaCursor("9007199254740993"));
+    assert.equal(state.text, "original history");
+    assert.equal(state.sequence, "4");
+    assert.equal(source.closed, true);
+    assert.equal(f.timers.size, 0);
+    f.output.pause(); f.output.resume(); f.output.suspend(); f.output.restore();
+    source.fail(); delta(source, "9007199254740995", "late");
+    assert.equal(f.sources.length, 1);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.output.snapshot().status, "discontinuous");
+    assert.equal(f.output.snapshot().text, "original history");
+
+    // Only a deliberate new selection can choose the replacement history.
+    f.output.select("7", { retainedHistory: true });
+    assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+    assert.equal(f.latest().url.searchParams.has("cursor"), false);
+    f.latest().emit("ready", readyPayload("7", "0", OTHER_OUTPUT_EPOCH));
+    delta(f.latest(), "1", "explicit recovery", "7", { epoch: OTHER_OUTPUT_EPOCH, sequence: "0" });
+    assert.equal(f.output.snapshot().terminal, false);
+    assert.equal(f.output.snapshot().status, "connected");
+    assert.equal(f.output.snapshot().resumeCursor, deltaCursor("1", "7", OTHER_OUTPUT_EPOCH));
+    assert.equal(f.output.snapshot().text, "explicit recovery");
+  }
+});
+
+test("terminal discontinuities before ready preserve the original token and fence watchdogs", () => {
+  for (const reason of ["cursor_epoch_mismatch", "cursor_ahead_of_high_water", "high_water_regressed"]) {
+    const f = fixture(); f.output.select("7");
+    delta(f.latest(), "9", "keep this history");
+    f.latest().fail(); f.retry();
+    const source = f.latest();
+    assertResume(source, "9");
+    const deadline = f.timers.values().next().value.fn;
+    control(source, "cursor_discontinuity", {
+      code: "delta_cursor_discontinuity", terminal: true, reason,
+      resume_cursor: deltaCursor("9"), message: "PRIVATE storage detail",
+    });
+    deadline();
+    assert.equal(source.closed, true);
+    assert.equal(f.output.snapshot().status, "discontinuous");
+    assert.equal(f.output.snapshot().cursor, "9");
+    assert.equal(f.output.snapshot().resumeCursor, deltaCursor("9"));
+    assert.equal(f.output.snapshot().text, "keep this history");
+    assert.match(f.output.snapshot().error, new RegExp(reason));
+    assert.doesNotMatch(f.output.snapshot().error, /PRIVATE/);
+    f.output.suspend(); f.output.restore(); f.output.resume();
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.sources.length, 2);
+  }
+});
+
+test("malformed terminal diagnostics halt without adopting or displaying their cursor or text", () => {
+  for (const change of [
+    (data) => { data.code = "PRIVATE"; },
+    (data) => { data.reason = "PRIVATE"; },
+    (data) => { data.terminal = false; },
+    (data) => { data.resume_cursor = deltaCursor("10"); },
+    (data) => { data.resume_cursor = deltaCursor("9", "8"); },
+    (data) => { data.resume_cursor = deltaCursor("9", "7", OTHER_OUTPUT_EPOCH); },
+    () => "PRIVATE malformed JSON",
+  ]) {
+    const f = fixture(); f.output.select("7"); delta(f.latest(), "9", "accepted");
+    const data = { code: "delta_cursor_discontinuity", terminal: true,
+      reason: "cursor_epoch_mismatch", resume_cursor: deltaCursor("9") };
+    const raw = change(data);
+    f.latest().emit("cursor_discontinuity", raw ?? JSON.stringify({
+      schema: "ft.stream.v1", stream: "deltas", kind: "cursor_discontinuity", data,
+    }), deltaCursor("99", "7", OTHER_OUTPUT_EPOCH));
+    assert.equal(f.output.snapshot().terminal, true);
+    assert.equal(f.output.snapshot().resumeCursor, deltaCursor("9"));
+    assert.equal(f.output.snapshot().text, "accepted");
+    assert.match(f.output.snapshot().error, /invalid capture history discontinuity/);
+    assert.doesNotMatch(f.output.snapshot().error, /PRIVATE/);
+    assert.equal(f.timers.size, 0);
+  }
+});
+
+test("control frames cannot advance the native reconnect cursor beyond accepted output", () => {
+  const f = fixture(); f.output.select("7"); delta(f.latest(), "9", "accepted");
+  control(f.latest(), "gap", { pane_id: 7 }, deltaCursor("10"));
+  assert.equal(f.latest().closed, true);
+  assert.equal(f.output.snapshot().cursor, "9");
+  assert.equal(f.output.snapshot().text, "accepted");
+  f.retry(); assertResume(f.latest(), "9");
 });
 
 test("a hanging initial output connection is replaced without accepting a late pane response", () => {
@@ -196,7 +311,7 @@ test("native reconnect grace cannot be renewed by repeated errors and preserves 
   assert.equal(f.retry(), 25);
   assert.equal(first.closed, true);
   assert.equal(f.retry(), 1000);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "9007199254740993");
+  assertResume(f.latest(), "9007199254740993");
   delta(first, "9007199254740994", "late");
   delta(f.latest(), "9007199254740994", "after", "7", { sequence: "9007199254740993" });
   assert.equal(f.output.snapshot().text, "beforeafter");
@@ -277,7 +392,7 @@ test("retained history is explicit and resumes from the accepted row", () => {
   delta(f.latest(), "12", "old output");
   f.latest().fail();
   assert.equal(f.retry(), 1000);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "12");
+  assertResume(f.latest(), "12");
   assert.equal(f.output.snapshot().text, "old output");
   assert.equal(f.output.snapshot().unanchored, false);
 });
@@ -292,14 +407,14 @@ test("u64 pane and i64 segment identities never round through Number", () => {
   assert.equal(f.output.snapshot().text, "exact");
   f.latest().fail(); f.retry();
   assert.equal(f.latest().url.searchParams.get("pane_id"), pane);
-  assert.equal(f.latest().url.searchParams.get("since_id"), id);
+  assertResume(f.latest(), id, pane);
 });
 
 test("neighboring large numeric identities cannot masquerade as the selected pane", () => {
   const f = fixture();
   f.output.select("9007199254740992");
   delta(f.latest(), "9007199254740993", "wrong", "9007199254740993", {
-    cursor: "delta-v1:pane:9007199254740992:9007199254740993",
+    cursor: deltaCursor("9007199254740993", "9007199254740992"),
   });
   assert.equal(f.output.snapshot().text, "");
   assert.equal(f.output.snapshot().cursor, "0");
@@ -339,7 +454,7 @@ test("retention omissions remain visible after native or replacement reconnects 
     f.latest().fail(permanent);
     if (permanent) {
       f.retry();
-      assert.equal(f.latest().url.searchParams.get("since_id"), "100");
+      assertResume(f.latest(), "100");
     }
     control(f.latest(), "ready");
     // No gap event survives the disconnect; only retained rows can expose it.
@@ -348,12 +463,12 @@ test("retention omissions remain visible after native or replacement reconnects 
     assert.equal(f.output.snapshot().gapNotifications, 0);
     assert.equal(f.output.snapshot().text, "beforeafter");
     f.output.pause(); f.output.resume();
-    assert.equal(f.latest().url.searchParams.get("since_id"), "200");
+    assertResume(f.latest(), "200");
     control(f.latest(), "ready");
     assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
     delta(f.latest(), "300", " next", "7", { sequence: "14" });
     f.output.suspend(); f.output.restore();
-    assert.equal(f.latest().url.searchParams.get("since_id"), "300");
+    assertResume(f.latest(), "300");
     control(f.latest(), "ready");
     delta(f.latest(), "400", " final", "7", { sequence: "15" });
     const state = f.output.snapshot();
@@ -375,7 +490,7 @@ test("pause and page suspension retain the sequence needed to detect pruning whi
     delta(old, "110", "late", "7", { sequence: "11" });
     if (suspend) f.output.restore();
     else f.output.resume();
-    assert.equal(f.latest().url.searchParams.get("since_id"), "100");
+    assertResume(f.latest(), "100");
     delta(f.latest(), "200", "after", "7", { sequence: "13" });
     assert.equal(f.output.snapshot().text, "beforeafter");
     assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
@@ -453,7 +568,7 @@ test("malformed sequence metadata cannot append, advance a cursor, or erase cont
     assert.equal(state.sequenceDiscontinuities, 1);
     assert.equal(f.latest().closed, true);
     f.retry();
-    assert.equal(f.latest().url.searchParams.get("since_id"), "101");
+    assertResume(f.latest(), "101");
     delta(f.latest(), "103", "C", "7", { sequence: "11" });
     assert.equal(f.output.snapshot().sequenceDiscontinuities, 1);
     assert.equal(f.output.snapshot().text, "ABC");
@@ -463,7 +578,7 @@ test("malformed sequence metadata cannot append, advance a cursor, or erase cont
 test("control frames preserve received cursor and capture-gap evidence", () => {
   const f = fixture(); f.output.select("7");
   delta(f.latest(), "10", "A");
-  control(f.latest(), "gap", { pane_id: 7 }, "delta-v1:pane:7:10");
+  control(f.latest(), "gap", { pane_id: 7 }, deltaCursor("10"));
   control(f.latest(), "lag", { missed_count: 99 });
   control(f.latest(), "ready", { pane_id: 7 });
   const state = f.output.snapshot();
@@ -495,9 +610,11 @@ test("invalid selection has no effect on an existing stream", () => {
 
 test("bad frame, wrong scope, and overflowing cursor fail closed before admission", () => {
   const cases = [
-    { cursor: "1" }, { cursor: "delta-v1:all:2" }, { cursor: "delta-v1:pane:8:2" },
-    { cursor: "delta-v1:pane:7:9223372036854775808" }, { cursor: "delta-v1:pane:7:0" },
-    { cursor: "delta-v1:pane:7:3" },
+    { cursor: "1" }, { cursor: "delta-v1:pane:7:2" },
+    { cursor: `delta-v2:${OUTPUT_EPOCH}:all:2` }, { cursor: deltaCursor("2", "8") },
+    { cursor: deltaCursor("9223372036854775808") }, { cursor: deltaCursor("0") },
+    { cursor: deltaCursor("3") }, { cursor: deltaCursor("02") },
+    { cursor: deltaCursor("2", "07") }, { cursor: deltaCursor("2", "7", OUTPUT_EPOCH.toUpperCase()) },
     { payload: "not JSON" }, { payload: '{1:2}' },
     { payload: '{"schema":"other","stream":"deltas","kind":"delta","data":{}}' },
     { payload: '{"schema":"ft.stream.v1","stream":"events","kind":"delta","data":{}}' },
@@ -510,7 +627,7 @@ test("bad frame, wrong scope, and overflowing cursor fail closed before admissio
     assert.equal(f.output.snapshot().cursor, "1");
     assert.equal(f.output.snapshot().text, "accepted");
     assert.equal(f.latest().closed, true);
-    f.retry(); assert.equal(f.latest().url.searchParams.get("since_id"), "1");
+    f.retry(); assertResume(f.latest(), "1");
   }
 });
 
@@ -576,7 +693,7 @@ test("pause closes transport and resume uses the cursor without clearing output"
   assert.equal(old.closed, true); assert.equal(f.output.snapshot().status, "paused");
   delta(old, "13", "late"); f.output.resume(); f.output.resume();
   assert.equal(f.sources.length, 2);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "12");
+  assertResume(f.latest(), "12");
   delta(f.latest(), "13", "after"); assert.equal(f.output.snapshot().text, "beforeafter");
 });
 
@@ -593,7 +710,7 @@ test("page suspension cancels replacement timer and rejects its stale callback",
   f.output.suspend(); assert.equal(f.timers.size, 0);
   pending(); assert.equal(f.sources.length, 1);
   f.output.restore(); f.output.restore();
-  assert.equal(f.sources.length, 2); assert.equal(f.latest().url.searchParams.get("since_id"), "4");
+  assert.equal(f.sources.length, 2); assertResume(f.latest(), "4");
 });
 
 test("close clears captured text, identity, retry timer and received cursor", () => {
@@ -648,7 +765,7 @@ test("native reconnect must confirm the accepted replay boundary before returnin
     assert.equal(f.output.snapshot().status, "retrying");
     delta(original, next, "stale");
     f.retry();
-    assert.equal(f.latest().url.searchParams.get("since_id"), id);
+    assertResume(f.latest(), id);
     f.latest().emit("ready", readyPayload("7", "9007199254740991"));
     assert.equal(f.output.snapshot().status, "connected", "overlapping replay is safe");
     delta(f.latest(), id, "duplicate"); delta(f.latest(), next, "B");
@@ -667,7 +784,7 @@ test("data before ready cannot enter a fresh, historical, or natively reconnecti
       delta(source, "5", "A");
       source.fail(false);
     }
-    source.emit("delta", '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":7,"segment_id":12,"seq":1,"captured_at":1000,"content_len":90,"content":"B"}}', "delta-v1:pane:7:12");
+    source.emit("delta", '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":7,"segment_id":12,"seq":1,"captured_at":1000,"content_len":90,"content":"B"}}', deltaCursor("12"));
     assert.equal(source.closed, true, mode);
     assert.equal(f.output.snapshot().cursor, mode === "reconnecting" ? "5" : null);
     assert.equal(f.output.snapshot().text, mode === "reconnecting" ? "A" : "");
@@ -806,6 +923,30 @@ test("history button restarts only the pinned pane with explicit replay", () => 
   assert.match(f.nodes["pane-output-status"].textContent, /retained history/);
 });
 
+test("a terminal output history leaves text readable and offers only explicit recovery", () => {
+  const f = panelFixture(); f.panel.openSelected();
+  delta(f.latest(), "9", "accepted diagnostic");
+  control(f.latest(), "cursor_discontinuity", {
+    code: "delta_cursor_discontinuity", terminal: true,
+    reason: "cursor_epoch_mismatch", resume_cursor: deltaCursor("9"),
+  });
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "accepted diagnostic");
+  assert.match(f.nodes["pane-output-status"].textContent, /discontinuous/);
+  assert.match(f.nodes["pane-output-warnings"].textContent, /history changed/);
+  assert.equal(f.nodes["pane-output-pause"].disabled, true);
+  assert.equal(f.nodes["pane-output-history"].disabled, false);
+  f.panel.suspend(); f.panel.restore(); f.panel.render();
+  assert.equal(f.sources.length, 1);
+  assert.equal(f.timers.size, 0);
+  f.nodes["pane-output-history"].emit("click");
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.latest().url.searchParams.get("since_id"), "0");
+  assert.equal(f.latest().url.searchParams.has("cursor"), false);
+  assert.equal(f.output.snapshot().terminal, false);
+  assert.equal(f.nodes["pane-output-text"].value, "");
+});
+
 test("the panel keeps continuity warnings until explicit recovery and reports a pruned history prefix", () => {
   const f = panelFixture(); f.panel.openSelected();
   delta(f.latest(), "100", "before", "7", { sequence: "10" }); f.panel.render();
@@ -859,7 +1000,7 @@ test("panel search freezes output, selects literal matches, wraps and resumes fr
   f.nodes["pane-output-find-form"].emit("submit"); assert.equal(area.selectionStart, 0);
   f.nodes["pane-output-previous"].emit("click"); assert.equal(area.selectionStart, 8);
   f.nodes["pane-output-pause"].emit("click");
-  assert.equal(f.latest().url.searchParams.get("since_id"), "9");
+  assertResume(f.latest(), "9");
   assert.equal(f.output.snapshot().paused, false);
 });
 
@@ -938,7 +1079,7 @@ test("clearing copied selection reveals buffered text and explicit resume uses t
   f.nodes["pane-output-pause"].emit("click");
   assert.equal(area.selectionStart, area.selectionEnd);
   assert.equal(f.output.snapshot().paused, false);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "2");
+  assertResume(f.latest(), "2");
   delta(f.latest(), "3", "-next"); f.panel.render();
   assert.equal(area.value, "output-next");
 });
@@ -1011,7 +1152,7 @@ test("native copy pause remains explicit across page suspension", () => {
   assert.equal(f.output.snapshot().paused, true);
   f.nodes["pane-output-pause"].emit("click");
   assert.equal(f.output.snapshot().paused, false);
-  assert.equal(f.latest().url.searchParams.get("since_id"), "1");
+  assertResume(f.latest(), "1");
 });
 
 test("close and Escape clear sensitive retained output and restore canvas focus", () => {
@@ -1105,7 +1246,7 @@ function capturedDelta(source, hit, content, overrides = {}) {
     ',"captured_at":' + hit.capturedAt + ',"content_len":' + hit.contentLength +
     ',"content":' + JSON.stringify(content) + '}}';
   source.emit("delta", overrides.payload ?? payload,
-    overrides.cursor ?? "delta-v1:pane:" + hit.paneId + ":" + hit.segmentId);
+    overrides.cursor ?? deltaCursor(hit.segmentId, hit.paneId, overrides.epoch ?? OUTPUT_EPOCH));
 }
 
 test("a single historical capture refuses both older and later replay starts", () => {
@@ -1120,6 +1261,22 @@ test("a single historical capture refuses both older and later replay starts", (
     assert.equal(f.output.snapshot().text, "");
     assert.equal(f.timers.size, 0);
   }
+});
+
+test("a finite historical read cannot change epochs after accepting its ready boundary", () => {
+  const f = fixture();
+  const hit = captureHit();
+  f.output.selectCapture(hit);
+  control(f.latest(), "ready");
+  capturedDelta(f.latest(), hit, "another database", { epoch: OTHER_OUTPUT_EPOCH });
+  assert.equal(f.output.snapshot().status, "unavailable");
+  assert.equal(f.output.snapshot().terminal, true);
+  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().text, "");
+  assert.equal(f.latest().closed, true);
+  assert.equal(f.timers.size, 0);
+  f.output.suspend(); f.output.restore(); f.output.resume();
+  assert.equal(f.sources.length, 1);
 });
 
 test("historical inspection admits exactly one captured identity and never follows its pane", () => {
@@ -1292,7 +1449,7 @@ test("historical malformed, oversized, and server-error frames settle without pa
   for (const fault of ["json", "size", "error"]) {
     const f = fixture({ maxFrameChars: 400 });
     f.output.selectCapture(captureHit());
-    if (fault === "json") f.latest().emit("delta", "PRIVATE malformed content", "delta-v1:pane:7:12");
+    if (fault === "json") f.latest().emit("delta", "PRIVATE malformed content", deltaCursor("12"));
     if (fault === "size") capturedDelta(f.latest(), captureHit(), "x".repeat(401));
     if (fault === "error") control(f.latest(), "error", { code: "<PRIVATE>", message: "PRIVATE" });
     assert.equal(f.output.snapshot().status, "unavailable");

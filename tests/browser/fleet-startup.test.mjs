@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { mountFleetApp } from "../../crates/frankenterm-browser-ui/web/app.mjs";
 
+const OUTPUT_EPOCH = "0123456789abcdef0123456789abcdef";
+const deltaCursor = (id, pane = "7") => `delta-v2:${OUTPUT_EPOCH}:pane:${pane}:${id}`;
+
 const flush = async () => { for (let n = 0; n < 60; n++) await Promise.resolve(); };
 const deferred = () => {
   let resolve, reject;
@@ -178,7 +181,7 @@ function fixture(t, options = {}) {
     get("pane-output-id").value = id;
     get("pane-output-form").requestSubmit();
     const source = sources.at(-1);
-    const cursor = `delta-v1:pane:${id}:0`;
+    const cursor = deltaCursor("0", id);
     source.emit("ready", {
       data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${id},"resume_after_id":0,"cursor":${JSON.stringify(cursor)}}}`,
       lastEventId: cursor,
@@ -206,7 +209,7 @@ test("manual output and real history search work before either WASM import settl
   const source = f.sources.at(-1);
   source.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
     pane_id: 7, segment_id: 1, seq: 0, content: "<script>captured text</script>",
-  } }, "delta-v1:pane:7:1");
+  } }, deltaCursor("1"));
   f.frame();
   assert.equal(f.get("pane-output-text").value, "<script>captured text</script>");
   f.get("history-search-open").emit("click");
@@ -413,7 +416,7 @@ test("session disposal clears captured data and cannot resume on pageshow", asyn
   const outputSource = f.sources.at(-1);
   outputSource.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
     pane_id: 7, segment_id: 1, seq: 0, content: "private captured session output",
-  } }, "delta-v1:pane:7:1");
+  } }, deltaCursor("1"));
   f.frame();
   f.get("history-search-open").emit("click");
   f.get("history-query").value = "private query";
@@ -479,7 +482,7 @@ test("hiding aborts snapshots and search, closes output and rejects late results
   const output = f.sources.at(-1);
   output.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
     pane_id: 7, segment_id: 9, seq: 2, content: "retained before hiding",
-  } }, "delta-v1:pane:7:9");
+  } }, deltaCursor("9"));
   f.frame();
   f.get("history-search-open").emit("click");
   f.get("history-query").value = "needle";
@@ -497,7 +500,7 @@ test("hiding aborts snapshots and search, closes output and rejects late results
   assert.equal(f.get("history-results").children.length, 0);
   output.message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
     pane_id: 7, segment_id: 10, seq: 3, content: "late content must not be accepted",
-  } }, "delta-v1:pane:7:10");
+  } }, deltaCursor("10"));
   f.resolveSearch(new Response(JSON.stringify({ ok: true, data: {
     results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "late needle" }], total: 1,
   } }))); await flush();
@@ -509,7 +512,7 @@ test("hiding aborts snapshots and search, closes output and rejects late results
   assert.equal(f.viewers[0], model);
   const resumedOutput = f.sources.filter((source) => !source.closed && source.url.pathname.endsWith("/stream/deltas"));
   assert.equal(resumedOutput.length, 1);
-  assert.equal(resumedOutput[0].url.searchParams.get("since_id"), "9");
+  assert.equal(resumedOutput[0].url.searchParams.get("cursor"), deltaCursor("9"));
   assert.equal(f.get("pane-output-text").value, "retained before hiding");
   assert.equal(f.frames.size, 1);
   assert.equal(f.intervals.size, 1);
@@ -520,7 +523,7 @@ test("visibility resume preserves an explicit pane pause and its received cursor
   f.openPane();
   f.sources.at(-1).message("delta", { schema: "ft.stream.v1", stream: "deltas", kind: "delta", data: {
     pane_id: 7, segment_id: 9, seq: 2, content: "paused output",
-  } }, "delta-v1:pane:7:9");
+  } }, deltaCursor("9"));
   f.frame();
   f.get("pane-output-pause").emit("click");
   f.visibility("hidden"); f.visibility("visible"); await flush();
@@ -528,7 +531,7 @@ test("visibility resume preserves an explicit pane pause and its received cursor
   assert.equal(f.get("pane-output-pause").textContent, "Resume");
   assert.equal(f.get("pane-output-text").value, "paused output");
   f.get("pane-output-pause").emit("click");
-  assert.equal(f.sources.at(-1).url.searchParams.get("since_id"), "9");
+  assert.equal(f.sources.at(-1).url.searchParams.get("cursor"), deltaCursor("9"));
   assert.equal(f.sources.at(-1).closed, false);
 });
 

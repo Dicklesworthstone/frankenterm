@@ -27,11 +27,12 @@ export function decodeFrame(payload) {
 }
 
 function cursorFor(id, pane, allowZero = false) {
-  if (typeof id !== "string" || id.length > 64) return null;
-  const match = /^delta-v1:pane:([0-9]{1,20}):([0-9]{1,19})$/.exec(id);
-  if (!match || unsigned(match[1], U64_MAX) !== pane) return null;
-  const segment = unsigned(match[2], I64_MAX);
-  return segment !== null && (allowZero || segment !== "0") ? segment : null;
+  if (typeof id !== "string" || id.length > 128) return null;
+  const match = /^delta-v2:([0-9a-f]{32}):pane:(0|[1-9][0-9]{0,19}):(0|[1-9][0-9]{0,18})$/.exec(id);
+  if (!match || unsigned(match[2], U64_MAX) !== pane) return null;
+  const segment = unsigned(match[3], I64_MAX);
+  return segment !== null && (allowZero || segment !== "0")
+    ? { token: id, epoch: match[1], segment } : null;
 }
 
 function safeSuffix(text, limit) {
@@ -73,12 +74,14 @@ export function createPaneOutput({
   let suspended = false;
   let history = false;
   let received = null;
+  let receivedCursor = null;
   let receivedSequence = null;
   let sequenceDiscontinuities = 0;
   let sequenceRestarted = false;
   let retainedPrefixMissing = false;
   let status = "closed";
   let error = null;
+  let terminal = false;
   let gaps = 0;
   let unanchored = false;
   let discardedChars = 0;
@@ -87,7 +90,7 @@ export function createPaneOutput({
   let dirty = true;
   let textDirty = false;
   let text = "";
-  const eligible = () => pane !== null && !paused && !suspended && (capture === null || capturePending);
+  const eligible = () => pane !== null && !terminal && !paused && !suspended && (capture === null || capturePending);
 
   function clearReadyDeadline() {
     readyGeneration += 1;
@@ -177,6 +180,15 @@ export function createPaneOutput({
     retryMs = Math.min(RETRY_MAX_MS, retryMs * 2);
   }
 
+  function halt(reason) {
+    retire();
+    terminal = true;
+    capturePending = false;
+    status = capture === null ? "discontinuous" : "unavailable";
+    error = `${reason}. Open a pane or load retained history to choose the current capture history.`;
+    dirty = true;
+  }
+
   function open() {
     if (!eligible() || source !== null || timer !== null) return;
     status = capture === null ? "connecting" : "loading";
@@ -185,7 +197,7 @@ export function createPaneOutput({
     url.searchParams.set("pane_id", pane);
     url.searchParams.set("max_hz", "50");
     if (capture !== null) url.searchParams.set("since_id", (BigInt(capture.segmentId) - 1n).toString());
-    else if (received !== null) url.searchParams.set("since_id", received);
+    else if (receivedCursor !== null) url.searchParams.set("cursor", receivedCursor.token);
     else if (history) url.searchParams.set("since_id", "0");
     let candidate;
     try {
@@ -216,18 +228,41 @@ export function createPaneOutput({
             || value.kind !== message.type || !value.data || typeof value.data !== "object"
             || Array.isArray(value.data)) throw new Error("invalid frame envelope");
         const data = value.data;
+        if (message.type === "cursor_discontinuity") {
+          const boundary = cursorFor(data.resume_cursor, selectedPane, true);
+          const valid = data.code === "delta_cursor_discontinuity" && data.terminal === true
+            && ["cursor_epoch_mismatch", "cursor_ahead_of_high_water", "high_water_regressed"].includes(data.reason)
+            && boundary !== null && (receivedCursor === null
+              || (boundary.epoch === receivedCursor.epoch && BigInt(boundary.segment) <= BigInt(receivedCursor.segment)));
+          halt(valid ? `output history changed (${data.reason})` : "output: invalid capture history discontinuity");
+          return;
+        }
         if (!ready && message.type !== "ready" && message.type !== "error") {
           reconnect("output arrived before its replay boundary was confirmed");
           return;
         }
+        if (["gap", "lag", "error"].includes(message.type) && message.lastEventId) {
+          const inherited = cursorFor(message.lastEventId, selectedPane, true);
+          if (inherited === null || receivedCursor === null) throw new Error("invalid inherited cursor");
+          if (inherited.epoch !== receivedCursor.epoch) {
+            halt("output capture database changed");
+            return;
+          }
+          if (BigInt(inherited.segment) > BigInt(receivedCursor.segment)) throw new Error("unadmitted control cursor");
+        }
         if (message.type === "delta") {
-          const segment = cursorFor(message.lastEventId, selectedPane);
+          const incoming = cursorFor(message.lastEventId, selectedPane);
+          const segment = incoming?.segment ?? null;
           const sequence = unsigned(exact.data.seq, U64_MAX);
           if (segment === null || typeof data.segment_id !== "number" || typeof data.pane_id !== "number"
               || unsigned(exact.data.segment_id, I64_MAX) !== segment
               || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane
               || typeof data.seq !== "number" || sequence === null || typeof data.content !== "string") {
             throw new Error("invalid delta identity or content");
+          }
+          if (receivedCursor === null || incoming.epoch !== receivedCursor.epoch) {
+            halt("output capture database changed");
+            return;
           }
           if (capture !== null) {
             if (segment !== capture.segmentId) {
@@ -245,6 +280,7 @@ export function createPaneOutput({
             // any following segment can arrive, even for a reused pane ID.
             append(data.content);
             received = segment;
+            receivedCursor = incoming;
             receivedSequence = sequence;
             settleCapture(null, true);
             return;
@@ -274,6 +310,7 @@ export function createPaneOutput({
           }
           append(data.content);
           received = segment;
+          receivedCursor = incoming;
           receivedSequence = sequence;
           status = "connected";
           error = null;
@@ -285,11 +322,16 @@ export function createPaneOutput({
           // Ready establishes the fresh tail even before the first delta.
           // Validate the scoped wire cursor as well as the exact JSON ID:
           // native reconnect may use Last-Event-ID from this checkpoint.
-          const expectedResume = received ?? url.searchParams.get("since_id");
+          const expectedResume = receivedCursor?.segment ?? url.searchParams.get("since_id");
           const resume = unsigned(exact.data.resume_after_id, I64_MAX);
           const checkpoint = cursorFor(message.lastEventId, selectedPane, true);
-          const safeResume = typeof data.resume_after_id === "number" && resume !== null
-            && checkpoint === resume && data.cursor === message.lastEventId
+          const validCheckpoint = typeof data.resume_after_id === "number" && resume !== null
+            && checkpoint?.segment === resume && data.cursor === message.lastEventId;
+          if (validCheckpoint && receivedCursor !== null && checkpoint.epoch !== receivedCursor.epoch) {
+            halt("output capture database changed");
+            return;
+          }
+          const safeResume = validCheckpoint
             && (expectedResume === null
               || (capture !== null ? resume === expectedResume : BigInt(resume) <= BigInt(expectedResume)));
           if (!safeResume) {
@@ -300,6 +342,7 @@ export function createPaneOutput({
           // replacement without pretending that any transcript was delivered.
           // A finite historical capture acknowledges only its requested row.
           if (capture === null && received === null) received = resume;
+          if (receivedCursor === null) receivedCursor = checkpoint;
           ready = true;
           clearReadyDeadline();
           status = capture === null ? "connected" : "loading";
@@ -319,12 +362,16 @@ export function createPaneOutput({
         }
         dirty = true;
       } catch (_) {
+        if (message.type === "cursor_discontinuity") {
+          halt("output: invalid capture history discontinuity");
+          return;
+        }
         // Native EventSource advances its private cursor before invoking us.
         // Retire it on rejection so replacement uses only our accepted cursor.
         reconnect("output frame rejected; received cursor unchanged");
       }
     };
-    for (const type of ["ready", "delta", "gap", "lag"]) candidate.addEventListener(type, frame);
+    for (const type of ["ready", "delta", "gap", "lag", "cursor_discontinuity"]) candidate.addEventListener(type, frame);
     candidate.addEventListener("error", (message) => {
       if (!current()) return;
       if (typeof message.data === "string") frame(message);
@@ -347,6 +394,7 @@ export function createPaneOutput({
     }
     return {
       paneId: pane, status, paused, suspended, history, cursor: received,
+      resumeCursor: receivedCursor?.token ?? null, terminal,
       text, discardedChars, gapNotifications: gaps, unanchored, error, capture,
       sequence: receivedSequence, sequenceDiscontinuities, sequenceRestarted, retainedPrefixMissing,
     };
@@ -360,6 +408,7 @@ export function createPaneOutput({
     history = Boolean(retainedHistory);
     paused = false;
     received = null;
+    receivedCursor = null;
     receivedSequence = null;
     sequenceDiscontinuities = 0;
     sequenceRestarted = retainedPrefixMissing = false;
@@ -368,6 +417,7 @@ export function createPaneOutput({
     text = "";
     textDirty = false;
     error = null;
+    terminal = false;
     gaps = discardedChars = 0;
     unanchored = false;
     retryMs = 1000;
@@ -402,14 +452,14 @@ export function createPaneOutput({
       startSelection(target.paneId, true, Object.freeze(target));
     },
     pause() {
-      if (pane === null || paused || capture !== null) return;
+      if (pane === null || terminal || paused || capture !== null) return;
       retire();
       paused = true;
       status = "paused";
       dirty = true;
     },
     resume() {
-      if (pane === null || !paused || capture !== null) return;
+      if (pane === null || terminal || !paused || capture !== null) return;
       paused = false;
       if (received === null && !history) unanchored = true;
       status = suspended ? "suspended" : "connecting";
@@ -421,14 +471,14 @@ export function createPaneOutput({
       if (capturePending) settleCapture("Historical capture request cancelled when the page was suspended.");
       else retire();
       suspended = true;
-      if (pane !== null && capture === null) status = paused ? "paused" : "suspended";
+      if (pane !== null && capture === null && !terminal) status = paused ? "paused" : "suspended";
       dirty = true;
     },
     restore() {
       if (!suspended) return;
       suspended = false;
-      if (pane !== null && capture === null && !paused && received === null && !history) unanchored = true;
-      if (pane !== null && capture === null) status = paused ? "paused" : "connecting";
+      if (pane !== null && capture === null && !terminal && !paused && received === null && !history) unanchored = true;
+      if (pane !== null && capture === null && !terminal) status = paused ? "paused" : "connecting";
       dirty = true;
       open();
     },
@@ -438,6 +488,7 @@ export function createPaneOutput({
       capture = null;
       capturePending = false;
       received = null;
+      receivedCursor = null;
       receivedSequence = null;
       sequenceDiscontinuities = 0;
       sequenceRestarted = retainedPrefixMissing = false;
@@ -446,6 +497,7 @@ export function createPaneOutput({
       text = "";
       textDirty = false;
       error = null;
+      terminal = false;
       paused = history = unanchored = false;
       gaps = discardedChars = 0;
       status = "closed";
@@ -531,7 +583,8 @@ export function mountPaneOutput({
       : state.status === "loading" ? "Loading historical capture" : "Historical capture unavailable";
     setText(statusLine, historical ? `${captureStatus} · read-only · not following a current pane`
       : opened ? `${state.status} · read-only · ${state.history ? "following retained history" : "new output since opening"}` : "");
-    pause.disabled = historyButton.disabled = follow.disabled = historical;
+    historyButton.disabled = follow.disabled = historical;
+    pause.disabled = historical || state.terminal;
     setText(pause, state.paused ? "Resume" : "Pause");
     pause.setAttribute("aria-pressed", String(state.paused));
     const notices = [];
