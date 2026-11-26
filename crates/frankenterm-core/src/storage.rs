@@ -18970,7 +18970,12 @@ mod writer_io_scheduler_tests {
         // The writer increments `parks` while holding this lock. Acquiring it
         // proves the writer has atomically entered its condvar wait (or has
         // incorrectly returned), so the observation window starts after park.
-        drop(wakeup.lock.lock().unwrap_or_else(|poison| poison.into_inner()));
+        drop(
+            wakeup
+                .lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
         true
     }
 
@@ -19005,8 +19010,15 @@ mod writer_io_scheduler_tests {
 
         assert!(parked, "the waiter must reach its idle park");
         assert_eq!(before_work, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-        assert_eq!(after_spurious, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-        assert_eq!(after_work, Ok(()), "published work must wake the idle writer");
+        assert_eq!(
+            after_spurious,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(
+            after_work,
+            Ok(()),
+            "published work must wake the idle writer"
+        );
         assert!(joined.is_ok(), "the parked writer must exit cleanly");
     }
 
@@ -19029,7 +19041,11 @@ mod writer_io_scheduler_tests {
         wakeup.notify_senders_gone();
         let joined = waiter.join();
 
-        assert_eq!(observed, Ok(()), "the park must observe already-queued work");
+        assert_eq!(
+            observed,
+            Ok(()),
+            "the park must observe already-queued work"
+        );
         assert!(joined.is_ok(), "the writer must exit cleanly");
     }
 
@@ -19147,7 +19163,11 @@ mod writer_io_scheduler_tests {
         wakeup.notify();
         let joined = waiter.join();
 
-        assert_eq!(observed, Ok(()), "the park must observe the sticky disconnect");
+        assert_eq!(
+            observed,
+            Ok(()),
+            "the park must observe the sticky disconnect"
+        );
         assert!(joined.is_ok(), "the disconnected writer must exit cleanly");
     }
 

@@ -780,10 +780,6 @@ pub struct IpcTuning {
     /// Source: ipc.rs MAX_MESSAGE_SIZE = 131072
     pub max_message_size: usize,
 
-    /// IPC connection accept poll interval (ms).
-    /// Source: ipc.rs IPC_ACCEPT_POLL_INTERVAL = 100
-    pub accept_poll_interval_ms: u64,
-
     /// Hard ceiling for concurrently admitted IPC client connections.
     /// Long-lived event subscriptions count against this limit.
     pub max_concurrent_connections: usize,
@@ -808,12 +804,6 @@ impl IpcTuning {
     pub const MIN_MAX_MESSAGE_SIZE: usize = 16 * 1024;
     /// Largest supported IPC message size limit (64 MiB).
     pub const MAX_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
-    /// Default IPC accept poll interval (ms).
-    pub const DEFAULT_ACCEPT_POLL_INTERVAL_MS: u64 = 100;
-    /// Smallest supported IPC accept poll interval (ms).
-    pub const MIN_ACCEPT_POLL_INTERVAL_MS: u64 = 10;
-    /// Largest supported IPC accept poll interval (ms).
-    pub const MAX_ACCEPT_POLL_INTERVAL_MS: u64 = 1_000;
     /// Default concurrent connection ceiling. This supports large local agent
     /// fleets while keeping accepted socket/task retention finite.
     pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
@@ -852,7 +842,6 @@ impl Default for IpcTuning {
     fn default() -> Self {
         Self {
             max_message_size: Self::DEFAULT_MAX_MESSAGE_SIZE,
-            accept_poll_interval_ms: Self::DEFAULT_ACCEPT_POLL_INTERVAL_MS,
             max_concurrent_connections: Self::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             initial_request_timeout_ms: Self::DEFAULT_INITIAL_REQUEST_TIMEOUT_MS,
             io_timeout_ms: Self::DEFAULT_IO_TIMEOUT_MS,
@@ -1107,12 +1096,6 @@ impl TuningConfig {
         if self.ipc.max_message_size > IpcTuning::MAX_MAX_MESSAGE_SIZE {
             errors.push("tuning.ipc.max_message_size must be <= 64MB".into());
         }
-        if self.ipc.accept_poll_interval_ms < IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS {
-            errors.push("tuning.ipc.accept_poll_interval_ms must be >= 10".into());
-        }
-        if self.ipc.accept_poll_interval_ms > IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS {
-            errors.push("tuning.ipc.accept_poll_interval_ms must be <= 1000".into());
-        }
         if self.ipc.max_concurrent_connections < IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS {
             errors.push("tuning.ipc.max_concurrent_connections must be >= 1".into());
         }
@@ -1298,7 +1281,6 @@ default_port = 9000
 
         // IPC
         assert_eq!(cfg.ipc.max_message_size, 128 * 1024);
-        assert_eq!(cfg.ipc.accept_poll_interval_ms, 100);
         assert_eq!(cfg.ipc.max_concurrent_connections, 1024);
         assert_eq!(cfg.ipc.initial_request_timeout_ms, 5_000);
         assert_eq!(cfg.ipc.io_timeout_ms, 30_000);
@@ -1405,32 +1387,6 @@ default_port = 9000
             cfg.validate()
                 .iter()
                 .any(|error| error == "tuning.ipc.max_message_size must be <= 64MB")
-        );
-
-        cfg = TuningConfig::default();
-        cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS;
-        assert!(
-            cfg.validate()
-                .iter()
-                .all(|error| !error.contains("accept_poll_interval_ms"))
-        );
-        cfg.ipc.accept_poll_interval_ms = IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS;
-        assert!(
-            cfg.validate()
-                .iter()
-                .all(|error| !error.contains("accept_poll_interval_ms"))
-        );
-        cfg.ipc.accept_poll_interval_ms = IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS - 1;
-        assert!(
-            cfg.validate()
-                .iter()
-                .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be >= 10")
-        );
-        cfg.ipc.accept_poll_interval_ms = IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS + 1;
-        assert!(
-            cfg.validate()
-                .iter()
-                .any(|error| error == "tuning.ipc.accept_poll_interval_ms must be <= 1000")
         );
 
         cfg = TuningConfig::default();
@@ -1753,8 +1709,6 @@ default_port = 9000
         assert_eq!(ip.max_message_size, IpcTuning::DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(IpcTuning::MIN_MAX_MESSAGE_SIZE, 16 * 1024);
         assert_eq!(IpcTuning::MAX_MAX_MESSAGE_SIZE, 64 * 1024 * 1024);
-        assert_eq!(IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS, 10);
-        assert_eq!(IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS, 1_000);
         assert_eq!(
             IpcTuning::MAX_AGGREGATE_REQUEST_BUFFER_BYTES,
             512 * 1024 * 1024

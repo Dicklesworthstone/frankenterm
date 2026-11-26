@@ -64,7 +64,8 @@ max_sender_id_len = 144
 [tuning.ipc]
 max_message_size = 262144
 max_concurrent_connections = 512
-accept_poll_interval_ms = 250
+initial_request_timeout_ms = 750
+io_timeout_ms = 45000
 ",
     );
 
@@ -76,7 +77,8 @@ accept_poll_interval_ms = 250
     let ipc_limits = frankenterm_core::ipc::resolve_limits(Some(&config.tuning.ipc));
     assert_eq!(ipc_limits.max_message_size, 262_144);
     assert_eq!(ipc_limits.max_concurrent_connections, 512);
-    assert_eq!(ipc_limits.accept_poll_interval_ms, 250);
+    assert_eq!(ipc_limits.initial_request_timeout_ms, 750);
+    assert_eq!(ipc_limits.io_timeout_ms, 45_000);
 }
 
 #[cfg(feature = "web")]

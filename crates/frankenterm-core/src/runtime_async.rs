@@ -9185,11 +9185,9 @@ where
     // blocking pool's existing queued-work cancellation/started-work contract.
     match until_cancelled(cx, join_fut).await {
         Ok(result) => map_spawn_blocking_runtime_result(result),
-        Err(_) if cx.checkpoint().is_err() => {
-            Err(SpawnBlockingWithCxError::CancelledMidFlight {
-                kind: spawn_blocking_root_cancel_kind(cx),
-            })
-        }
+        Err(_) if cx.checkpoint().is_err() => Err(SpawnBlockingWithCxError::CancelledMidFlight {
+            kind: spawn_blocking_root_cancel_kind(cx),
+        }),
         Err(_) => Err(SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
     }
 }
@@ -14704,8 +14702,14 @@ mod tests {
             let completed = timeout(Duration::from_secs(5), oneshot_recv(completed_rx)).await;
             assert!(initially_pending, "the closure must wait for its release");
             assert!(matches!(&started, Ok(Ok(()))), "closure start: {started:?}");
-            assert_eq!(pending_timers, 0, "pending blocking work needs no idle timer");
-            assert!(cancellation_woke_waiter, "cancellation must wake the registered task");
+            assert_eq!(
+                pending_timers, 0,
+                "pending blocking work needs no idle timer"
+            );
+            assert!(
+                cancellation_woke_waiter,
+                "cancellation must wake the registered task"
+            );
             assert!(
                 matches!(
                     &cancelled,
@@ -14717,10 +14721,19 @@ mod tests {
                 ),
                 "cancellation must settle without advancing the clock: {cancelled:?}"
             );
-            assert!(released.is_ok(), "the running closure must retain its release receiver");
-            assert!(matches!(&completed, Ok(Ok(()))), "closure completion: {completed:?}");
+            assert!(
+                released.is_ok(),
+                "the running closure must retain its release receiver"
+            );
+            assert!(
+                matches!(&completed, Ok(Ok(()))),
+                "closure completion: {completed:?}"
+            );
             assert_eq!(timer.now(), asupersync::Time::ZERO);
-            assert_eq!(timers_after_drop, 0, "dropping the wait must unregister timers");
+            assert_eq!(
+                timers_after_drop, 0,
+                "dropping the wait must unregister timers"
+            );
         });
     }
 

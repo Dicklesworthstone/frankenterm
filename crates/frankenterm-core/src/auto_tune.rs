@@ -238,9 +238,6 @@ pub enum TunableKnobId {
     /// Search Tantivy writer memory budget.
     #[serde(rename = "search.tantivy_writer_memory_bytes")]
     SearchTantivyWriterMemoryBytes,
-    /// IPC accept polling interval.
-    #[serde(rename = "ipc.accept_poll_interval_ms")]
-    IpcAcceptPollIntervalMs,
     /// Capacity admission queue defer threshold.
     #[serde(rename = "capacity.queue_defer_threshold")]
     CapacityQueueDeferThreshold,
@@ -294,7 +291,6 @@ impl TunableKnobId {
             Self::WorkflowsCassTimeoutSecs => "workflows.cass_*_timeout_secs",
             Self::WorkflowsCooldownMs => "workflows.*_cooldown_ms",
             Self::SearchTantivyWriterMemoryBytes => "search.tantivy_writer_memory_bytes",
-            Self::IpcAcceptPollIntervalMs => "ipc.accept_poll_interval_ms",
             Self::CapacityQueueDeferThreshold => "capacity.queue_defer_threshold",
             Self::CapacityBacklogDeferThreshold => "capacity.backlog_defer_threshold",
             Self::CapacityThrottleQueueDepth => "capacity.throttle_queue_depth",
@@ -334,7 +330,6 @@ impl TunableKnobId {
             "workflows.cass_*_timeout_secs" => Some(Self::WorkflowsCassTimeoutSecs),
             "workflows.*_cooldown_ms" => Some(Self::WorkflowsCooldownMs),
             "search.tantivy_writer_memory_bytes" => Some(Self::SearchTantivyWriterMemoryBytes),
-            "ipc.accept_poll_interval_ms" => Some(Self::IpcAcceptPollIntervalMs),
             "capacity.queue_defer_threshold" => Some(Self::CapacityQueueDeferThreshold),
             "capacity.backlog_defer_threshold" => Some(Self::CapacityBacklogDeferThreshold),
             "capacity.throttle_queue_depth" => Some(Self::CapacityThrottleQueueDepth),
@@ -1285,24 +1280,6 @@ fn default_candidate_registry() -> BTreeMap<TunableKnobId, KnobSpec> {
                 rollback_metric: "search_lag",
                 constraint: "memory pressure must not regress",
                 gate: CanaryFirst,
-            },
-        ),
-        (
-            TunableKnobId::IpcAcceptPollIntervalMs,
-            KnobSpec {
-                id: TunableKnobId::IpcAcceptPollIntervalMs,
-                owner: "ipc",
-                source: "IpcTuning::accept_poll_interval_ms",
-                default_value: 100.0,
-                range: ParamRange {
-                    min: 10.0,
-                    max: 250.0,
-                },
-                step: Fixed { amount: 25.0 },
-                safety_metric: "accept_latency",
-                rollback_metric: "idle_cpu",
-                constraint: "accept p99 must not regress",
-                gate: ObserveFirst,
             },
         ),
         (
@@ -4060,9 +4037,15 @@ mod tests {
     #[test]
     fn candidate_registry_rejects_unknown_knob() {
         let engine = fresh_observe_candidate_engine();
-        assert_eq!(
-            engine.validate_knob_id("not_a_real_knob"),
-            Err(CandidateSkipReason::UnknownKnob)
+        for unknown in ["not_a_real_knob", "ipc.accept_poll_interval_ms"] {
+            assert_eq!(
+                engine.validate_knob_id(unknown),
+                Err(CandidateSkipReason::UnknownKnob)
+            );
+        }
+        assert!(
+            serde_json::from_str::<TunableKnobId>(r#""ipc.accept_poll_interval_ms""#).is_err(),
+            "event-driven IPC must not advertise an adjustable idle poll"
         );
         assert_eq!(
             engine.validate_knob_id("runtime.output_coalesce_window_ms"),

@@ -81,7 +81,8 @@ rollback metric has returned inside budget.
 ## Initial Safe Knob Registry
 
 The registry below is the complete initial set. Future implementation beads
-must update this document before tuning anything else.
+must update this document before tuning anything else. IPC accepts and handler
+completion use event-driven waits; there is no idle polling interval to tune.
 
 | Knob id | Owner | Current source | Default | Hard bounds | Initial step | Safety metric | Rollback metric | Gate |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -105,7 +106,6 @@ must update this document before tuning anything else.
 | `workflows.cass_*_timeout_secs` | Workflow/CASS handlers | `CassQueryConfig::timeout_secs` | `6..8 s` | `4..=15 s` | `+/-2 s` | CASS success rate, workflow latency | workflow p99 or cancellation rate regresses | observe-first |
 | `workflows.*_cooldown_ms` | Workflow handlers | `WorkflowsTuning` cooldown fields | `180000..900000 ms` | `60000..=1800000 ms` | x2 or /2 | duplicate automation rate, recovery latency | repeated intervention or delayed recovery exceeds baseline | observe-first |
 | `search.tantivy_writer_memory_bytes` | Search/indexing | `SearchTuning::tantivy_writer_memory_bytes` | `50000000 bytes` | `10485760..=268435456 bytes` | x2 or /2 | indexing throughput, search freshness, memory pressure | memory pressure or search lag regresses | canary-first |
-| `ipc.accept_poll_interval_ms` | IPC | `IpcTuning::accept_poll_interval_ms` | `100 ms` | `10..=250 ms` | `+/-25 ms` | accept latency, idle CPU | accept p99 or idle CPU regresses | observe-first |
 | `capacity.queue_defer_threshold` | Capacity admission | `SwarmCapacityAdmissionControllerConfig` | `16` | `1..=1024` and `defer <= throttle <= shed` | x2 or /2 | admission queue pressure, defer count, completed work | capacity action becomes noisier or backlog grows | canary-first |
 | `capacity.backlog_defer_threshold` | Capacity admission | `SwarmCapacityAdmissionControllerConfig` | `64` | `1..=4096` and `defer <= throttle <= shed` | x2 or /2 | backlog pressure, defer count, completed work | backlog grows or defers arrive too late | canary-first |
 | `capacity.throttle_queue_depth` | Capacity admission | `SwarmCapacityAdmissionControllerConfig` | `64` | `queue_defer..=shed` | x2 or /2 | throttle rate, capture freshness | capture freshness or completed work regresses | canary-first |

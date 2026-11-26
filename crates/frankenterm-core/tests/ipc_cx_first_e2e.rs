@@ -282,7 +282,6 @@ fn accepted_idle_partial_and_subscribed_clients_stop_without_rpc_settlement_grac
             let cx = runtime_ipc_cx();
             let limits = IpcRuntimeLimits {
                 max_message_size: MAX_MESSAGE_SIZE,
-                accept_poll_interval_ms: 10,
                 max_concurrent_connections: 1,
                 initial_request_timeout_ms: 5_000,
                 io_timeout_ms: 1_000,

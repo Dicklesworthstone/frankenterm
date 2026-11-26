@@ -404,16 +404,25 @@ Validation:
 
 ## `[tuning.ipc]`
 
-These keys live under `[tuning.ipc]`.
+These keys live under `[tuning.ipc]`. The accept loop waits for client
+readiness, handler completion, shutdown, or context termination. Healthy idle
+connections need no periodic handler-reaping timer, and there is no tunable
+accept polling interval.
 
-| Field | Default | Unit | What it controls / when to change it | 10 panes | 50 panes | 200+ panes |
-| --- | --- | --- | --- | --- | --- | --- |
-| `max_message_size` | `131072` (`128 KiB`) | bytes | Local IPC message size ceiling. Raise if local RPC callers legitimately exchange larger payloads. | `65536-131072` | `131072-262144` | `262144-1048576` |
-| `accept_poll_interval_ms` | `100` | ms | Poll interval for accepting IPC connections. Lower it for faster accept latency; raise it slightly if you want to trim idle CPU. | `50-100` | `25-100` | `10-50` |
+| Field | Default | Unit | What it controls |
+| --- | --- | --- | --- |
+| `max_message_size` | `131072` (`128 KiB`) | bytes | Local IPC message size ceiling. Raise only when callers need larger payloads, within the aggregate buffer bound below. |
+| `max_concurrent_connections` | `1024` | connections | Maximum admitted client tasks, including long-lived event subscriptions. Completed handlers release capacity immediately. |
+| `initial_request_timeout_ms` | `5000` | ms | Deadline for an accepted client to send its first complete request line. |
+| `io_timeout_ms` | `30000` | ms | Client deadline across connect/write/flush/read; server deadline for each response or streaming record emission. |
 
 Validation:
-- `max_message_size >= 16384` (`16 KiB`)
-- `accept_poll_interval_ms >= 10`
+
+- `max_message_size` must be between `16384` (`16 KiB`) and `67108864` (`64 MiB`).
+- `max_concurrent_connections` must be between `1` and `16384`.
+- `initial_request_timeout_ms` must be between `100` and `60000`.
+- `io_timeout_ms` must be between `100` and `300000`.
+- The aggregate request-line buffer bound, `(2 * max_message_size + 2) * max_concurrent_connections`, must not exceed `536870912` (`512 MiB`).
 
 ## `[tuning.wezterm]`
 

@@ -320,17 +320,12 @@ mod socket_transport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcRuntimeLimits {
     pub max_message_size: usize,
-    pub accept_poll_interval_ms: u64,
     pub max_concurrent_connections: usize,
     pub initial_request_timeout_ms: u64,
     pub io_timeout_ms: u64,
 }
 
 impl IpcRuntimeLimits {
-    fn accept_poll_interval(self) -> Duration {
-        Duration::from_millis(self.accept_poll_interval_ms)
-    }
-
     fn initial_request_timeout(self) -> Duration {
         Duration::from_millis(self.initial_request_timeout_ms)
     }
@@ -343,9 +338,6 @@ impl IpcRuntimeLimits {
         (crate::tuning_config::IpcTuning::MIN_MAX_MESSAGE_SIZE
             ..=crate::tuning_config::IpcTuning::MAX_MAX_MESSAGE_SIZE)
             .contains(&self.max_message_size)
-            && (crate::tuning_config::IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS
-                ..=crate::tuning_config::IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS)
-                .contains(&self.accept_poll_interval_ms)
             && (crate::tuning_config::IpcTuning::MIN_MAX_CONCURRENT_CONNECTIONS
                 ..=crate::tuning_config::IpcTuning::MAX_MAX_CONCURRENT_CONNECTIONS)
                 .contains(&self.max_concurrent_connections)
@@ -357,7 +349,6 @@ impl IpcRuntimeLimits {
                 .contains(&self.io_timeout_ms)
             && crate::tuning_config::IpcTuning {
                 max_message_size: self.max_message_size,
-                accept_poll_interval_ms: self.accept_poll_interval_ms,
                 max_concurrent_connections: self.max_concurrent_connections,
                 initial_request_timeout_ms: self.initial_request_timeout_ms,
                 io_timeout_ms: self.io_timeout_ms,
@@ -393,15 +384,12 @@ pub fn resolve_limits(tuning: Option<&crate::tuning_config::IpcTuning>) -> IpcRu
     match tuning {
         Some(tuning) => IpcRuntimeLimits {
             max_message_size: tuning.max_message_size,
-            accept_poll_interval_ms: tuning.accept_poll_interval_ms,
             max_concurrent_connections: tuning.max_concurrent_connections,
             initial_request_timeout_ms: tuning.initial_request_timeout_ms,
             io_timeout_ms: tuning.io_timeout_ms,
         },
         None => IpcRuntimeLimits {
             max_message_size: MAX_MESSAGE_SIZE,
-            accept_poll_interval_ms:
-                crate::tuning_config::IpcTuning::DEFAULT_ACCEPT_POLL_INTERVAL_MS,
             max_concurrent_connections:
                 crate::tuning_config::IpcTuning::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             initial_request_timeout_ms:
@@ -1335,7 +1323,7 @@ pub struct IpcHandlerContext {
     pub search_config: Option<SearchConfig>,
     /// Optional mux handle for live prompt evidence in `pane_state`.
     pub semantic_source: Option<crate::wezterm::WeztermHandle>,
-    connection_shutdown: crate::runtime_async::process::CommandCancellation,
+    connection_shutdown: crate::runtime_async::ShutdownSignal,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
@@ -1352,7 +1340,7 @@ impl IpcHandlerContext {
             search_config: None,
             semantic_source: None,
             event_storage: None,
-            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::ShutdownSignal::new(),
         }
     }
 
@@ -1368,7 +1356,7 @@ impl IpcHandlerContext {
             search_config: None,
             semantic_source: None,
             event_storage: None,
-            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::ShutdownSignal::new(),
         }
     }
 
@@ -1388,7 +1376,7 @@ impl IpcHandlerContext {
             search_config: None,
             semantic_source: None,
             event_storage: None,
-            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::ShutdownSignal::new(),
         }
     }
 
@@ -1442,7 +1430,7 @@ impl IpcHandlerContext {
             search_config,
             semantic_source: None,
             event_storage: None,
-            connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
+            connection_shutdown: crate::runtime_async::ShutdownSignal::new(),
         }
     }
 
@@ -1726,17 +1714,14 @@ impl IpcServer {
                 break;
             }
 
-            // One wait per iteration covers shutdown, cancellation and the
-            // next client. The loop used to poll the shutdown channel on a
-            // 1 ms timer before every accept (frankenterm#135); now
-            // `accept_poll_interval` only bounds how long finished handlers
-            // wait to be reaped while the server is idle. The wait is bound
-            // to the caller's cx (ft-xbnl0.2.3), never the thread-local one.
+            // Client arrival, handler completion, shutdown and context
+            // termination all wake this wait directly. An empty server and
+            // healthy pending handlers need no periodic reaping timer.
             match next_accept_loop_wake(
                 cx,
                 shutdown_rx,
                 self.listener.accept(),
-                limits.accept_poll_interval(),
+                &mut connection_tasks,
             )
             .await
             {
@@ -1744,8 +1729,25 @@ impl IpcServer {
                     tracing::info!("IPC server shutting down (cx-first)");
                     break;
                 }
-                // Cancellation is acted on by the checkpoint at the top.
-                AcceptLoopWake::Cancelled | AcceptLoopWake::Idle => {}
+                AcceptLoopWake::ContextFailed(failure_class) => {
+                    tracing::info!(?failure_class, "IPC server context ended");
+                    break;
+                }
+                AcceptLoopWake::ConnectionFinished(Some(Err(error))) => {
+                    tracing::debug!(
+                        error_class = "ipc_client_task_join_failed",
+                        failure_class = ?error.kind(),
+                        "IPC client task failed"
+                    );
+                }
+                AcceptLoopWake::ConnectionFinished(_) => {}
+                AcceptLoopWake::ConnectionWaitFailed(error) => {
+                    tracing::warn!(
+                        failure_class = ?error.kind(),
+                        "IPC connection completion wait failed"
+                    );
+                    break;
+                }
                 AcceptLoopWake::Accepted(Ok((stream, _addr))) => {
                     if cx.checkpoint().is_err() {
                         // The accept can become ready in the same scheduler
@@ -1832,7 +1834,7 @@ impl IpcServer {
 
         // RPC owners must observe cancellation and finish bounded process
         // settlement before their connection future can be dropped.
-        ctx.connection_shutdown.cancel();
+        ctx.connection_shutdown.request();
         let drain_cx = crate::cx::for_request();
         let cooperative_drain = crate::runtime_async::timeout_with_cx(
             &drain_cx,
@@ -2104,26 +2106,28 @@ async fn shutdown_signal_with_cx(shutdown_rx: &mut mpsc::Receiver<()>, cx: &crat
 enum AcceptLoopWake<A> {
     /// A shutdown message arrived, or the shutdown channel closed.
     Shutdown,
-    /// `cx` was cancelled.
-    Cancelled,
+    /// `cx` terminated, preserving cancellation and budget distinctions.
+    ContextFailed(crate::runtime_async::ContextErrorKind),
     /// `accept()` completed.
     Accepted(A),
-    /// The idle bound (or an earlier deadline in `cx`'s budget) elapsed.
-    Idle,
+    /// A handler reached a terminal result and was reaped.
+    ConnectionFinished(Option<Result<(), crate::runtime_async::task::JoinError>>),
+    /// Handler observation failed without surrendering settlement ownership.
+    ConnectionWaitFailed(crate::runtime_async::task::JoinError),
 }
 
-/// Waits for whichever comes first: a shutdown signal, cancellation of `cx`,
-/// or `accept` completing, bounded by `idle_bound`.
+/// Waits for shutdown, context termination, a finished handler, or a client.
 ///
-/// Shutdown is checked before cancellation and cancellation before
-/// `accept`, so a pending shutdown always wins. Cancellation is observed
-/// through a registered waker, so the only timer armed is `idle_bound`.
+/// Shutdown and context termination take priority over new admission. Healthy
+/// pending handlers register completion wakers; an empty set parks indefinitely.
+/// Only real context deadlines and exceptional quarantined-handle settlement
+/// can arm timers here. Dropping this wait retains every unfinished handler.
 #[cfg(any(unix, windows))]
 async fn next_accept_loop_wake<A, F>(
     cx: &crate::cx::Cx,
     shutdown_rx: &mut mpsc::Receiver<()>,
     accept: F,
-    idle_bound: Duration,
+    connection_tasks: &mut crate::runtime_async::task::JoinSet<()>,
 ) -> AcceptLoopWake<A>
 where
     F: std::future::Future<Output = A>,
@@ -2133,22 +2137,45 @@ where
     let mut shutdown = std::pin::pin!(shutdown_signal_with_cx(shutdown_rx, cx));
     let mut cancelled = crate::runtime_async::wait_for_cancellation_boxed(cx);
     let mut accept = std::pin::pin!(accept);
-    let wake = std::future::poll_fn(|task_cx| {
-        if let Poll::Ready(shutdown) = shutdown.as_mut().poll(task_cx) {
-            return Poll::Ready(if shutdown {
-                AcceptLoopWake::Shutdown
-            } else {
-                AcceptLoopWake::Cancelled
+    let mut completed = std::pin::pin!(async {
+        if connection_tasks.is_empty() {
+            std::future::pending().await
+        } else {
+            connection_tasks.drain_next_with_cx(cx).await
+        }
+    });
+    std::future::poll_fn(|task_cx| {
+        let shutdown_state = shutdown.as_mut().poll(task_cx);
+        if matches!(shutdown_state, Poll::Ready(true)) {
+            return Poll::Ready(AcceptLoopWake::Shutdown);
+        }
+        if let Poll::Ready(result) = cancelled.as_mut().poll(task_cx) {
+            let kind = match result {
+                Err(error) => error.kind(),
+                Ok(()) => crate::runtime_async::ContextError::internal(
+                    "IPC cancellation wait ended without context termination",
+                )
+                .kind(),
+            };
+            return Poll::Ready(AcceptLoopWake::ContextFailed(kind));
+        }
+        if matches!(shutdown_state, Poll::Ready(false)) {
+            return Poll::Ready(AcceptLoopWake::ContextFailed(
+                crate::runtime_async::ContextError::internal(
+                    "IPC shutdown receive ended without context termination",
+                )
+                .kind(),
+            ));
+        }
+        if let Poll::Ready(result) = completed.as_mut().poll(task_cx) {
+            return Poll::Ready(match result {
+                Ok(result) => AcceptLoopWake::ConnectionFinished(result),
+                Err(error) => AcceptLoopWake::ConnectionWaitFailed(error),
             });
         }
-        if cancelled.as_mut().poll(task_cx).is_ready() {
-            return Poll::Ready(AcceptLoopWake::Cancelled);
-        }
         accept.as_mut().poll(task_cx).map(AcceptLoopWake::Accepted)
-    });
-    crate::runtime_async::timeout_with_cx(cx, idle_bound, wake)
-        .await
-        .unwrap_or(AcceptLoopWake::Idle)
+    })
+    .await
 }
 
 /// Stub IPC server for platforms without the local socket transport.
@@ -2455,7 +2482,7 @@ async fn handle_client_with_context_with_cx(
     let Some(line) = request_line? else {
         return Ok(());
     };
-    if ctx.connection_shutdown.is_cancelled() || cx.checkpoint().is_err() {
+    if ctx.connection_shutdown.is_requested() || cx.checkpoint().is_err() {
         return Ok(());
     }
 
@@ -2632,7 +2659,7 @@ async fn handle_client_with_context_with_cx(
         };
         line
     };
-    if ctx.connection_shutdown.is_cancelled() || cx.checkpoint().is_err() {
+    if ctx.connection_shutdown.is_requested() || cx.checkpoint().is_err() {
         return Ok(());
     }
 
@@ -3267,7 +3294,7 @@ async fn handle_request_with_context(
             payload["allocator"] = allocator_status_payload();
             if let Some(registry_lock) = ctx.registry.as_ref() {
                 let (active_count, panes) = {
-                    if ctx.connection_shutdown.is_cancelled() {
+                    if ctx.connection_shutdown.is_requested() {
                         return registry_lock_error_response(LockAcquireError::Cancelled);
                     }
                     // A blocked status snapshot retains an admitted connection.
@@ -3286,7 +3313,7 @@ async fn handle_request_with_context(
                     {
                         futures::future::Either::Left((result, _)) => result,
                         futures::future::Either::Right(((), read)) => {
-                            if ctx.connection_shutdown.is_cancelled() {
+                            if ctx.connection_shutdown.is_requested() {
                                 return registry_lock_error_response(LockAcquireError::Cancelled);
                             }
                             // The Cx ended the shutdown wait. Let the bounded
@@ -3430,20 +3457,11 @@ async fn handle_request_with_context_with_cx(
 /// on the same server stop signal, without cancelling their shared caller Cx.
 /// Only admitted RPCs must retain their work until process settlement.
 ///
-/// A cancelled `cx` also ends the wait. asupersync 0.6's `Sleep` completes
-/// early, with `Ok`, once its context is cancelled (other than by a timeout
-/// or deadline, which `sleep_with_cx` reports as `Err`), so without that
-/// check the 10 ms poll became one scheduler trip per iteration until the
-/// server cancelled `connection_shutdown`.
+/// Context cancellation and its actual budget deadline also end the wait.
+/// The shared sticky signal wakes every registered connection and is visible
+/// to late waiters; an idle connection needs no shutdown polling timer.
 async fn wait_for_ipc_shutdown(cx: &crate::cx::Cx, ctx: &IpcHandlerContext) {
-    while !ctx.connection_shutdown.is_cancelled() && !cx.is_cancel_requested() {
-        if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
+    let _ = ctx.connection_shutdown.wait(cx).await;
 }
 
 /// Retain the handler after disconnect/shutdown so its owned process reports
@@ -5345,14 +5363,6 @@ mod tests {
         assert!(!invalid.resource_bounds_are_valid());
 
         invalid = defaults;
-        invalid.accept_poll_interval_ms =
-            crate::tuning_config::IpcTuning::MIN_ACCEPT_POLL_INTERVAL_MS - 1;
-        assert!(!invalid.resource_bounds_are_valid());
-        invalid.accept_poll_interval_ms =
-            crate::tuning_config::IpcTuning::MAX_ACCEPT_POLL_INTERVAL_MS + 1;
-        assert!(!invalid.resource_bounds_are_valid());
-
-        invalid = defaults;
         invalid.max_concurrent_connections = 0;
         assert!(!invalid.resource_bounds_are_valid());
         invalid.max_concurrent_connections =
@@ -5832,10 +5842,10 @@ mod tests {
                 matches!(cancelled, Either::Left(_)),
                 "a cancelled Cx must end the wait without connection_shutdown"
             );
-            assert!(!ctx.connection_shutdown.is_cancelled());
+            assert!(!ctx.connection_shutdown.is_requested());
 
             let server_cx = crate::cx::for_testing();
-            ctx.connection_shutdown.cancel();
+            ctx.connection_shutdown.request();
             let shutdown = futures::future::select(
                 Box::pin(wait_for_ipc_shutdown(&server_cx, &ctx)),
                 Box::pin(crate::runtime_async::sleep(Duration::from_secs(2))),
@@ -5930,64 +5940,413 @@ mod tests {
         assert_eq!(message, "IPC I/O deadline exceeded");
     }
 
-    /// frankenterm#135: one accept-loop wait covers the idle bound, a ready
-    /// client, shutdown (which wins over a ready client) and cancellation
-    /// (which ends the wait without waiting for the idle bound).
+    #[derive(Default)]
+    struct AcceptWaitWakeProbe(AtomicU64);
+
+    impl std::task::Wake for AcceptWaitWakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn accept_wait_virtual_context(
+        budget: crate::cx::Budget,
+    ) -> (
+        crate::cx::Cx,
+        Arc<asupersync::time::VirtualClock>,
+        asupersync::time::TimerDriverHandle,
+    ) {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let identity = crate::cx::for_testing();
+        let cx = crate::cx::Cx::new_with_drivers(
+            identity.region_id(),
+            identity.task_id(),
+            budget,
+            None,
+            None,
+            None,
+            Some(timer.clone()),
+            None,
+        );
+        (cx, clock, timer)
+    }
+
+    #[test]
+    fn connected_shutdown_wait_is_timer_free_and_wakes_all_live_handlers() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let (cx, clock, timer) = accept_wait_virtual_context(crate::cx::Budget::INFINITE);
+        let ctx = Arc::new(IpcHandlerContext::new(Arc::new(EventBus::new(16))));
+        let cloned_ctx = Arc::clone(&ctx);
+        let first_probe = Arc::new(AcceptWaitWakeProbe::default());
+        let second_probe = Arc::new(AcceptWaitWakeProbe::default());
+        let abandoned_probe = Arc::new(AcceptWaitWakeProbe::default());
+        let first_waker = Waker::from(Arc::clone(&first_probe));
+        let second_waker = Waker::from(Arc::clone(&second_probe));
+        let abandoned_waker = Waker::from(Arc::clone(&abandoned_probe));
+        let mut first_task_cx = Context::from_waker(&first_waker);
+        let mut second_task_cx = Context::from_waker(&second_waker);
+        let mut abandoned_task_cx = Context::from_waker(&abandoned_waker);
+        let mut first = Box::pin(wait_for_ipc_shutdown(&cx, &ctx));
+        let mut second = Box::pin(wait_for_ipc_shutdown(&cx, &cloned_ctx));
+        let mut abandoned = Box::pin(wait_for_ipc_shutdown(&cx, &ctx));
+
+        assert!(first.as_mut().poll(&mut first_task_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_task_cx).is_pending());
+        assert!(abandoned.as_mut().poll(&mut abandoned_task_cx).is_pending());
+        drop(abandoned);
+        assert_eq!(
+            timer.pending_count(),
+            0,
+            "connected idle handlers need no timer"
+        );
+        clock.advance_to(asupersync::Time::from_secs(3_600));
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(first_probe.0.load(Ordering::SeqCst), 0);
+        assert_eq!(second_probe.0.load(Ordering::SeqCst), 0);
+
+        assert!(!ctx.connection_shutdown.request());
+        assert!(first_probe.0.load(Ordering::SeqCst) > 0);
+        assert!(second_probe.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            abandoned_probe.0.load(Ordering::SeqCst),
+            0,
+            "dropping a connection must remove its shutdown waiter"
+        );
+        assert!(first.as_mut().poll(&mut first_task_cx).is_ready());
+        assert!(second.as_mut().poll(&mut second_task_cx).is_ready());
+        assert!(
+            !cx.is_cancel_requested(),
+            "server stop must not cancel the caller Cx"
+        );
+
+        // A request before registration is sticky and repeated requests remain
+        // idempotent, so newly arriving waiters also finish without a timer.
+        assert!(ctx.connection_shutdown.request());
+        let mut late = Box::pin(wait_for_ipc_shutdown(&cx, &ctx));
+        assert!(late.as_mut().poll(&mut first_task_cx).is_ready());
+        assert_eq!(timer.pending_count(), 0);
+    }
+
+    #[test]
+    fn connected_shutdown_wait_observes_cancellation_before_and_after_registration() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        for cancelled_before_wait in [false, true] {
+            let (cx, _clock, timer) = accept_wait_virtual_context(crate::cx::Budget::INFINITE);
+            let ctx = IpcHandlerContext::new(Arc::new(EventBus::new(16)));
+            let probe = Arc::new(AcceptWaitWakeProbe::default());
+            let waker = Waker::from(Arc::clone(&probe));
+            let mut task_cx = Context::from_waker(&waker);
+            if cancelled_before_wait {
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("connection cancelled"),
+                );
+            }
+            let mut wait = Box::pin(wait_for_ipc_shutdown(&cx, &ctx));
+            if !cancelled_before_wait {
+                assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+                assert_eq!(timer.pending_count(), 0);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("connection cancelled"),
+                );
+                assert!(probe.0.load(Ordering::SeqCst) > 0);
+            }
+            assert!(wait.as_mut().poll(&mut task_cx).is_ready());
+            assert!(!ctx.connection_shutdown.is_requested());
+            assert_eq!(timer.pending_count(), 0);
+        }
+    }
+
+    #[test]
+    fn connected_shutdown_wait_arms_only_its_context_deadline() {
+        let deadline = asupersync::Time::from_secs(5);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let task_observed = Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x135C_CC01)
+                .with_auto_advance()
+                .max_steps(10_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(
+                region,
+                asupersync::Budget::new().with_deadline(deadline),
+                async move {
+                    let cx = crate::cx::Cx::current().expect("LabRuntime context");
+                    let ctx = IpcHandlerContext::new(Arc::new(EventBus::new(16)));
+                    wait_for_ipc_shutdown(&cx, &ctx).await;
+                    assert!(!ctx.connection_shutdown.is_requested());
+                    *task_observed.lock().expect("record deadline result") =
+                        Some(cx.checkpoint().is_err());
+                },
+            )
+            .expect("spawn connection deadline waiter");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+        assert!(observed.lock().expect("deadline result").is_none());
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        let report = runtime.run_with_auto_advance();
+        assert_eq!(
+            report.auto_advances, 1,
+            "only the context deadline may end an idle connection wait"
+        );
+        assert_eq!(runtime.now(), deadline);
+        assert_eq!(*observed.lock().expect("deadline result"), Some(true));
+        assert_eq!(runtime.pending_timer_count(), 0);
+    }
+
+    /// #135: advancing an empty server's clock cannot generate idle wakes.
+    /// Both a shutdown message and sender closure wake the registered wait.
+    #[test]
+    fn idle_accept_wait_arms_no_timer_and_wakes_on_shutdown() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        for close_channel in [false, true] {
+            let (cx, clock, timer) = accept_wait_virtual_context(crate::cx::Budget::INFINITE);
+            let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+            let mut tasks = crate::runtime_async::task::JoinSet::new();
+            let probe = Arc::new(AcceptWaitWakeProbe::default());
+            let waker = Waker::from(Arc::clone(&probe));
+            let mut task_cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(next_accept_loop_wake(
+                &cx,
+                &mut shutdown_rx,
+                std::future::pending::<u8>(),
+                &mut tasks,
+            ));
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(timer.pending_count(), 0, "empty IPC must arm no timer");
+            clock.advance_to(asupersync::Time::from_secs(3_600));
+            assert_eq!(timer.process_timers(), 0);
+            assert_eq!(probe.0.load(Ordering::SeqCst), 0, "idle must not self-wake");
+
+            if close_channel {
+                drop(shutdown_tx);
+            } else {
+                let mut send = std::pin::pin!(shutdown_tx.send(&cx, ()));
+                assert!(matches!(
+                    send.as_mut().poll(&mut task_cx),
+                    Poll::Ready(Ok(()))
+                ));
+            }
+            assert!(
+                probe.0.load(Ordering::SeqCst) > 0,
+                "shutdown must wake the waiter"
+            );
+            assert!(matches!(
+                wait.as_mut().poll(&mut task_cx),
+                Poll::Ready(AcceptLoopWake::Shutdown)
+            ));
+            drop(wait);
+            assert_eq!(timer.pending_count(), 0);
+            assert!(tasks.is_empty());
+        }
+    }
+
+    /// Shutdown and cancellation win over a simultaneously ready client.
     #[test]
     fn next_accept_loop_wake_covers_shutdown_cancellation_and_clients() {
         run_async_test(async {
             let cx = crate::cx::for_testing();
             let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-            let long_idle = Duration::from_secs(30);
-
-            let wake = next_accept_loop_wake(
-                &cx,
-                &mut shutdown_rx,
-                std::future::pending::<u8>(),
-                Duration::from_millis(20),
-            )
-            .await;
-            assert!(matches!(wake, AcceptLoopWake::Idle), "got {wake:?}");
+            let mut tasks = crate::runtime_async::task::JoinSet::new();
 
             let wake =
-                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), long_idle)
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), &mut tasks)
                     .await;
             assert!(matches!(wake, AcceptLoopWake::Accepted(7)), "got {wake:?}");
 
             send_shutdown(&shutdown_tx).await;
             let wake =
-                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), long_idle)
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), &mut tasks)
                     .await;
             assert!(matches!(wake, AcceptLoopWake::Shutdown), "got {wake:?}");
 
-            let cancel_cx = cx.clone();
-            let canceller = crate::runtime_async::task::spawn(async move {
-                crate::runtime_async::sleep(Duration::from_millis(20)).await;
-                cancel_cx.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("accept loop wait cancel"),
-                );
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("accept loop cancellation"),
+            );
+            let wake =
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), &mut tasks)
+                    .await;
+            assert!(
+                matches!(
+                    wake,
+                    AcceptLoopWake::ContextFailed(
+                        crate::runtime_async::ContextErrorKind::Cancelled
+                    )
+                ),
+                "got {wake:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn accept_wait_reaps_handler_completion_without_new_clients() {
+        run_async_test(async {
+            let (cx, _clock, timer) = accept_wait_virtual_context(crate::cx::Budget::INFINITE);
+            let witness_cx = crate::cx::for_testing();
+            let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+            let (release_tx, release_rx) = crate::runtime_async::oneshot::channel::<()>();
+            let mut tasks = crate::runtime_async::task::JoinSet::new();
+            tasks.spawn(async move {
+                crate::runtime_async::oneshot_recv(release_rx)
+                    .await
+                    .expect("release handler");
             });
-            let started = std::time::Instant::now();
-            let wake = next_accept_loop_wake(
+
+            // A client can win while the handler is pending without dropping
+            // that handler's ownership or its later completion notification.
+            let wake =
+                next_accept_loop_wake(&cx, &mut shutdown_rx, std::future::ready(7_u8), &mut tasks)
+                    .await;
+            assert!(matches!(wake, AcceptLoopWake::Accepted(7)), "got {wake:?}");
+            assert_eq!(tasks.len(), 1);
+
+            let mut wait = Box::pin(next_accept_loop_wake(
                 &cx,
                 &mut shutdown_rx,
                 std::future::pending::<u8>(),
-                long_idle,
-            )
+                &mut tasks,
+            ));
+            std::future::poll_fn(|task_cx| {
+                assert!(std::future::Future::poll(wait.as_mut(), task_cx).is_pending());
+                std::task::Poll::Ready(())
+            })
             .await;
+            assert_eq!(
+                timer.pending_count(),
+                0,
+                "pending healthy handlers need no reap timer"
+            );
+            release_tx.send(()).expect("finish the waiting handler");
+            let wake =
+                crate::runtime_async::timeout_with_cx(&witness_cx, Duration::from_secs(5), wait)
+                    .await
+                    .expect("handler completion must wake the accept loop");
             assert!(
-                matches!(wake, AcceptLoopWake::Cancelled | AcceptLoopWake::Idle),
+                matches!(wake, AcceptLoopWake::ConnectionFinished(Some(Ok(())))),
                 "got {wake:?}"
             );
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "cancellation must end the wait before the idle bound; took {:?}",
-                started.elapsed()
+                tasks.is_empty(),
+                "completion must immediately free admission capacity"
             );
-            let _ = canceller.await;
-            drop(shutdown_tx);
+            assert_eq!(timer.pending_count(), 0);
         });
+    }
+
+    #[test]
+    fn accept_wait_cancellation_preserves_failure_kind_without_a_timer() {
+        use crate::outcome::CancelKind;
+        use crate::runtime_async::ContextErrorKind;
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        for (cancel_kind, expected) in [
+            (CancelKind::User, ContextErrorKind::Cancelled),
+            (CancelKind::Deadline, ContextErrorKind::DeadlineExceeded),
+            (CancelKind::PollQuota, ContextErrorKind::PollQuotaExhausted),
+            (CancelKind::CostBudget, ContextErrorKind::CostQuotaExhausted),
+        ] {
+            let (cx, _clock, timer) = accept_wait_virtual_context(crate::cx::Budget::INFINITE);
+            let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+            let mut tasks = crate::runtime_async::task::JoinSet::new();
+            let probe = Arc::new(AcceptWaitWakeProbe::default());
+            let waker = Waker::from(Arc::clone(&probe));
+            let mut task_cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(next_accept_loop_wake(
+                &cx,
+                &mut shutdown_rx,
+                std::future::pending::<u8>(),
+                &mut tasks,
+            ));
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(timer.pending_count(), 0);
+            cx.cancel_with(cancel_kind, Some("accept wait cancellation proof"));
+            assert!(
+                probe.0.load(Ordering::SeqCst) > 0,
+                "context termination must wake the waiter"
+            );
+            let Poll::Ready(AcceptLoopWake::ContextFailed(actual)) =
+                wait.as_mut().poll(&mut task_cx)
+            else {
+                panic!("context termination must end the pending accept wait");
+            };
+            assert_eq!(actual, expected);
+            drop(wait);
+            assert_eq!(timer.pending_count(), 0);
+        }
+    }
+
+    #[test]
+    fn accept_wait_arms_only_its_context_deadline() {
+        let deadline = asupersync::Time::from_secs(5);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let task_observed = Arc::clone(&observed);
+        let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x135A_CC01)
+                .with_auto_advance()
+                .max_steps(10_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(
+                region,
+                asupersync::Budget::new().with_deadline(deadline),
+                async move {
+                    let cx = crate::cx::Cx::current().expect("LabRuntime context");
+                    let mut tasks = crate::runtime_async::task::JoinSet::new();
+                    let wake = next_accept_loop_wake(
+                        &cx,
+                        &mut shutdown_rx,
+                        std::future::pending::<u8>(),
+                        &mut tasks,
+                    )
+                    .await;
+                    let AcceptLoopWake::ContextFailed(kind) = wake else {
+                        panic!("context deadline must end the accept wait, got {wake:?}");
+                    };
+                    *task_observed.lock().expect("record deadline result") = Some(kind);
+                },
+            )
+            .expect("spawn deadline waiter");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+        assert!(observed.lock().expect("deadline result").is_none());
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        let report = runtime.run_with_auto_advance();
+        assert_eq!(
+            report.auto_advances, 1,
+            "only the context deadline may end an idle wait"
+        );
+        assert_eq!(runtime.now(), deadline);
+        assert_eq!(
+            *observed.lock().expect("deadline result"),
+            Some(crate::runtime_async::ContextErrorKind::DeadlineExceeded)
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
     }
 
     fn run_async_test<F>(future: F)
@@ -6275,7 +6634,6 @@ mod tests {
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
             let mut limits = resolve_limits(None);
-            limits.accept_poll_interval_ms = 10;
             limits.initial_request_timeout_ms = 100;
             limits.io_timeout_ms = 1_000;
             limits.max_concurrent_connections = 4;
@@ -6786,7 +7144,6 @@ mod tests {
             let socket_path = temp_dir.path().join("test.sock");
             let limits = IpcRuntimeLimits {
                 max_message_size: crate::tuning_config::IpcTuning::MIN_MAX_MESSAGE_SIZE,
-                accept_poll_interval_ms: 10,
                 max_concurrent_connections: 4,
                 initial_request_timeout_ms: 500,
                 io_timeout_ms: 500,
@@ -7651,7 +8008,7 @@ mod tests {
                 })
                 .await;
                 if server_shutdown {
-                    ctx.connection_shutdown.cancel();
+                    ctx.connection_shutdown.request();
                 } else {
                     request_cx.cancel_with(
                         crate::outcome::CancelKind::User,
@@ -7734,7 +8091,7 @@ mod tests {
                 );
                 assert!(response.data.is_none());
                 assert!(!witness_cx.is_cancel_requested());
-                assert!(!ctx.connection_shutdown.is_cancelled());
+                assert!(!ctx.connection_shutdown.is_requested());
 
                 drop(writer);
                 let recovered = crate::runtime_async::timeout_with_cx(
