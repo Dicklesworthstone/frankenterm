@@ -1004,6 +1004,24 @@ mod tests {
         );
         assert_eq!(drawn + missing.len(), 1376);
         assert!(drawn >= 1150, "only {drawn} of the T0 emoji have glyphs");
+        // Every T0 codepoint that defaults to emoji presentation must come
+        // from Apple Color Emoji. The ones it lacks on macOS 27 (font version
+        // 22.0, 191 of 1376) all default to text, such as U+1F322 and the
+        // U+1F5xx Wingdings pictographs; those use the fallback chain.
+        let missing_emoji: Vec<String> = missing
+            .iter()
+            .filter(|&&codepoint| {
+                let character = char::from_u32(codepoint).unwrap();
+                termwiz::cell::Presentation::for_char(character)
+                    == termwiz::cell::Presentation::Emoji
+            })
+            .map(|codepoint| format!("U+{codepoint:X}"))
+            .collect();
+        assert!(
+            missing_emoji.is_empty(),
+            "emoji-presentation codepoints with no Apple Color Emoji glyph: {}",
+            missing_emoji.join(" ")
+        );
         assert!(
             chromatic * 100 >= drawn * 95,
             "only {chromatic}/{drawn} T0 emoji drew with chromatic pixels (achromatic: {:X?})",
