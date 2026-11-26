@@ -91,6 +91,87 @@ fn streaming_redactor_drives_cold_tier_split_secret_privacy() {
 }
 
 #[test]
+fn cold_tier_writes_never_expose_an_armored_secret_after_redaction_overflow() {
+    let secret_line = "MIIF7AIBAAKCAQEA0123456789SensitiveMaterial\n";
+    let input = format!(
+        "before\n-----BEGIN RSA PRIVATE KEY-----\n{}-----END RSA PRIVATE KEY-----\nafter\n",
+        secret_line.repeat(32)
+    );
+    let mut redactor = StreamingRedactor::new().with_max_pending_bytes(128);
+    let key = ColdTierKeyHandle {
+        key_id: "overflow-test-key".to_string(),
+        mmap_key_slug: "overflow-test-mmap".to_string(),
+    };
+    let mut written = Vec::new();
+    let mut original_input_bytes = 0_u64;
+    let mut replacements = 0_u64;
+
+    // Drive the actual typed persistence pipeline with tiny chunks, including
+    // split armor delimiters. Compression and encryption are identity test
+    // transforms so the final write exposes exactly what redaction emitted.
+    for bytes in input.as_bytes().chunks(17) {
+        let (redacted, evidence) =
+            ChunkBytes::<Raw>::from_raw(bytes.to_vec()).redact_with_streaming(&mut redactor);
+        original_input_bytes += evidence.original_input_bytes;
+        replacements += u64::from(evidence.replacement_count);
+        assert!(redactor.pending_bytes() <= 128);
+        redacted
+            .compress_with(|bytes| bytes)
+            .encrypt_with(&key, |bytes| bytes)
+            .write_with::<_, ()>(|bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            })
+            .expect("write redacted test chunk");
+    }
+    if let Some((tail, evidence)) = finish_streaming_redaction(&mut redactor) {
+        original_input_bytes += evidence.original_input_bytes;
+        replacements += u64::from(evidence.replacement_count);
+        tail.compress_with(|bytes| bytes)
+            .encrypt_with(&key, |bytes| bytes)
+            .write_with::<_, ()>(|bytes| {
+                written.extend_from_slice(bytes);
+                Ok(())
+            })
+            .expect("write redacted test tail");
+    }
+
+    let output = String::from_utf8(written).expect("valid UTF-8 persistence output");
+    assert!(output.starts_with("before\n"));
+    assert!(output.ends_with("\nafter\n"));
+    assert!(output.contains(REDACTED_MARKER));
+    assert!(!output.contains("MIIF7AIBAAKCAQEA"));
+    assert!(!output.contains("SensitiveMaterial"));
+    assert_eq!(original_input_bytes, input.len() as u64);
+    assert!(replacements > 0);
+}
+
+#[test]
+fn finishing_cold_tier_redaction_retires_an_empty_overflow_quarantine() {
+    let mut redactor = StreamingRedactor::new().with_max_pending_bytes(64);
+    let unfinished = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}",
+        "SensitiveMaterial\n".repeat(32)
+    );
+    let (redacted, evidence) = ChunkBytes::<Raw>::from_raw(unfinished.into_bytes())
+        .redact_with_streaming(&mut redactor);
+    assert!(evidence.made_changes());
+    assert!(!String::from_utf8_lossy(redacted.as_bytes()).contains("SensitiveMaterial"));
+
+    // Even if there are no bytes left to write, the end-of-stream operation
+    // must retire suppression before this redactor is reused for a new stream.
+    let _ = finish_streaming_redaction(&mut redactor);
+    let clean = b"next session ready\n";
+    let (redacted, _) =
+        ChunkBytes::<Raw>::from_raw(clean.to_vec()).redact_with_streaming(&mut redactor);
+    let mut output = redacted.as_bytes().to_vec();
+    if let Some((tail, _)) = finish_streaming_redaction(&mut redactor) {
+        output.extend_from_slice(tail.as_bytes());
+    }
+    assert_eq!(output.as_slice(), clean);
+}
+
+#[test]
 fn production_storage_redacts_split_secret_in_sqlite_and_mmap_mirror() {
     if std::env::var_os(MMAP_REDACTION_CHILD_ENV).is_none() {
         let output = Command::new(std::env::current_exe().expect("current test binary"))

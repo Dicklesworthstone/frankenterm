@@ -257,11 +257,13 @@ impl ChunkBytes<Raw> {
 pub fn finish_streaming_redaction(
     redactor: &mut StreamingRedactor,
 ) -> Option<(ChunkBytes<Redacted>, RedactionEvidence)> {
-    if redactor.pending_bytes() == 0 {
+    // Finish also retires any overflow quarantine. An empty retained buffer
+    // does not imply that the stream has no state: an unterminated secret may
+    // already have been replaced while its continuation is being suppressed.
+    let result = redactor.finish();
+    if result.bytes.is_empty() && result.evidence.original_input_bytes == 0 {
         return None;
     }
-
-    let result = redactor.finish();
     Some((
         ChunkBytes {
             bytes: result.bytes,
@@ -292,7 +294,8 @@ pub struct RedactionEvidence {
     pub decoded_input_text_bytes: u64,
     /// UTF-8 byte length of the emitted redacted bytes.
     pub redacted_output_bytes: u64,
-    /// Exact original source bytes covered by replaced secret spans.
+    /// Original source bytes removed by matched secret spans or conservative
+    /// streaming suppression after an unresolved boundary exceeds its budget.
     pub secret_input_bytes_replaced: u64,
     /// Original source bytes represented by lossy replacement characters
     /// in the scanned text.
@@ -314,10 +317,11 @@ impl RedactionEvidence {
         true
     }
 
-    /// Whether the redactor found and replaced anything.
+    /// Whether bytes were replaced or conservatively withheld. A continuation
+    /// of an overflow episode need not emit another replacement marker.
     #[must_use]
     pub const fn made_changes(&self) -> bool {
-        self.replacement_count > 0
+        self.replacement_count > 0 || self.secret_input_bytes_replaced > 0
     }
 }
 

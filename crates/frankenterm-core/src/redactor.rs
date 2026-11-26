@@ -15,59 +15,37 @@ pub const REDACTED_MARKER: &str = "[REDACTED]";
 /// with no secret-looking suffix are emitted immediately.
 pub const DEFAULT_STREAMING_REDACTOR_TAIL_BYTES: usize = 64 * 1024;
 
-/// Maximum bytes the [`StreamingRedactor.pending`] buffer may hold before
-/// forced emission kicks in. [ft-4socw]
+/// Maximum bytes retained while waiting for a streaming secret boundary.
 ///
-/// Pre-fix \`pending\` had no upper bound: an adversarial or buggy producer
-/// streaming repeated occurrences of any [`STREAMING_SECRET_ANCHORS`] entry
-/// (e.g. `"rk_AAAAAAAA"` × 1 GiB) would drive memory growth without limit
-/// because every anchor in the rolling tail-window pushes the safe-emit
-/// boundary backwards. Setting an absolute cap ensures the buffer drains
-/// even when no clean boundary is found.
-///
-/// 8 MiB is generous for legitimate streams (a single chunked terminal
-/// log line rarely exceeds a few KiB) but quickly halts runaway growth.
+/// An unresolved suffix that reaches this cap is replaced with a marker; its
+/// continuation stays suppressed until a recognized armour terminator or the
+/// explicit end of the stream. Raw secret prefixes are never force-emitted to
+/// make room. The default bounds pathological unterminated-prefix buffering.
 pub const DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
-/// Smallest pending-buffer cap that can make overflow emission progress.
-///
-/// The overflow path targets `max_pending_bytes / 2`; caps below 2 make
-/// progress depend on a zero-byte target. The forced boundary may advance to
-/// the first UTF-8 scalar when flooring would otherwise drain nothing.
+/// Smallest supported pending-buffer cap. Smaller requested caps are clamped.
 pub const MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 2;
 
-/// br-ft-4socw: cumulative count of [`StreamingRedactor::redact_chunk`]
-/// calls that triggered forced emission because `pending.len()` exceeded
-/// `max_pending_bytes`.
+/// Cumulative count of streaming overflow-suppression episodes.
 ///
-/// Non-zero values signal a runaway producer — the streaming redactor
-/// drained content with the redactor regex applied (catching complete
-/// patterns) but cannot guarantee that partial-secret prefixes
-/// straddling the cut boundary weren't emitted unredacted. Operators
-/// should investigate the producer when this counter has a steady
-/// non-zero rate; one-off bumps from large legitimate streams are
-/// expected.
-///
-/// Same observability defect family as ft-luav8 / ft-skec1 / ft-tpdl5
-/// / ft-wzk10 — make silent state loss visible.
+/// Non-zero values signal that content was conservatively withheld because a
+/// safe streaming boundary could not be established within the configured cap.
+/// Continuation chunks in the same episode do not increment this counter.
 static STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Cumulative count of forced emissions from the streaming redactor's
-/// pending buffer overflow path. See
-/// [`STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT`] for the contract.
+/// Cumulative count of overflow-suppression episodes.
 #[must_use]
 pub fn streaming_redactor_pending_overflow_count() -> u64 {
     STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.load(Ordering::Relaxed)
 }
 
-/// Test helper: reset the counter so tests that exercise overflow
-/// can assert post-increment values without state leakage.
+/// Test helper: reset the counter for serialized overflow tests.
 #[cfg(test)]
 pub fn reset_streaming_redactor_pending_overflow_count_for_test() {
     STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
 }
 
-/// Internal helper: bump the counter when forced emission fires.
+/// Internal helper: bump the counter when overflow suppression starts.
 fn record_streaming_redactor_pending_overflow() {
     STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
 }
@@ -1668,12 +1646,101 @@ pub struct StreamingRedactor {
     redactor: Redactor,
     pending: PendingDecodedText,
     tail_bytes: usize,
-    /// br-ft-4socw: absolute cap on the pending buffer. Above this,
-    /// [`StreamingRedactor::redact_chunk`] forces emission of the
-    /// oldest portion to prevent unbounded growth under adversarial
-    /// anchor-prefix streams. See
-    /// [`DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES`].
+    /// Unresolved input above this cap enters fail-closed suppression.
     max_pending_bytes: usize,
+    suppression: Option<StreamingSuppression>,
+}
+
+/// After discarding an unresolved prefix, ordinary regex matching cannot see
+/// what later bytes continue. Retain only a bounded terminator matcher, never
+/// the discarded secret. Arbitrary regexes have no generally safe delimiter.
+#[derive(Debug, Clone)]
+enum StreamingSuppression {
+    UntilFinish,
+    Armour {
+        terminator: Vec<u8>,
+        fallback: Vec<usize>,
+        matched: usize,
+    },
+}
+
+impl StreamingSuppression {
+    fn armour(terminator: String) -> Self {
+        let terminator = terminator.into_bytes();
+        let mut fallback = vec![0; terminator.len()];
+        for index in 1..terminator.len() {
+            let mut matched = fallback[index - 1];
+            while matched > 0 && terminator[index] != terminator[matched] {
+                matched = fallback[matched - 1];
+            }
+            if terminator[index] == terminator[matched] {
+                matched += 1;
+            }
+            fallback[index] = matched;
+        }
+        Self::Armour {
+            terminator,
+            fallback,
+            matched: 0,
+        }
+    }
+
+    /// The returned boundary includes the complete ASCII terminator and is
+    /// therefore a UTF-8 boundary, even when the footer spans several chunks.
+    fn consume(&mut self, bytes: &[u8]) -> Option<usize> {
+        let Self::Armour {
+            terminator,
+            fallback,
+            matched,
+        } = self
+        else {
+            return None;
+        };
+        for (index, byte) in bytes.iter().enumerate() {
+            while *matched > 0 && *byte != terminator[*matched] {
+                *matched = fallback[*matched - 1];
+            }
+            if *byte == terminator[*matched] {
+                *matched += 1;
+            }
+            if *matched == terminator.len() {
+                return Some(index + 1);
+            }
+        }
+        None
+    }
+}
+
+/// A complete sensitive armour header, matching the catalog's full label
+/// grammar. Oversized labels are detected but never retained as matcher state.
+static STREAMING_ARMOURED_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK|PGP PUBLIC KEY BLOCK|PGP MESSAGE|PGP SIGNED MESSAGE)-----",
+    )
+    .expect("streaming armoured header regex")
+});
+
+fn armoured_terminator(label: &str) -> Option<String> {
+    if label.len() > 128 {
+        return None;
+    }
+    let label = if label == "PGP SIGNED MESSAGE" {
+        "PGP SIGNATURE"
+    } else {
+        label
+    };
+    Some(format!("-----END {label}-----"))
+}
+
+fn unclosed_armoured_secret(text: &str) -> Option<usize> {
+    for header in STREAMING_ARMOURED_HEADER.captures_iter(text) {
+        let whole = header.get(0)?;
+        let terminator = armoured_terminator(header.name("label")?.as_str());
+        if terminator.is_none_or(|terminator| !text[whole.end()..].contains(terminator.as_str())) {
+            return Some(whole.start());
+        }
+    }
+    None
 }
 
 impl StreamingRedactor {
@@ -1691,6 +1758,7 @@ impl StreamingRedactor {
             pending: PendingDecodedText::default(),
             tail_bytes: DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
             max_pending_bytes: DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES,
+            suppression: None,
         }
     }
 
@@ -1701,19 +1769,13 @@ impl StreamingRedactor {
         self
     }
 
-    /// Override the pending-buffer cap. [ft-4socw]
+    /// Override the pending-buffer cap.
     ///
-    /// When `pending.len()` exceeds this value during
-    /// [`Self::redact_chunk`], the streaming redactor forcibly emits
-    /// the oldest portion (with the regex redactor applied) to halt
-    /// unbounded growth. Each forced emission bumps
-    /// [`streaming_redactor_pending_overflow_count`].
-    ///
-    /// Values below [`MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES`] are clamped
-    /// upward so the overflow path always drains at least one byte. When the
-    /// cap is lower than `tail_bytes`, the retained-tail scan uses the cap as
-    /// its effective tail limit. Intended primarily for focused tests;
-    /// production callers should rely on the default constant.
+    /// Unresolved input exceeding this cap is replaced with a marker and its
+    /// continuation is suppressed. Each new suppression episode increments the
+    /// overflow counter. Values below the minimum supported cap are clamped.
+    /// Intended primarily for focused tests; production callers should rely on
+    /// the default constant.
     #[must_use]
     pub fn with_max_pending_bytes(mut self, max_pending_bytes: usize) -> Self {
         self.max_pending_bytes = max_pending_bytes.max(MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES);
@@ -1722,63 +1784,53 @@ impl StreamingRedactor {
 
     /// Redact one chunk, returning the safely-emittable prefix.
     ///
-    /// Call [`Self::finish`] after the last chunk to flush the retained tail.
+    /// Call finish after the last chunk to flush the retained tail.
     ///
-    /// # Overflow handling [ft-4socw]
+    /// Input is processed in bounded decode windows. If unresolved input grows
+    /// past the pending cap, it is replaced with a marker and the overflow
+    /// counter is bumped. Subsequent bytes remain suppressed through a known
+    /// PEM/PGP footer, or through finish when no safe terminator is known.
+    /// Custom regex policies retain input until finish because arbitrary
+    /// expressions cannot use the built-in catalog's finite anchor rules.
     ///
-    /// If the pending buffer grows past `max_pending_bytes` after appending
-    /// this chunk, the oldest half is force-emitted with the regex redactor
-    /// applied and [`streaming_redactor_pending_overflow_count`] is bumped.
-    /// The forced emission catches complete secret patterns but may leak
-    /// partial-secret prefixes that straddle the cut boundary. The trade-off
-    /// is bounded leakage versus unbounded heap growth (OOM); operators are
-    /// expected to monitor the counter and investigate runaway producers.
+    /// The retained buffer is at most the cap when this call returns. A decode
+    /// window can temporarily exceed it by at most twelve UTF-8 bytes; a large
+    /// input chunk is never copied wholesale into the pending buffer. The
+    /// returned output allocation still scales with safely emitted content.
     ///
-    /// # Chunk boundaries
-    ///
-    /// Each chunk is lossy-decoded independently
-    /// (`String::from_utf8_lossy`) before being appended to the pending
-    /// buffer, so a chunk boundary that falls in the *middle* of a valid
-    /// multibyte UTF-8 scalar degrades that scalar to `U+FFFD` (one
-    /// replacement char per orphaned byte) rather than carrying the
-    /// trailing bytes into the next chunk. The output stays valid UTF-8
-    /// in all cases, but callers that need byte-exact passthrough of
-    /// multibyte content (rather than redaction-grade fidelity) should
-    /// align chunk boundaries to scalar boundaries. Secret detection is
-    /// unaffected: every catalog pattern is ASCII-prefixed, so a scalar
-    /// mangled at a chunk seam never masks a credential.
+    /// Caller chunks are lossy-decoded independently. A caller boundary inside
+    /// a UTF-8 scalar therefore retains the existing replacement-character
+    /// behavior; internal processing windows never introduce additional seams.
     #[must_use]
-    pub fn redact_chunk(&mut self, bytes: &[u8]) -> RedactionResult {
-        self.pending.push_lossy_decoded(bytes);
-
-        // br-ft-4socw: forced emission on overflow. Drains the oldest
-        // half of pending so subsequent boundary-safe scanning works
-        // on the remaining tail. Merges into the same RedactionResult
-        // as the normal-path emission so callers see a single result
-        // per chunk regardless of overflow.
-        let mut overflow_result: Option<RedactionResult> = None;
-        while self.pending.len() > self.max_pending_bytes {
-            record_streaming_redactor_pending_overflow();
-            let half = self.max_pending_bytes / 2;
-            let force_boundary = overflow_emit_boundary(self.pending.as_str(), half);
-            let forced = self.emit_prefix(force_boundary);
-            overflow_result = Some(match overflow_result {
-                Some(prev) => merge_redaction_results(prev, forced),
-                None => forced,
-            });
+    pub fn redact_chunk(&mut self, mut bytes: &[u8]) -> RedactionResult {
+        let mut result = self.drain_ready();
+        while !bytes.is_empty() {
+            // Lossy decoding expands one invalid source byte to at most three
+            // bytes. The extra three source bytes preserve UTF-8 chunk seams.
+            let room = self.max_pending_bytes.saturating_sub(self.pending.len());
+            let source_window = (room / 3).max(1).min(bytes.len());
+            let boundary = lossy_decode_window_boundary(bytes, source_window);
+            self.pending.push_lossy_decoded(&bytes[..boundary]);
+            bytes = &bytes[boundary..];
+            result = merge_redaction_results(result, self.drain_ready());
         }
-
-        let boundary = self.stable_emit_boundary();
-        let normal = self.emit_prefix(boundary);
-        match overflow_result {
-            Some(forced) => merge_redaction_results(forced, normal),
-            None => normal,
-        }
+        result
     }
 
-    /// Flush and redact all pending bytes at end-of-stream.
+    /// Flush at the explicit end of a stream, then reset for a new stream.
+    ///
+    /// An incomplete private-key/PGP block is withheld even below the cap.
+    /// This must not be used as a periodic flush between adjacent chunks.
     #[must_use]
     pub fn finish(&mut self) -> RedactionResult {
+        self.suppression = None;
+        if unclosed_armoured_secret(self.pending.as_str()).is_some() {
+            // This buffer is still unresolved. A custom expression or a quoted
+            // password can begin before the armour header and end after it;
+            // splitting first would erase the context that masks its prefix.
+            // Earlier safely emitted text is unaffected.
+            return self.suppress_prefix(self.pending.len(), true);
+        }
         let pending = std::mem::take(&mut self.pending);
         redact_decoded_text_with_evidence(&self.redactor, &pending)
     }
@@ -1802,6 +1854,12 @@ impl StreamingRedactor {
     }
 
     fn stable_emit_boundary(&self) -> usize {
+        // A custom expression may start with any byte or span arbitrary lines.
+        // Keep its input together until finish instead of emitting a prefix
+        // that the later half of the expression can no longer recognize.
+        if !self.redactor.custom_patterns.is_empty() {
+            return 0;
+        }
         let mut boundary = self.pending.len();
         let detections = self.redactor.detect(self.pending.as_str());
         // ft-aznq6: one automaton pass, reused by every fixed-point iteration.
@@ -1997,6 +2055,13 @@ impl StreamingRedactor {
     }
 
     fn effective_tail_bytes(&self) -> usize {
+        if self.pending.len() > self.max_pending_bytes {
+            // Before choosing suppression, inspect every retained byte for a
+            // safe prefix. A tiny test cap must not move the retention floor
+            // into an incomplete token merely to make room; safe Unicode and
+            // complete delimited secrets can still be emitted normally.
+            return self.pending.len();
+        }
         // Never scan an open-anchor window smaller than
         // `STREAMING_ANCHOR_TAIL_FLOOR`: below it a keyed `key=value` secret
         // whose value prefix has scrolled past a small `with_tail_bytes`
@@ -2006,6 +2071,98 @@ impl StreamingRedactor {
         // caps.
         let floor = STREAMING_ANCHOR_TAIL_FLOOR.min(self.max_pending_bytes);
         self.tail_bytes.max(floor).min(self.max_pending_bytes)
+    }
+
+    fn drain_ready(&mut self) -> RedactionResult {
+        let mut result = RedactionResult {
+            bytes: Vec::new(),
+            evidence: BytesRedactionEvidence::default(),
+        };
+        loop {
+            if self.pending.is_empty() {
+                return result;
+            }
+            if let Some(suppression) = self.suppression.as_mut() {
+                let end = suppression.consume(self.pending.as_str().as_bytes());
+                let boundary = end.unwrap_or(self.pending.len());
+                result = merge_redaction_results(result, self.suppress_prefix(boundary, false));
+                if end.is_none() {
+                    return result;
+                }
+                self.suppression = None;
+                continue;
+            }
+            let boundary = self.stable_emit_boundary();
+            if boundary > 0 {
+                result = merge_redaction_results(result, self.emit_prefix(boundary));
+            }
+            if self.pending.len() > self.max_pending_bytes {
+                record_streaming_redactor_pending_overflow();
+                self.suppression = Some(
+                    if self.redactor.custom_patterns.is_empty() {
+                        STREAMING_ARMOURED_HEADER
+                            .captures(self.pending.as_str())
+                            .filter(|header| {
+                                header.get(0).is_some_and(|whole| whole.start() == 0)
+                            })
+                            .and_then(|header| header.name("label"))
+                            .and_then(|label| armoured_terminator(label.as_str()))
+                            .map(StreamingSuppression::armour)
+                            .unwrap_or(StreamingSuppression::UntilFinish)
+                    } else {
+                        StreamingSuppression::UntilFinish
+                    },
+                );
+                // Emit one content-free marker for this entire episode. Its
+                // continuation contributes byte evidence without more markers.
+                let marker = if self.redactor.include_pattern_names {
+                    b"[REDACTED:streaming_unresolved]".to_vec()
+                } else {
+                    self.redactor.marker().as_bytes().to_vec()
+                };
+                let marker_len = marker.len() as u64;
+                result = merge_redaction_results(
+                    result,
+                    RedactionResult {
+                        bytes: marker,
+                        evidence: BytesRedactionEvidence {
+                            replacement_count: 1,
+                            redacted_output_bytes: marker_len,
+                            ..BytesRedactionEvidence::default()
+                        },
+                    },
+                );
+                continue;
+            }
+            return result;
+        }
+    }
+
+    /// Conservatively removed bytes count as withheld source bytes, not as a
+    /// claim that each byte individually matched a secret expression.
+    fn suppress_prefix(&mut self, boundary: usize, emit_marker: bool) -> RedactionResult {
+        let withheld = self.pending.take_prefix(boundary);
+        let bytes = if emit_marker && !withheld.is_empty() {
+            if self.redactor.include_pattern_names {
+                b"[REDACTED:streaming_unresolved]".to_vec()
+            } else {
+                self.redactor.marker().as_bytes().to_vec()
+            }
+        } else {
+            Vec::new()
+        };
+        RedactionResult {
+            evidence: BytesRedactionEvidence {
+                replacement_count: u32::from(!bytes.is_empty()),
+                original_input_bytes: withheld.original_input_bytes(),
+                decoded_input_text_bytes: withheld.len() as u64,
+                redacted_output_bytes: bytes.len() as u64,
+                secret_input_bytes_replaced: withheld.original_input_bytes(),
+                lossy_input_bytes: withheld.lossy_input_bytes(),
+                lossy_replacement_count: withheld.lossy_replacement_count(),
+            },
+            bytes,
+        }
     }
 
     fn emit_prefix(&mut self, boundary: usize) -> RedactionResult {
@@ -2137,15 +2294,16 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn overflow_emit_boundary(text: &str, index: usize) -> usize {
-    let floor = floor_char_boundary(text, index);
-    if floor > 0 || text.is_empty() {
-        return floor;
+/// Do not introduce new lossy-decoding seams while splitting one caller chunk
+/// into bounded windows. Extending over at most three continuation bytes keeps
+/// both valid UTF-8 scalars and invalid incomplete prefixes together.
+fn lossy_decode_window_boundary(bytes: &[u8], index: usize) -> usize {
+    let mut boundary = index.min(bytes.len());
+    let limit = boundary.saturating_add(3).min(bytes.len());
+    while boundary < limit && bytes[boundary] & 0xc0 == 0x80 {
+        boundary += 1;
     }
-
-    text.char_indices()
-        .nth(1)
-        .map_or_else(|| text.len(), |(boundary, _)| boundary)
+    boundary
 }
 
 /// br-ft-4socw: combine a forced-emission result with the
@@ -2207,7 +2365,9 @@ pub struct BytesRedactionEvidence {
     pub decoded_input_text_bytes: u64,
     /// UTF-8 byte length of the emitted redacted bytes.
     pub redacted_output_bytes: u64,
-    /// Exact original source bytes covered by replaced secret spans.
+    /// Exact original source bytes covered by replacements, including bytes
+    /// conservatively withheld after streaming context exceeds its limit.
+    /// Withheld bytes are not a claim that every byte matched a secret regex.
     pub secret_input_bytes_replaced: u64,
     /// Original source bytes represented by lossy replacement
     /// characters in the scanned text.
@@ -2228,12 +2388,12 @@ impl BytesRedactionEvidence {
         true
     }
 
-    /// Whether the redactor matched + replaced anything.
+    /// Whether the redactor replaced or conservatively withheld anything.
     /// Distinct from `redactor_applied` (substrate scanned but
     /// found no secrets ⇒ applied=true, made_changes=false).
     #[must_use]
     pub const fn made_changes(&self) -> bool {
-        self.replacement_count > 0
+        self.replacement_count > 0 || self.secret_input_bytes_replaced > 0
     }
 }
 
@@ -2550,6 +2710,224 @@ mod tests {
         let mut bytes = streaming.redact_chunk(input.as_bytes()).bytes;
         bytes.extend(streaming.finish().bytes);
         assert_eq!(bytes, expected.as_bytes());
+    }
+
+    #[test]
+    fn streaming_custom_secret_without_builtin_anchor_is_redacted_at_every_split() {
+        let input = "before ORG-482901 after\n";
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[r"ORG-[0-9]{6}".to_string()],
+            Some("[PRIVATE]"),
+        )
+        .expect("valid custom redactor");
+        for split in 0..=input.len() {
+            let mut streaming = StreamingRedactor::with_redactor(redactor.clone());
+            let first = streaming.redact_chunk(&input.as_bytes()[..split]);
+            let second = streaming.redact_chunk(&input.as_bytes()[split..]);
+            assert!(first.bytes.is_empty(), "split={split}");
+            assert!(second.bytes.is_empty(), "split={split}");
+            let finished = streaming.finish();
+            assert_eq!(finished.bytes, b"before [PRIVATE] after\n", "split={split}");
+            assert_eq!(finished.evidence.original_input_bytes, input.len() as u64);
+        }
+    }
+
+    #[test]
+    fn streaming_finish_masks_unterminated_armour_without_losing_plain_prefix() {
+        for label in [
+            "PRIVATE KEY".to_string(),
+            "RSA PRIVATE KEY".to_string(),
+            "PGP PRIVATE KEY BLOCK".to_string(),
+            "PGP SIGNED MESSAGE".to_string(),
+            format!("{} PRIVATE KEY", "A".repeat(160)),
+        ] {
+            let input = format!("before!\n-----BEGIN {label}-----\nSensitiveMaterial\n");
+            let mut streaming = StreamingRedactor::new();
+            let mut result = streaming.redact_chunk(input.as_bytes());
+            result = super::merge_redaction_results(result, streaming.finish());
+            assert_eq!(result.bytes, b"before!\n[REDACTED]", "label={label}");
+            assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+            assert_eq!(
+                result.evidence.secret_input_bytes_replaced,
+                (input.len() - "before!\n".len()) as u64
+            );
+            assert!(streaming.finish().bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_finish_does_not_split_custom_match_at_unfinished_armour() {
+        let input = "ORG-482901\n-----BEGIN PRIVATE KEY-----\nbody";
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[r"ORG-[0-9]{6}\n-----BEGIN PRIVATE KEY-----".to_string()],
+            Some("[PRIVATE]"),
+        )
+        .expect("valid custom redactor");
+        assert!(redactor.contains_secrets(input));
+        let mut streaming = StreamingRedactor::with_redactor(redactor);
+        assert!(streaming.redact_chunk(input.as_bytes()).bytes.is_empty());
+        let finished = streaming.finish();
+        assert_eq!(finished.bytes, b"[PRIVATE]");
+        assert_eq!(finished.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(
+            finished.evidence.secret_input_bytes_replaced,
+            input.len() as u64
+        );
+    }
+
+    #[test]
+    fn streaming_finish_does_not_split_quoted_password_at_unfinished_armour() {
+        let input = "password=\"SensitivePrefix\n-----BEGIN PRIVATE KEY-----\nbody\"";
+        assert!(Redactor::new().contains_secrets(input));
+        let mut streaming = StreamingRedactor::new();
+        assert!(streaming.redact_chunk(input.as_bytes()).bytes.is_empty());
+        let finished = streaming.finish();
+        assert_eq!(finished.bytes, REDACTED_MARKER.as_bytes());
+        assert_eq!(finished.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(
+            finished.evidence.secret_input_bytes_replaced,
+            input.len() as u64
+        );
+    }
+
+    #[test]
+    fn streaming_overflow_masks_armour_and_recovers_after_every_split_footer() {
+        let _guard = streaming_overflow_test_lock();
+        for (label, footer_label) in [
+            ("PRIVATE KEY", "PRIVATE KEY"),
+            ("RSA PRIVATE KEY", "RSA PRIVATE KEY"),
+            ("PGP PRIVATE KEY BLOCK", "PGP PRIVATE KEY BLOCK"),
+            ("PGP SIGNED MESSAGE", "PGP SIGNATURE"),
+        ] {
+            let prefix = format!(
+                "before!\n-----BEGIN {label}-----\n{}",
+                "SensitiveMaterial\n".repeat(32)
+            );
+            let footer = format!("-----END {footer_label}-----");
+            for split in 0..=footer.len() {
+                let mut streaming = StreamingRedactor::new().with_max_pending_bytes(128);
+                let mut result = streaming.redact_chunk(prefix.as_bytes());
+                assert!(streaming.pending_bytes() <= 128);
+                result = super::merge_redaction_results(
+                    result,
+                    streaming.redact_chunk(b"StillSensitive\n"),
+                );
+                result = super::merge_redaction_results(
+                    result,
+                    streaming.redact_chunk(&footer.as_bytes()[..split]),
+                );
+                result = super::merge_redaction_results(
+                    result,
+                    streaming.redact_chunk(&footer.as_bytes()[split..]),
+                );
+                result = super::merge_redaction_results(
+                    result,
+                    streaming.redact_chunk(b"\nafter!\n"),
+                );
+                result = super::merge_redaction_results(result, streaming.finish());
+                assert_eq!(
+                    result.bytes,
+                    b"before!\n[REDACTED]\nafter!\n",
+                    "{label} split={split}"
+                );
+                assert_eq!(result.evidence.replacement_count, 1);
+                assert_eq!(
+                    result.evidence.original_input_bytes,
+                    (prefix.len()
+                        + b"StillSensitive\n".len()
+                        + footer.len()
+                        + b"\nafter!\n".len()) as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_overflow_never_releases_a_partial_token_or_its_continuation() {
+        let _guard = streaming_overflow_test_lock();
+        let token = b"sk-1234567890abcdef1234567890abcdef";
+        for split in 0..=token.len() {
+            let mut streaming = StreamingRedactor::new().with_max_pending_bytes(2);
+            let first = streaming.redact_chunk(&token[..split]);
+            let second = streaming.redact_chunk(&token[split..]);
+            let mut result = super::merge_redaction_results(first, second);
+            result = super::merge_redaction_results(result, streaming.finish());
+            assert_eq!(result.bytes, REDACTED_MARKER.as_bytes(), "split={split}");
+            assert_eq!(result.evidence.original_input_bytes, token.len() as u64);
+            assert_eq!(
+                result.evidence.secret_input_bytes_replaced,
+                token.len() as u64
+            );
+            assert_eq!(result.evidence.replacement_count, 1);
+            assert_eq!(streaming.pending_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn streaming_overflow_custom_policy_counts_lossy_suppression_and_resets_at_finish() {
+        let _guard = streaming_overflow_test_lock();
+        let redactor = Redactor::with_custom_patterns_and_placeholder(
+            &[r"ORG-[0-9]{6}".to_string()],
+            Some("[PRIVATE]"),
+        )
+        .expect("valid custom redactor");
+        let mut streaming = StreamingRedactor::with_redactor(redactor).with_max_pending_bytes(16);
+        let first = b"ORG-482901\xff\xfe more sensitive data";
+        let second = b"continued\xf0\x90\x80";
+        let mut result = streaming.redact_chunk(first);
+        let continuation = streaming.redact_chunk(second);
+        assert!(continuation.evidence.made_changes());
+        assert_eq!(continuation.evidence.replacement_count, 0);
+        result = super::merge_redaction_results(result, continuation);
+        assert_eq!(streaming.pending_bytes(), 0);
+        result = super::merge_redaction_results(result, streaming.finish());
+        assert_eq!(result.bytes, b"[PRIVATE]");
+        assert_eq!(
+            result.evidence.original_input_bytes,
+            (first.len() + second.len()) as u64
+        );
+        assert_eq!(
+            result.evidence.secret_input_bytes_replaced,
+            (first.len() + second.len()) as u64
+        );
+        assert_eq!(result.evidence.lossy_input_bytes, 5);
+        assert_eq!(result.evidence.lossy_replacement_count, 3);
+        assert_eq!(
+            result.evidence.decoded_input_text_bytes,
+            (String::from_utf8_lossy(first).len() + String::from_utf8_lossy(second).len()) as u64
+        );
+        assert_eq!(
+            result.evidence.redacted_output_bytes,
+            b"[PRIVATE]".len() as u64
+        );
+        assert!(streaming.finish().bytes.is_empty());
+        assert!(streaming.redact_chunk(b"clean\n").bytes.is_empty());
+        assert_eq!(streaming.finish().bytes, b"clean\n");
+    }
+
+    #[test]
+    fn streaming_small_cap_preserves_safe_unicode_and_lossy_decode_boundaries() {
+        let _guard = streaming_overflow_test_lock();
+        let input = "\u{1f9ea}\u{03bb}\u{65e5}\n".repeat(64);
+        let mut streaming = StreamingRedactor::new().with_max_pending_bytes(2);
+        let mut result = streaming.redact_chunk(input.as_bytes());
+        result = super::merge_redaction_results(result, streaming.finish());
+        assert_eq!(result.bytes, input.as_bytes());
+        assert_eq!(result.evidence.original_input_bytes, input.len() as u64);
+        assert_eq!(result.evidence.lossy_input_bytes, 0);
+
+        for bytes in [
+            &[0xf0, 0x90, 0x80, 0x80, b'!'][..],
+            &[0xf0, 0x90, 0x80, b'!'][..],
+            &[0xe0, 0x80, 0x80, b'!'][..],
+            &[0xff, 0x80, 0x80, 0x80, b'!'][..],
+        ] {
+            let mut streaming = StreamingRedactor::new().with_max_pending_bytes(2);
+            let mut actual = streaming.redact_chunk(bytes);
+            actual = super::merge_redaction_results(actual, streaming.finish());
+            let expected = Redactor::new().redact_bytes_with_evidence(bytes);
+            assert_eq!(actual, expected, "input={bytes:?}");
+        }
     }
 
     #[test]
@@ -3962,12 +4340,8 @@ mod tests {
 
     #[test]
     fn streaming_redactor_pending_overflow_does_not_drop_secrets_within_emitted_window() {
-        // br-ft-4socw: forced emission applies the redactor regex
-        // BEFORE emitting. Complete secret patterns within the
-        // forced-emit window must still be redacted; the trade-off
-        // documented in the bead is that PARTIAL prefixes straddling
-        // the cut boundary may leak (acceptable for a hardening
-        // counter; OOM is the worse alternative).
+        // Complete, safely delimited secrets still use ordinary redaction.
+        // Unresolved prefixes that cannot fit are withheld rather than leaked.
         let _guard = streaming_overflow_test_lock();
         super::reset_streaming_redactor_pending_overflow_count_for_test();
 

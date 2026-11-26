@@ -680,11 +680,9 @@ impl MmapScrollback {
         &mut self,
     ) -> Result<Option<MmapAppendReport>, MmapScrollbackError> {
         self.ensure_ready_for_input()?;
-        if self.redactor.pending_bytes() == 0 {
-            self.pending_record_kind = None;
-            return Ok(None);
-        }
-
+        // An overflow can leave no buffered bytes while suppression remains
+        // active. Only this explicit stream boundary retires that state;
+        // periodic sync must continue preserving it between adjacent appends.
         let record_kind = self.pending_record_kind.unwrap_or(RecordKind::Text);
         let redacted = self.redactor.finish();
         self.pending_record_kind = None;
