@@ -848,22 +848,22 @@ fn detected_config_path(
 ) -> Option<String> {
     let provider = AgentProvider::from_slug(&entry.slug);
     let template = crate::agent_config_templates::generate_template(&provider);
+    // The template names its file with `/` (`.github/copilot-instructions.md`);
+    // join it per component so a Windows path has one kind of separator.
+    let config_file = |root: &str| {
+        template
+            .filename
+            .split('/')
+            .fold(std::path::PathBuf::from(root), |path, part| path.join(part))
+    };
     let candidate_roots: Vec<String> = entry
         .root_paths
         .iter()
-        .filter(|root| {
-            std::path::Path::new(root)
-                .join(&template.filename)
-                .is_file()
-        })
+        .filter(|root| config_file(root).is_file())
         .cloned()
         .collect();
-    preferred_root_path(&provider, &candidate_roots).map(|root| {
-        std::path::Path::new(root)
-            .join(&template.filename)
-            .display()
-            .to_string()
-    })
+    preferred_root_path(&provider, &candidate_roots)
+        .map(|root| config_file(root).display().to_string())
 }
 
 #[cfg(feature = "agent-detection")]
