@@ -10247,6 +10247,23 @@ impl StorageHandle {
         .await
     }
 
+    /// When this database began allocating segment IDs it never reuses
+    /// (schema v53), or `None` if no migration recorded that. A segment ID
+    /// stored earlier, such as a secret-scan checkpoint, may since have been
+    /// reissued: v53 first seeded its high-water mark from the surviving
+    /// segments only.
+    pub async fn segment_id_authority_since_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Option<i64>> {
+        Self::checkpoint_storage_operation(cx, "segment_id_authority_since")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), query_segment_id_authority_since_backend)
+        })
+        .await
+    }
+
     /// Get workflow by ID
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -36632,6 +36649,24 @@ fn query_latest_secret_scan_report_backend(
     row.as_deref()
         .map(secret_scan_report_from_backend_cells)
         .transpose()
+}
+
+/// When migration v53 made this database's segment IDs permanent, or `None`
+/// if no applied v53 is recorded. Before then they were plain rowids that
+/// could be reissued once retention freed the highest.
+fn query_segment_id_authority_since_backend(backend: &dyn StorageBackend) -> Result<Option<i64>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT MIN(applied_at) FROM schema_version WHERE version = 53",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Query segment ID authority", err))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(CellRowReader::new(&row)
+        .optional_i64(0)
+        .map_err(|err| storage_backend_error("Segment ID authority time", err))?)
 }
 
 // =============================================================================

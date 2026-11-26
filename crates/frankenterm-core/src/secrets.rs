@@ -266,7 +266,24 @@ impl SecretScanEngine {
         let checkpoint = storage
             .latest_secret_scan_report_with_cx(cx, &scope_hash)
             .await?;
-        let resume_after_id = checkpoint.and_then(|report| report.last_segment_id);
+        // A checkpoint written before segment IDs became permanent may name
+        // IDs retention freed and the database has reissued since: v53 first
+        // seeded its allocator from the surviving segments only. Rescan
+        // those once; a checkpoint written after cannot be overtaken.
+        let permanent_ids_since = if checkpoint.is_some() {
+            storage.segment_id_authority_since_with_cx(cx).await?
+        } else {
+            None
+        };
+        let resume_after_id = checkpoint.and_then(|report| {
+            let predates_permanent_ids =
+                permanent_ids_since.is_some_and(|since| report.created_at < since);
+            if predates_permanent_ids {
+                None
+            } else {
+                report.last_segment_id
+            }
+        });
 
         let report = self
             .scan_storage_from_with_cx(cx, storage, options, resume_after_id)
@@ -1342,6 +1359,58 @@ mod tests {
                 report2.resume_after_id.is_some(),
                 "should have resume point"
             );
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn scan_storage_incremental_rescans_a_checkpoint_older_than_permanent_segment_ids() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("pre_authority").await;
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "token sk-abc0234567890abcdef1234567890abcdef12345678",
+            );
+            let engine = SecretScanEngine::new();
+            let options = SecretScanOptions::default();
+            // Before v53 the scan had checkpointed through ID 1000, and
+            // retention then freed every segment: the new one may hold an ID
+            // at or below that checkpoint.
+            let checkpoint = |created_at: i64| SecretScanReportRecord {
+                id: 0,
+                scope_hash: engine.checkpoint_key(&options).unwrap(),
+                scope_json: "{}".to_string(),
+                report_version: 1,
+                last_segment_id: Some(1_000),
+                report_json: "{}".to_string(),
+                created_at,
+            };
+            storage
+                .record_secret_scan_report(checkpoint(1))
+                .await
+                .unwrap();
+            let rescanned = engine
+                .scan_storage_incremental(&storage, options.clone())
+                .await
+                .unwrap();
+            assert_eq!(rescanned.resume_after_id, None);
+            assert_eq!(rescanned.scanned_segments, 1);
+            assert!(rescanned.matches_total > 0);
+
+            // A checkpoint recorded after v53 names IDs that can never be
+            // reissued, so the scan resumes after it.
+            storage
+                .record_secret_scan_report(checkpoint(now_ms() + 60_000))
+                .await
+                .unwrap();
+            let resumed = engine
+                .scan_storage_incremental(&storage, options)
+                .await
+                .unwrap();
+            assert_eq!(resumed.resume_after_id, Some(1_000));
+            assert_eq!(resumed.scanned_segments, 0);
 
             teardown(storage, &db_path).await;
         });

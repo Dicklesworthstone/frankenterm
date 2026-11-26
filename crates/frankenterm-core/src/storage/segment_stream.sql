@@ -14,11 +14,16 @@ CREATE TABLE IF NOT EXISTS segment_stream_state (
 );
 
 -- This seed runs only during installation, never as a current-schema repair.
--- The subquery keeps WHERE NOT EXISTS outside the aggregate, including when
+-- The subqueries keep WHERE NOT EXISTS outside the aggregates, including when
 -- output_segments is empty or fresh initialization applies this SQL twice.
+-- Legacy segment IDs were plain rowids, so retention could already have freed
+-- the highest ones. A secret-scan checkpoint is the one stored segment ID with
+-- no foreign key; seeding past it keeps an incremental scan from skipping
+-- reissued IDs.
 INSERT INTO segment_stream_state (singleton, cursor_epoch, max_segment_id)
 SELECT 1, lower(hex(randomblob(16))),
-       (SELECT COALESCE(MAX(id), 0) FROM output_segments)
+       MAX((SELECT COALESCE(MAX(id), 0) FROM output_segments),
+           (SELECT COALESCE(MAX(last_segment_id), 0) FROM secret_scan_reports))
 WHERE NOT EXISTS (SELECT 1 FROM segment_stream_state WHERE singleton = 1);
 
 CREATE INDEX IF NOT EXISTS idx_segments_pane_id ON output_segments(pane_id, id);

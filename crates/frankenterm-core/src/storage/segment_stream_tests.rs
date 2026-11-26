@@ -344,6 +344,37 @@ fn segment_stream_v53_upgrade_seeds_once_and_reopen_does_not_repair_missing_auth
     );
 }
 
+#[test]
+fn segment_stream_v53_upgrade_seeds_past_a_secret_scan_checkpoint_of_freed_ids() {
+    // Retention freed segments 84..=500 after a scan checkpointed at 500.
+    // Seeding from the surviving MAX(id) would reissue 84 and the next
+    // incremental scan would resume after 500, skipping it.
+    let connection = stream_connection();
+    connection
+        .execute_batch(
+            "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at)
+             VALUES (83, 7, 0, 'legacy', 6, 1);
+             INSERT INTO secret_scan_reports
+                 (scope_hash, scope_json, report_version, last_segment_id, report_json, created_at)
+             VALUES ('scope', '{}', 1, 500, '{}', 1), ('other', '{}', 1, NULL, '{}', 2);
+             DROP TRIGGER output_segments_monotonic_id_ai;
+             DROP TRIGGER output_segments_id_update_guard;
+             DROP TRIGGER segment_stream_state_insert_guard;
+             DROP TRIGGER segment_stream_state_delete_guard;
+             DROP TRIGGER segment_stream_state_update_guard;
+             DROP TABLE segment_stream_state;
+             DROP INDEX idx_segments_pane_id;
+             PRAGMA user_version = 52;
+             UPDATE ft_meta SET schema_version = 52 WHERE id = 1;
+             DELETE FROM schema_version WHERE version = 53;",
+        )
+        .unwrap();
+    initialize_schema(&connection).expect("upgrade legacy segment allocator");
+    assert_eq!(authority(&connection).1, 500);
+    let backend = RusqliteBackend::new(connection).unwrap();
+    assert_eq!(append(&backend, 7, 1, 2).id, 501);
+}
+
 #[cfg(unix)]
 #[test]
 fn fresh_stream_read_observes_replacement_and_never_creates_a_missing_database() {
