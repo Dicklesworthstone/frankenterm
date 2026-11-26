@@ -2416,36 +2416,38 @@ pub(crate) fn check_db_path_workspace_safety(
         );
     }
     let path = std::path::Path::new(trimmed);
-    if path.is_absolute() {
+    if path_escapes_join_base(path) {
         return Err(format!(
             "storage.db_path '{trimmed}' must be relative to the workspace .ft directory; \
              absolute paths can redirect runtime state outside the workspace. Set \
              FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1 to override (operator-only escape hatch).",
         ));
     }
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err(format!(
-                "storage.db_path '{trimmed}' must not contain '..' segments; \
-                 path traversal can redirect runtime state outside the workspace .ft directory. \
-                 Set FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1 to override (operator-only escape hatch).",
-            ));
-        }
-        if matches!(
-            component,
-            std::path::Component::RootDir | std::path::Component::Prefix(_)
-        ) {
-            // Defense in depth: `Path::is_absolute` already covers
-            // these on the current platform, but a Windows drive
-            // prefix (e.g. `C:`) reaching this branch on a relative-
-            // probe path is also a redirect attempt.
-            return Err(format!(
-                "storage.db_path '{trimmed}' must not contain a root or drive prefix; \
-                 absolute-style components can redirect runtime state outside the workspace.",
-            ));
-        }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "storage.db_path '{trimmed}' must not contain '..' segments; \
+             path traversal can redirect runtime state outside the workspace .ft directory. \
+             Set FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1 to override (operator-only escape hatch).",
+        ));
     }
     Ok(())
+}
+
+/// True when `path` joined to a base directory does not stay under it: an
+/// absolute path, or on Windows a root-relative path (`\tmp\x`) or a
+/// drive-relative one (`C:x`). `Path::is_absolute` is false for the last two,
+/// but `Path::join` replaces all of the base but its drive for the first and
+/// all of it for the second. On Unix this is `Path::is_absolute`.
+fn path_escapes_join_base(path: &Path) -> bool {
+    path.is_absolute()
+        || path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
 }
 
 /// br-ft-at5kq: env-var escape hatch for the workspace-containment
@@ -3991,12 +3993,13 @@ impl IpcConfig {
         self.permissions & IPC_NON_OWNER_ACCESS_MASK != 0
     }
 
-    /// True when the configured socket path is absolute (rooted
-    /// at `/`). Absolute paths escape the workspace `.ft` dir,
-    /// so they require tokens at validation time.
+    /// True when the configured socket path does not resolve under the
+    /// workspace `.ft` dir: an absolute path, or on Windows a root- or
+    /// drive-relative one (`\tmp\ft.sock`, `C:ft.sock`). Such paths escape
+    /// the workspace, so they require tokens at validation time.
     #[must_use]
     pub fn socket_path_is_absolute(&self) -> bool {
-        Path::new(self.socket_path.trim()).is_absolute()
+        path_escapes_join_base(Path::new(self.socket_path.trim()))
     }
 
     /// True when the configured socket path contains a `..`
@@ -6993,8 +6996,18 @@ fn physical_operator_root(root: PathBuf) -> PathBuf {
 
 // Provide a fallback for dirs crate
 mod dirs {
+    /// `HOME`, else on Windows `USERPROFILE`. Windows sets no `HOME` unless a
+    /// Unix-style shell does, so without the fallback a `~/` path stayed
+    /// literal there and resolved under the current directory.
     pub fn home_dir() -> Option<std::path::PathBuf> {
-        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        let profile = if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        };
+        std::env::var_os("HOME")
+            .or(profile)
+            .map(std::path::PathBuf::from)
     }
 
     /// Windows-only data-directory resolver for this `mod dirs` fallback (which
@@ -7846,6 +7859,30 @@ disabled_rules = ["codex.usage_warning"]
             err.contains("FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE"),
             "error must point at the operator escape hatch, got: {err}",
         );
+    }
+
+    /// `Path::is_absolute` is false for these, but each leaves the workspace
+    /// when joined to it. On Unix they are ordinary relative names.
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_and_drive_relative_paths_leave_the_workspace() {
+        for path in [r"\tmp\escape.db", "C:escape.db"] {
+            let err = check_db_path_workspace_safety(path, false)
+                .expect_err("a root- or drive-relative db_path must reject");
+            assert!(
+                err.contains("must be relative")
+                    && err.contains("FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE"),
+                "{path}: {err}"
+            );
+        }
+        for path in [r"\tmp\ft.sock", "C:ft.sock"] {
+            let cfg = ipc_config_with(0o600, path, Vec::new());
+            assert!(cfg.socket_path_is_absolute(), "{path}");
+            let err = cfg
+                .validate()
+                .expect_err("a socket outside the workspace needs an auth token");
+            assert!(err.contains("auth token"), "{path}: {err}");
+        }
     }
 
     #[test]
@@ -11167,10 +11204,21 @@ retention_tiers = []
     // resolve_path Tests
     // =========================================================================
 
+    /// `unix_path` as an absolute path on this platform: unchanged on Unix,
+    /// and on drive C: on Windows, where a path starting with `/` is
+    /// root-relative rather than absolute.
+    fn platform_absolute(unix_path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", unix_path.replace('/', "\\")))
+        } else {
+            PathBuf::from(unix_path)
+        }
+    }
+
     #[test]
     fn resolve_path_absolute() {
-        let result = resolve_path(Path::new("/usr/bin/test")).unwrap();
-        assert_eq!(result, PathBuf::from("/usr/bin/test"));
+        let path = platform_absolute("/usr/bin/test");
+        assert_eq!(resolve_path(&path).unwrap(), path);
     }
 
     #[test]
@@ -11209,28 +11257,24 @@ retention_tiers = []
 
     #[test]
     fn resolve_workspace_root_with_explicit_path() {
-        let result =
-            resolve_workspace_root_with_env(Some(Path::new("/tmp/test-workspace")), None, None)
-                .unwrap();
-        assert_eq!(result, PathBuf::from("/tmp/test-workspace"));
+        let root = platform_absolute("/tmp/test-workspace");
+        let result = resolve_workspace_root_with_env(Some(&root), None, None).unwrap();
+        assert_eq!(result, root);
     }
 
     #[test]
     fn resolve_workspace_root_with_env_path() {
-        let result =
-            resolve_workspace_root_with_env(None, Some("/tmp/env-workspace"), None).unwrap();
-        assert_eq!(result, PathBuf::from("/tmp/env-workspace"));
+        let root = platform_absolute("/tmp/env-workspace");
+        let result = resolve_workspace_root_with_env(None, root.to_str(), None).unwrap();
+        assert_eq!(result, root);
     }
 
     #[test]
     fn resolve_workspace_root_explicit_overrides_env() {
-        let result = resolve_workspace_root_with_env(
-            Some(Path::new("/tmp/explicit")),
-            Some("/tmp/env"),
-            None,
-        )
-        .unwrap();
-        assert_eq!(result, PathBuf::from("/tmp/explicit"));
+        let explicit = platform_absolute("/tmp/explicit");
+        let env = platform_absolute("/tmp/env");
+        let result = resolve_workspace_root_with_env(Some(&explicit), env.to_str(), None).unwrap();
+        assert_eq!(result, explicit);
     }
 
     #[test]
@@ -11256,7 +11300,9 @@ retention_tiers = []
         assert_ne!(dir, "");
         #[cfg(target_os = "macos")]
         assert!(dir.contains("Library"));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        assert!(Path::new(&dir).ends_with("ft"), "{dir}");
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert!(dir.contains(".local/share"));
     }
 
@@ -11839,7 +11885,13 @@ mode = "periodic"
         let config = Config::default();
         #[cfg(target_os = "macos")]
         assert_eq!(config.general.data_dir, "~/Library/Application Support/ft");
-        #[cfg(not(target_os = "macos"))]
+        // %APPDATA%\ft (ft-plp3c).
+        #[cfg(windows)]
+        assert_eq!(
+            PathBuf::from(&config.general.data_dir),
+            dirs::data_dir().unwrap().join("ft")
+        );
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert_eq!(config.general.data_dir, "~/.local/share/ft");
         assert_eq!(
             config.native.socket_path,
