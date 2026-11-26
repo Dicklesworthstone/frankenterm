@@ -200,6 +200,173 @@ pub fn compile_assignment_dispatch(
     Ok(contract)
 }
 
+/// Maximum number of pane actions admitted by one explicit drive invocation.
+pub const MISSION_DRIVE_MAX_ASSIGNMENTS: u32 = 100;
+
+/// Largest declared wait accepted by the bounded mission driver.
+///
+/// The driver never rewrites a stored action's timeout: the exact action is
+/// part of its durable transaction identity. Longer observations remain
+/// available through an explicitly selected single-assignment dispatch.
+pub const MISSION_DRIVE_MAX_WAIT_MS: u64 = 300_000;
+
+/// Failure to establish a valid mission-wide drive admission boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MissionDrivePlanError {
+    #[error("mission drive requires between 1 and 100 assignments")]
+    InvalidLimit,
+    #[error(transparent)]
+    Mission(#[from] AssignmentDispatchError),
+}
+
+impl MissionDrivePlanError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidLimit => "mission.drive.invalid_limit",
+            Self::Mission(error) => error.code(),
+        }
+    }
+}
+
+/// Why selection stopped, before any transaction publication or pane action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MissionDriveStop {
+    /// Every unresolved assignment is included in the selected batch.
+    QueueEnd,
+    /// More unresolved assignments remain after the requested action limit.
+    AssignmentLimit,
+    /// The entire batch is refused, including any eligible prefix.
+    Blocked {
+        assignment_id: AssignmentId,
+        error_code: String,
+    },
+}
+
+/// Read-only admission plan for one bounded pass over authored assignments.
+///
+/// IDs retain their persisted vector order. Candidate scores, lexical IDs and
+/// the mission's sorted canonical hash do not establish execution order.
+/// Existing successful outcomes are counted as metadata, not independently
+/// certified by this planner. Failed or cancelled outcomes are barriers.
+///
+/// A caller MUST refuse the entire batch if stop is Blocked. Otherwise it
+/// must retain these exact IDs and use the live single-assignment executor for
+/// each one. Compilation is not policy approval. Each action still needs its
+/// own authoritative mission lock, durable transaction and live policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDrivePlan {
+    pub assignment_ids: Vec<AssignmentId>,
+    pub unresolved_assignments: usize,
+    pub successful_assignments: usize,
+    /// Unresolved assignments not included in assignment_ids.
+    pub remaining_assignments: usize,
+    pub stop: MissionDriveStop,
+}
+
+/// Admit at most max_assignments unresolved actions without external effects.
+///
+/// Validate the entire selected prefix before dispatching any of it. A pending
+/// approval, unsupported reservation/action, invalid target or excessive wait
+/// cannot be silently skipped in favor of later work. Previously failed or
+/// cancelled assignments refuse admission even outside the selected prefix;
+/// the operator can explicitly dispatch independent work after reviewing it.
+///
+/// Runtime progress is separate from this plan. Persist every proven action,
+/// drop its locks, and reacquire the next assignment using only the revision
+/// token returned by that successful save. Never adopt a fresh token from a
+/// concurrent pause, abort, edit or other dispatcher to continue this batch.
+pub fn compile_mission_drive(
+    mission: &Mission,
+    max_assignments: u32,
+) -> Result<MissionDrivePlan, MissionDrivePlanError> {
+    if !(1..=MISSION_DRIVE_MAX_ASSIGNMENTS).contains(&max_assignments) {
+        return Err(MissionDrivePlanError::InvalidLimit);
+    }
+    mission
+        .validate()
+        .map_err(|_| AssignmentDispatchError::InvalidMission)?;
+    if !matches!(
+        mission.lifecycle_state,
+        MissionLifecycleState::Running | MissionLifecycleState::Executing
+    ) || mission.pause_resume_state.is_paused()
+    {
+        return Err(AssignmentDispatchError::NotRunning.into());
+    }
+
+    let unresolved_assignments = mission
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.outcome.is_none())
+        .count();
+    let successful_assignments = mission
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            matches!(
+                assignment.outcome,
+                Some(crate::plan::Outcome::Success { .. })
+            )
+        })
+        .count();
+    let mut plan = MissionDrivePlan {
+        assignment_ids: Vec::new(),
+        unresolved_assignments,
+        successful_assignments,
+        remaining_assignments: unresolved_assignments,
+        stop: MissionDriveStop::QueueEnd,
+    };
+
+    // Settled failures are not ordinary "already done" entries. Skipping one
+    // could execute a later action whose prerequisite never took effect.
+    for assignment in &mission.assignments {
+        let error_code = match assignment.outcome {
+            Some(crate::plan::Outcome::Failed { .. }) => "mission.drive.prior_assignment_failed",
+            Some(crate::plan::Outcome::Cancelled { .. }) => {
+                "mission.drive.prior_assignment_cancelled"
+            }
+            _ => continue,
+        };
+        plan.stop = MissionDriveStop::Blocked {
+            assignment_id: assignment.assignment_id.clone(),
+            error_code: error_code.to_string(),
+        };
+        return Ok(plan);
+    }
+
+    for assignment in &mission.assignments {
+        if assignment.outcome.is_some() {
+            continue;
+        }
+        if plan.assignment_ids.len() == max_assignments as usize {
+            plan.stop = MissionDriveStop::AssignmentLimit;
+            break;
+        }
+        let refusal = match compile_assignment_dispatch(mission, &assignment.assignment_id) {
+            Ok(contract) => match contract.plan.steps.first().map(|step| &step.action) {
+                Some(StepAction::WaitFor { timeout_ms, .. })
+                    if *timeout_ms > MISSION_DRIVE_MAX_WAIT_MS =>
+                {
+                    Some("mission.drive.wait_limit_exceeded")
+                }
+                _ => None,
+            },
+            Err(error) => Some(error.code()),
+        };
+        if let Some(error_code) = refusal {
+            plan.stop = MissionDriveStop::Blocked {
+                assignment_id: assignment.assignment_id.clone(),
+                error_code: error_code.to_string(),
+            };
+            break;
+        }
+        plan.assignment_ids.push(assignment.assignment_id.clone());
+        plan.remaining_assignments -= 1;
+    }
+    Ok(plan)
+}
+
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Configuration for the mission dispatcher.
@@ -803,6 +970,271 @@ mod tests {
             updated_at_ms: None,
         });
         mission
+    }
+
+    fn drive_mission() -> Mission {
+        let mut mission = dispatch_mission();
+        let candidate = mission.candidates[0].clone();
+        let assignment = mission.assignments[0].clone();
+        mission.candidates.clear();
+        mission.assignments.clear();
+        for (index, suffix) in ["z", "a", "m"].into_iter().enumerate() {
+            let mut candidate = candidate.clone();
+            candidate.candidate_id = crate::plan::CandidateActionId(format!("candidate:{suffix}"));
+            candidate.action = StepAction::SendText {
+                pane_id: 42 + index as u64,
+                text: format!("DO_NOT_DISCLOSE_DRIVE_INPUT_{suffix}"),
+                paste_mode: Some(false),
+            };
+            // Neither score nor lexical ID is an execution dependency order.
+            candidate.score = Some(index as f64);
+            let mut assignment = assignment.clone();
+            assignment.assignment_id = AssignmentId(format!("assignment:{suffix}"));
+            assignment.candidate_id = candidate.candidate_id.clone();
+            mission.candidates.push(candidate);
+            mission.assignments.push(assignment);
+        }
+        mission
+    }
+
+    #[test]
+    fn mission_drive_keeps_authored_order_without_mutating_or_disclosing_actions() {
+        let mission = drive_mission();
+        let before = serde_json::to_vec(&mission).unwrap();
+        let plan = compile_mission_drive(&mission, 10).unwrap();
+        assert_eq!(
+            plan.assignment_ids,
+            [
+                AssignmentId("assignment:z".to_string()),
+                AssignmentId("assignment:a".to_string()),
+                AssignmentId("assignment:m".to_string()),
+            ]
+        );
+        assert_eq!(plan.unresolved_assignments, 3);
+        assert_eq!(plan.successful_assignments, 0);
+        assert_eq!(plan.remaining_assignments, 0);
+        assert_eq!(plan.stop, MissionDriveStop::QueueEnd);
+        let wire = serde_json::to_string(&plan).unwrap();
+        assert!(!wire.contains("DO_NOT_DISCLOSE_DRIVE_INPUT"));
+        assert_eq!(serde_json::to_vec(&mission).unwrap(), before);
+        assert_eq!(
+            serde_json::from_str::<MissionDrivePlan>(&wire).unwrap(),
+            plan
+        );
+    }
+
+    #[test]
+    fn mission_drive_limit_counts_only_pending_actions_and_preserves_remainder() {
+        let mut mission = drive_mission();
+        mission.assignments[0].outcome = Some(crate::plan::Outcome::Success {
+            reason_code: "mission.assignment_action_committed".to_string(),
+            completed_at_ms: 1_003,
+        });
+        mission.assignments[0].updated_at_ms = Some(1_003);
+        let plan = compile_mission_drive(&mission, 1).unwrap();
+        assert_eq!(
+            plan.assignment_ids,
+            [AssignmentId("assignment:a".to_string())]
+        );
+        assert_eq!(plan.unresolved_assignments, 2);
+        assert_eq!(plan.successful_assignments, 1);
+        assert_eq!(plan.remaining_assignments, 1);
+        assert_eq!(plan.stop, MissionDriveStop::AssignmentLimit);
+
+        let all = compile_mission_drive(&mission, 2).unwrap();
+        assert_eq!(all.assignment_ids.len(), 2);
+        assert_eq!(all.remaining_assignments, 0);
+        assert_eq!(all.stop, MissionDriveStop::QueueEnd);
+    }
+
+    #[test]
+    fn mission_drive_settled_failures_block_even_outside_the_selected_limit() {
+        for (outcome, expected_code) in [
+            (
+                crate::plan::Outcome::Failed {
+                    reason_code: "agent_failed".to_string(),
+                    error_code: "NO_PROGRESS".to_string(),
+                    completed_at_ms: 1_003,
+                },
+                "mission.drive.prior_assignment_failed",
+            ),
+            (
+                crate::plan::Outcome::Cancelled {
+                    reason_code: "operator_cancelled".to_string(),
+                    completed_at_ms: 1_003,
+                },
+                "mission.drive.prior_assignment_cancelled",
+            ),
+        ] {
+            let mut mission = drive_mission();
+            mission.assignments[2].outcome = Some(outcome);
+            mission.assignments[2].updated_at_ms = Some(1_003);
+            let plan = compile_mission_drive(&mission, 1).unwrap();
+            assert!(plan.assignment_ids.is_empty());
+            assert_eq!(plan.unresolved_assignments, 2);
+            assert_eq!(plan.remaining_assignments, 2);
+            assert_eq!(
+                plan.stop,
+                MissionDriveStop::Blocked {
+                    assignment_id: AssignmentId("assignment:m".to_string()),
+                    error_code: expected_code.to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn mission_drive_never_skips_an_approval_barrier_in_the_selected_prefix() {
+        let mut mission = drive_mission();
+        mission.assignments[1].approval_state = ApprovalState::Pending {
+            requested_by: "operator".to_string(),
+            requested_at_ms: 1_003,
+        };
+        let blocked = compile_mission_drive(&mission, 3).unwrap();
+        assert_eq!(
+            blocked.assignment_ids,
+            [AssignmentId("assignment:z".to_string())]
+        );
+        assert_eq!(blocked.remaining_assignments, 2);
+        assert_eq!(
+            blocked.stop,
+            MissionDriveStop::Blocked {
+                assignment_id: AssignmentId("assignment:a".to_string()),
+                error_code: "mission.dispatch.approval_blocked".to_string(),
+            }
+        );
+
+        // An explicitly smaller batch does not select or approve later work.
+        let bounded = compile_mission_drive(&mission, 1).unwrap();
+        assert_eq!(bounded.assignment_ids, blocked.assignment_ids);
+        assert_eq!(bounded.stop, MissionDriveStop::AssignmentLimit);
+    }
+
+    #[test]
+    fn mission_drive_wait_cap_preserves_the_bound_action() {
+        for timeout_ms in [
+            0,
+            MISSION_DRIVE_MAX_WAIT_MS,
+            MISSION_DRIVE_MAX_WAIT_MS + 1,
+            u64::MAX,
+        ] {
+            let mut mission = drive_mission();
+            mission.candidates[1].action = StepAction::WaitFor {
+                pane_id: Some(43),
+                condition: WaitCondition::StableTail {
+                    pane_id: Some(43),
+                    stable_for_ms: 1,
+                },
+                timeout_ms,
+            };
+            let before = serde_json::to_vec(&mission).unwrap();
+            let plan = compile_mission_drive(&mission, 3).unwrap();
+            if timeout_ms > MISSION_DRIVE_MAX_WAIT_MS {
+                assert_eq!(
+                    plan.stop,
+                    MissionDriveStop::Blocked {
+                        assignment_id: AssignmentId("assignment:a".to_string()),
+                        error_code: "mission.drive.wait_limit_exceeded".to_string(),
+                    }
+                );
+                assert_eq!(plan.assignment_ids.len(), 1);
+            } else {
+                assert_eq!(plan.stop, MissionDriveStop::QueueEnd);
+                assert_eq!(plan.assignment_ids.len(), 3);
+            }
+            assert_eq!(serde_json::to_vec(&mission).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn mission_drive_unsupported_actions_block_the_batch_without_skipping_ahead() {
+        let mut mission = drive_mission();
+        mission.candidates[1].action = StepAction::Custom {
+            action_type: "unverified".to_string(),
+            payload: serde_json::json!({"secret": "DRIVE_PRIVATE_PAYLOAD"}),
+        };
+        let plan = compile_mission_drive(&mission, 3).unwrap();
+        assert_eq!(
+            plan.assignment_ids,
+            [AssignmentId("assignment:z".to_string())]
+        );
+        assert_eq!(
+            plan.stop,
+            MissionDriveStop::Blocked {
+                assignment_id: AssignmentId("assignment:a".to_string()),
+                error_code: "mission.dispatch.action_unsupported".to_string(),
+            }
+        );
+        assert!(
+            !serde_json::to_string(&plan)
+                .unwrap()
+                .contains("DRIVE_PRIVATE_PAYLOAD")
+        );
+    }
+
+    #[test]
+    fn mission_drive_rejects_limits_and_nonrunning_or_invalid_missions() {
+        let mission = drive_mission();
+        for max in [0, MISSION_DRIVE_MAX_ASSIGNMENTS + 1, u32::MAX] {
+            let error = compile_mission_drive(&mission, max).unwrap_err();
+            assert_eq!(error, MissionDrivePlanError::InvalidLimit);
+            assert_eq!(error.code(), "mission.drive.invalid_limit");
+        }
+        for state in [
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::AwaitingApproval,
+            MissionLifecycleState::RetryPending,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::Paused,
+        ] {
+            let mut stopped = mission.clone();
+            stopped.lifecycle_state = state;
+            assert_eq!(
+                compile_mission_drive(&stopped, 1).unwrap_err(),
+                MissionDrivePlanError::Mission(AssignmentDispatchError::NotRunning)
+            );
+        }
+        let mut paused = mission.clone();
+        paused
+            .pause_mission("operator", "hold", 2_000, None)
+            .unwrap();
+        assert_eq!(
+            compile_mission_drive(&paused, 1).unwrap_err().code(),
+            "mission.dispatch.not_running"
+        );
+        let mut invalid = mission;
+        invalid.assignments[1].assignment_id = invalid.assignments[0].assignment_id.clone();
+        assert_eq!(
+            compile_mission_drive(&invalid, 1).unwrap_err().code(),
+            "mission.dispatch.invalid_mission"
+        );
+    }
+
+    #[test]
+    fn mission_drive_an_empty_or_settled_queue_does_not_complete_the_mission() {
+        let mut mission = drive_mission();
+        for assignment in &mut mission.assignments {
+            assignment.outcome = Some(crate::plan::Outcome::Success {
+                reason_code: "action_acknowledged".to_string(),
+                completed_at_ms: 1_003,
+            });
+            assignment.updated_at_ms = Some(1_003);
+        }
+        let plan = compile_mission_drive(&mission, 1).unwrap();
+        assert!(plan.assignment_ids.is_empty());
+        assert_eq!(plan.successful_assignments, 3);
+        assert_eq!(plan.unresolved_assignments, 0);
+        assert_eq!(plan.remaining_assignments, 0);
+        assert_eq!(plan.stop, MissionDriveStop::QueueEnd);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+
+        mission.assignments.clear();
+        mission.candidates.clear();
+        let empty = compile_mission_drive(&mission, 1).unwrap();
+        assert!(empty.assignment_ids.is_empty());
+        assert_eq!(empty.stop, MissionDriveStop::QueueEnd);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
     }
 
     fn compile_selected(mission: &Mission) -> Result<MissionTxContract, AssignmentDispatchError> {
