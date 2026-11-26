@@ -850,7 +850,8 @@ fn sync_adopted_file(file: &File, parent: &Dir, path: &Path) -> Result<(), Publi
     }
     #[cfg(windows)]
     {
-        let _ = file;
+        use cap_fs_ext::MetadataExt as _;
+
         let name = path.file_name().ok_or_else(|| {
             PublicationError::io(
                 path,
@@ -862,9 +863,33 @@ fn sync_adopted_file(file: &File, parent: &Dir, path: &Path) -> Result<(), Publi
         })?;
         let mut options = OpenOptions::new();
         options.write(true).follow(FollowSymlinks::No);
-        parent
+        let writer = parent
             .open_with(name, &options)
-            .and_then(|writer| writer.sync_all())
+            .map_err(|error| PublicationError::io(path, error))?;
+        // The name must still be the adopted file. Both metadata come from
+        // open handles, so dev and ino are the volume serial number and file
+        // index, as snapshot_engine compares them. The index is 64 bits, which
+        // ReFS's 128-bit IDs truncate (ft-8r43i.16), so length and
+        // modification time must match as well.
+        let adopted = file
+            .metadata()
+            .map_err(|error| PublicationError::io(path, error))?;
+        let reopened = writer
+            .metadata()
+            .map_err(|error| PublicationError::io(path, error))?;
+        if !reopened.is_file()
+            || adopted.dev() != reopened.dev()
+            || adopted.ino() != reopened.ino()
+            || adopted.len() != reopened.len()
+            || adopted.modified().ok() != reopened.modified().ok()
+        {
+            return Err(PublicationError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "adopted file was replaced before its flush".to_string(),
+            });
+        }
+        writer
+            .sync_all()
             .map_err(|error| PublicationError::io(path, error))?;
     }
     sync_directory(parent, path.parent().unwrap_or_else(|| Path::new(".")))
