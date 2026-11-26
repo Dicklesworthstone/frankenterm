@@ -6424,6 +6424,72 @@ impl From<MissionApprovalDecisionArg> for frankenterm_core::plan::MissionAssignm
 
 #[derive(Subcommand)]
 enum MissionCommands {
+    /// Create a fresh draft with one explicit pane action, pending operator approval
+    Create {
+        /// New mission JSON file in an existing directory; existing targets are refused
+        #[arg(long)]
+        mission_file: PathBuf,
+
+        /// Mission ID (default: a new random ID)
+        #[arg(long)]
+        mission_id: Option<String>,
+
+        /// Short operator-authored mission title
+        #[arg(long)]
+        title: String,
+
+        /// Explicit pane to receive the literal action after approval and dispatch
+        #[arg(long)]
+        pane_id: u64,
+
+        /// Pane input stored unchanged; dispatch appends a newline (Enter)
+        #[arg(long)]
+        text: String,
+
+        /// Assignment attribution; does not grant runtime authority
+        #[arg(long, default_value = "cli-operator")]
+        assignee: String,
+
+        /// Validate a projected draft; destination publication checks are not performed
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Append an explicit pane action to an unreviewed, unstarted draft
+    AddAssignment {
+        /// Exact revision_token JSON from mission status; stale tokens fail closed
+        #[arg(long)]
+        expected_token: String,
+
+        /// Explicit pane to receive the literal action after approval and dispatch
+        #[arg(long)]
+        pane_id: u64,
+
+        /// Pane input stored unchanged; dispatch appends a newline (Enter)
+        #[arg(long)]
+        text: String,
+
+        /// Assignment attribution; does not grant runtime authority
+        #[arg(long, default_value = "cli-operator")]
+        assignee: String,
+
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Preview the appended Pending assignment without saving it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
     /// Compile an operator objective into a read-only dry-run plan
     ObjectivePlan {
         #[command(flatten)]
@@ -82965,17 +83031,52 @@ fn mission_run_transition_plan(
     use frankenterm_core::plan::MissionLifecycleState as State;
     use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
+    let unsettled_approval_blocked = mission.assignments.iter().any(|assignment| {
+        assignment.outcome.is_none()
+            && matches!(
+                assignment.approval_state,
+                frankenterm_core::plan::ApprovalState::Denied { .. }
+                    | frankenterm_core::plan::ApprovalState::Expired { .. }
+            )
+    });
+    if matches!(
+        mission.lifecycle_state,
+        State::Planning | State::Planned | State::Dispatching
+    ) && unsettled_approval_blocked
+    {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.approval_blocked",
+            message: "A denied or expired assignment approval blocks this run request.".to_string(),
+            hint: Some(
+                "Inspect mission status. Existing decisions are retained; resolve-approval only decides Pending assignments."
+                    .to_string(),
+            ),
+        });
+    }
+    let pending_approval = mission.assignments.iter().any(|assignment| {
+        assignment.outcome.is_none()
+            && matches!(
+                assignment.approval_state,
+                frankenterm_core::plan::ApprovalState::Pending { .. }
+            )
+    });
+    let admission = if pending_approval {
+        (State::AwaitingApproval, Kind::RequestApproval)
+    } else {
+        (State::Running, Kind::ExecutionStarted)
+    };
     match mission.lifecycle_state {
         State::Planning => Ok(vec![
             (State::Planned, Kind::PlanFinalized),
             (State::Dispatching, Kind::DispatchStarted),
-            (State::Running, Kind::ExecutionStarted),
+            admission,
         ]),
         State::Planned => Ok(vec![
             (State::Dispatching, Kind::DispatchStarted),
-            (State::Running, Kind::ExecutionStarted),
+            admission,
         ]),
-        State::Dispatching => Ok(vec![(State::Running, Kind::ExecutionStarted)]),
+        State::Dispatching => Ok(vec![admission]),
         State::RetryPending | State::Blocked | State::Paused => {
             Ok(vec![(State::Running, Kind::RetryResumed)])
         }
@@ -84166,6 +84267,254 @@ fn emit_mission_drive_output(
     Ok(())
 }
 
+fn mission_authoring_error(
+    error: frankenterm_core::plan::MissionAuthoringError,
+) -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: error.code(),
+        message: error.to_string(),
+        hint: Some(
+            "Add all explicit assignments before running or reviewing the draft. Only unreviewed Pending assignments in an unstarted draft can be extended."
+                .to_string(),
+        ),
+    }
+}
+
+fn mission_create_store_error(
+    error: frankenterm_core::tx_execution::MissionStoreError,
+) -> MissionCommandError {
+    use frankenterm_core::tx_execution::MissionStoreError;
+    let hint = match error {
+        MissionStoreError::Conflict => {
+            "The destination may already exist or its directory identity changed during publication. Inspect the path before retrying; choose a new --mission-file to preserve an existing mission."
+        }
+        MissionStoreError::Authority => {
+            "Choose --mission-file in an existing real directory inside this workspace, using its canonical path. Missing parents and path aliases are refused; creation requires Linux or macOS."
+        }
+        MissionStoreError::Indeterminate => {
+            "Publication may have occurred. Inspect the requested mission file and its revision token before deciding what to do next; do not assume creation can be retried."
+        }
+        _ => "Inspect the destination and retry only after resolving the reported creation failure.",
+    };
+    MissionCommandError {
+        hint: Some(hint.to_string()),
+        ..mission_store_error(error)
+    }
+}
+
+fn mission_assignment_draft_request(
+    pane_id: u64,
+    text: &str,
+    assignee: &str,
+) -> frankenterm_core::plan::MissionAssignmentDraftRequest {
+    use frankenterm_core::plan::{
+        AssignmentId, CandidateActionId, MissionAssignmentDraftRequest, StepAction,
+    };
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    MissionAssignmentDraftRequest {
+        assignment_id: AssignmentId(format!("assignment:{id}")),
+        candidate_id: CandidateActionId(format!("candidate:{id}")),
+        assignee: assignee.to_string(),
+        actor: "cli-operator".to_string(),
+        action: StepAction::SendText {
+            pane_id,
+            text: text.to_string(),
+            paste_mode: Some(false),
+        },
+    }
+}
+
+fn mission_draft_request(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_id: Option<&str>,
+    title: &str,
+    pane_id: u64,
+    text: &str,
+    assignee: &str,
+) -> Result<frankenterm_core::plan::MissionDraftRequest, MissionCommandError> {
+    use frankenterm_core::plan::{MissionDraftRequest, MissionId, MissionOwnership};
+    let workspace = layout.root.canonicalize().map_err(|_| {
+        mission_create_store_error(frankenterm_core::tx_execution::MissionStoreError::Authority)
+    })?;
+    let workspace_id = workspace.to_str().ok_or_else(|| {
+        mission_create_store_error(frankenterm_core::tx_execution::MissionStoreError::Authority)
+    })?;
+    Ok(MissionDraftRequest {
+        mission_id: MissionId(mission_id.map(str::to_string).unwrap_or_else(|| {
+            format!("mission:{}", uuid::Uuid::new_v4().simple())
+        })),
+        generation: uuid::Uuid::new_v4().simple().to_string(),
+        title: title.to_string(),
+        workspace_id: workspace_id.to_string(),
+        ownership: MissionOwnership {
+            planner: "cli-planner".to_string(),
+            dispatcher: "cli-dispatcher".to_string(),
+            operator: "cli-operator".to_string(),
+        },
+        initial_assignment: mission_assignment_draft_request(pane_id, text, assignee),
+    })
+}
+
+/// Describe authoring without copying literal pane input into command output.
+fn mission_authored_assignment_summary(
+    request: &frankenterm_core::plan::MissionAssignmentDraftRequest,
+) -> serde_json::Value {
+    let mut summary = serde_json::json!({
+        "assignment_id": request.assignment_id,
+        "candidate_id": request.candidate_id,
+        "assignee": request.assignee,
+        "approval_state": "pending",
+    });
+    if let frankenterm_core::plan::StepAction::SendText {
+        pane_id, text, paste_mode,
+    } = &request.action
+    {
+        summary["action"] = serde_json::json!({
+            "kind": "send_text",
+            "pane_id": pane_id.to_string(),
+            "input_bytes": text.len(),
+            "paste_mode": paste_mode,
+            "newline_appended_by_executor": true,
+        });
+    }
+    summary
+}
+
+fn run_mission_create(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_path: &Path,
+    request: &frankenterm_core::plan::MissionDraftRequest,
+    dry_run: bool,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    use frankenterm_core::tx_execution::{MissionRevisionToken, create_mission_contract};
+    let mission = frankenterm_core::plan::Mission::create_draft(request, mission_now_ms())
+        .map_err(mission_authoring_error)?;
+    let projected_token = if dry_run {
+        Some(MissionRevisionToken::from_mission(&mission).map_err(mission_store_error)?)
+    } else {
+        None
+    };
+    let receipt = if dry_run {
+        None
+    } else {
+        let workspace = layout.root.canonicalize().map_err(|_| {
+            mission_create_store_error(frankenterm_core::tx_execution::MissionStoreError::Authority)
+        })?;
+        Some(
+            create_mission_contract(&workspace, mission_path, &mission)
+                .map_err(mission_create_store_error)?,
+        )
+    };
+    let published_path = receipt
+        .as_ref()
+        .map_or(mission_path, |receipt| receipt.path.as_path());
+    let data = serde_json::json!({
+        "command": "create",
+        "mission_file": published_path.display().to_string(),
+        "mission_id": mission.mission_id,
+        "generation": mission.generation,
+        "lifecycle_state": mission.lifecycle_state.to_string(),
+        "assignment": mission_authored_assignment_summary(&request.initial_assignment),
+        "assignment_count": mission.assignments.len(),
+        "dry_run": dry_run,
+        "persisted": receipt.is_some(),
+        "publication_checks_performed": !dry_run,
+        "action_executed": false,
+        "runtime_policy_grant_created": false,
+        "revision_token": receipt.as_ref().map(|receipt| &receipt.current),
+        "projected_revision_token": projected_token,
+        "creation": receipt,
+    });
+    let mut plain_lines = vec![
+        format!(
+            "Mission {}: {}",
+            if dry_run { "draft preview" } else { "created" },
+            mission.mission_id
+        ),
+        format!("  File: {}", published_path.display()),
+        format!("  Assignment: {}", request.initial_assignment.assignment_id),
+        "  Lifecycle: planning; assignment approval: pending".to_string(),
+        "  Input is stored unchanged; dispatch appends Enter. No pane action has executed."
+            .to_string(),
+    ];
+    if let Some(receipt) = &receipt {
+        plain_lines.push(format!("  Persistence: {}", receipt.durability));
+        plain_lines.push(
+            "  Add remaining assignments before run and approval. Read status -f json for the current revision token."
+                .to_string(),
+        );
+    } else {
+        plain_lines.push(
+            "  Preview only: destination existence, parent authority and publication were not checked. Generated IDs belong to this preview."
+                .to_string(),
+        );
+    }
+    Ok((data, plain_lines))
+}
+
+fn run_mission_add_assignment(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_path: &Path,
+    expected_token: &str,
+    request: &frankenterm_core::plan::MissionAssignmentDraftRequest,
+    dry_run: bool,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    let mutation = acquire_mission_mutation(layout, mission_path, Some(expected_token))?;
+    mutation
+        .verify_dispatch_workspace()
+        .map_err(mission_store_error)?;
+    let observed = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+        mutation.mission(),
+    )
+    .map_err(mission_store_error)?;
+    let mut next = mutation
+        .mission()
+        .append_assignment(request, mission_now_ms())
+        .map_err(mission_authoring_error)?;
+    let receipt = if dry_run {
+        mutation.verify_current().map_err(mission_store_error)?;
+        None
+    } else {
+        Some(mutation.commit(&mut next).map_err(mission_store_error)?)
+    };
+    let revision_token = receipt
+        .as_ref()
+        .map_or(observed, |receipt| receipt.current.clone());
+    let data = serde_json::json!({
+        "command": "add_assignment",
+        "mission_file": mission_path.display().to_string(),
+        "mission_id": next.mission_id,
+        "lifecycle_state": next.lifecycle_state.to_string(),
+        "assignment": mission_authored_assignment_summary(request),
+        "assignment_count": next.assignments.len(),
+        "dry_run": dry_run,
+        "persisted": !dry_run,
+        "action_executed": false,
+        "runtime_policy_grant_created": false,
+        "revision_token": revision_token,
+        "mutation": receipt,
+    });
+    let plain_lines = vec![
+        format!(
+            "Mission assignment {}: {}",
+            if dry_run { "preview" } else { "added" },
+            request.assignment_id
+        ),
+        format!("  File: {}", mission_path.display()),
+        format!("  Draft assignments: {}; new approval: pending", next.assignments.len()),
+        "  Input is stored unchanged; dispatch appends Enter. No pane action has executed."
+            .to_string(),
+        if dry_run {
+            "  Preview only: the current revision token is unchanged.".to_string()
+        } else {
+            "  Read the new revision token before another mutation. Finish authoring before run or approval."
+                .to_string()
+        },
+    ];
+    Ok((data, plain_lines))
+}
+
 fn mission_assignment_approval_error(
     error: frankenterm_core::plan::MissionAssignmentApprovalError,
 ) -> MissionCommandError {
@@ -84255,6 +84604,53 @@ async fn handle_mission_command(
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     match command {
+        MissionCommands::Create {
+            mission_file,
+            mission_id,
+            title,
+            pane_id,
+            text,
+            assignee,
+            dry_run,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let request = match mission_draft_request(
+                layout, mission_id.as_deref(), &title, pane_id, &text, &assignee,
+            ) {
+                Ok(request) => request,
+                Err(error) => emit_mission_error(output_format, error),
+            };
+            let (data, plain_lines) = match run_mission_create(
+                layout, &mission_file, &request, dry_run,
+            ) {
+                Ok(result) => result,
+                Err(error) => emit_mission_error(output_format, error),
+            };
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::AddAssignment {
+            expected_token,
+            pane_id,
+            text,
+            assignee,
+            mission_file,
+            dry_run,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let request = mission_assignment_draft_request(pane_id, &text, &assignee);
+            let (data, plain_lines) = match run_mission_add_assignment(
+                layout, &mission_path, &expected_token, &request, dry_run,
+            ) {
+                Ok(result) => result,
+                Err(error) => emit_mission_error(output_format, error),
+            };
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
         MissionCommands::ObjectivePlan { args } => {
             let output_format = MissionCommandOutputFormat::from_flag(&args.format);
             let surface = match build_mission_objective_plan_surface(&args.common, "ft.mission.cli")
@@ -108849,6 +109245,306 @@ mod tests {
     }
 
     #[test]
+    fn mission_authoring_cli_requires_destination_action_and_exact_append_token() {
+        for args in [
+            vec!["ft", "mission", "create", "--title", "Draft", "--pane-id", "7", "--text", "status"],
+            vec!["ft", "mission", "create", "--mission-file", "mission.json", "--pane-id", "7", "--text", "status"],
+            vec!["ft", "mission", "create", "--mission-file", "mission.json", "--title", "Draft", "--text", "status"],
+            vec!["ft", "mission", "create", "--mission-file", "mission.json", "--title", "Draft", "--pane-id", "7"],
+            vec!["ft", "mission", "add-assignment", "--pane-id", "7", "--text", "status"],
+            vec!["ft", "mission", "add-assignment", "--expected-token", "{}", "--pane-id", "18446744073709551616", "--text", "status"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "ft", "mission", "create", "--mission-file", "mission.json",
+            "--mission-id", "mission:explicit", "--title", "Draft",
+            "--pane-id", "18446744073709551615", "--text", "literal\ninput",
+            "--dry-run", "-f", "json",
+        ]).expect("explicit mission authoring");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Mission {
+                command: MissionCommands::Create {
+                    mission_file, mission_id, pane_id, text, assignee, dry_run, ..
+                },
+            }) => {
+                assert_eq!(mission_file, PathBuf::from("mission.json"));
+                assert_eq!(mission_id.as_deref(), Some("mission:explicit"));
+                assert_eq!(pane_id, u64::MAX);
+                assert_eq!(text, "literal\ninput");
+                assert_eq!(assignee, "cli-operator");
+                assert!(dry_run);
+            }
+            _ => panic!("expected mission create"),
+        }
+        assert!(Cli::try_parse_from([
+            "ft", "mission", "add-assignment", "--expected-token", "{}",
+            "--pane-id", "7", "--text", "next", "--dry-run",
+        ]).is_ok());
+    }
+
+    fn mission_authoring_fixture() -> (
+        tempfile::TempDir,
+        frankenterm_core::config::WorkspaceLayout,
+        PathBuf,
+    ) {
+        let dir = tempfile::tempdir().expect("authoring workspace");
+        let root = dir.path().canonicalize().expect("canonical workspace");
+        let ft_dir = root.join(".ft");
+        let path = root.join("mission.json");
+        let layout = frankenterm_core::config::WorkspaceLayout {
+            root,
+            ft_dir: ft_dir.clone(),
+            db_path: ft_dir.join("ft.db"),
+            lock_path: ft_dir.join("ft.lock"),
+            ipc_socket_path: ft_dir.join("ft.sock"),
+            logs_dir: ft_dir.join("logs"),
+            log_path: ft_dir.join("logs/ft.log"),
+            crash_dir: ft_dir.join("crashes"),
+            diag_dir: ft_dir.join("diag"),
+        };
+        (dir, layout, path)
+    }
+
+    #[test]
+    fn mission_authoring_preview_is_payload_free_and_does_not_publish_or_check_destination() {
+        let (_dir, layout, path) = mission_authoring_fixture();
+        let private = "private-authoring-payload\n";
+        let request = mission_draft_request(
+            &layout, None, "Preview draft", u64::MAX, private, "worker",
+        ).expect("draft request");
+        let second = mission_draft_request(
+            &layout, None, "Another draft", 7, "next", "worker",
+        ).expect("independent incarnation");
+        assert_ne!(request.mission_id, second.mission_id);
+        assert_ne!(request.generation, second.generation);
+        let absent_parent_path = path.with_file_name("missing").join("mission.json");
+        let (data, lines) = run_mission_create(&layout, &absent_parent_path, &request, true)
+            .expect("pure preview does not require an existing destination parent");
+        assert_eq!(data["persisted"], false);
+        assert_eq!(data["publication_checks_performed"], false);
+        assert_eq!(data["action_executed"], false);
+        assert_eq!(data["runtime_policy_grant_created"], false);
+        assert!(data["revision_token"].is_null());
+        assert_eq!(data["projected_revision_token"]["revision"], "0");
+        assert_eq!(data["assignment"]["action"]["pane_id"], u64::MAX.to_string());
+        assert_eq!(data["assignment"]["action"]["newline_appended_by_executor"], true);
+        assert_eq!(data["assignment"]["action"]["input_bytes"], private.len());
+        assert!(!data.to_string().contains(private));
+        assert!(!lines.join("\n").contains(private));
+        assert!(!absent_parent_path.parent().expect("parent").exists());
+        assert!(!path.exists());
+        assert!(!layout.ft_dir.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_authoring_create_preserves_literal_pending_input_and_refuses_overwrite() {
+        use frankenterm_core::plan::{ApprovalState, MissionLifecycleState, StepAction};
+        let (_dir, layout, path) = mission_authoring_fixture();
+        let text = "operator-supplied text\n";
+        let request = mission_draft_request(
+            &layout, Some("mission:created"), "Created draft", 7, text, "worker",
+        ).expect("draft request");
+        let (created, _) = run_mission_create(&layout, &path, &request, false)
+            .expect("durable initial publication");
+        assert_eq!(created["persisted"], true);
+        assert_eq!(created["publication_checks_performed"], true);
+        assert_eq!(created["revision_token"]["revision"], "0");
+        assert_eq!(created["creation"]["durability"], "file_and_directory_synced");
+        let mission = load_mission_from_path(&path).expect("published mission");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Planning);
+        assert_eq!(mission.workspace_id, layout.root.to_str().expect("UTF-8 root"));
+        assert_eq!(mission.assignments.len(), 1);
+        assert!(matches!(mission.assignments[0].approval_state, ApprovalState::Pending { .. }));
+        assert!(mission.assignments[0].outcome.is_none());
+        assert!(matches!(
+            &mission.candidates[0].action,
+            StepAction::SendText { pane_id: 7, text: actual, paste_mode: Some(false) } if actual == text
+        ));
+        let before = std::fs::read(&path).expect("published bytes");
+        let error = run_mission_create(&layout, &path, &request, false)
+            .expect_err("create never overwrites a mission");
+        assert_eq!(error.error_code, "mission.revision_conflict");
+        assert!(error.hint.expect("creation guidance").contains("already exist"));
+        assert_eq!(std::fs::read(&path).expect("retained bytes"), before);
+        assert!(!layout.db_path.exists());
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_authoring_create_refuses_missing_parent_without_creating_it() {
+        let (_dir, layout, path) = mission_authoring_fixture();
+        let request = mission_draft_request(
+            &layout, None, "Missing parent", 7, "status", "worker",
+        ).expect("draft request");
+        let missing = path.with_file_name("missing").join("mission.json");
+        let error = run_mission_create(&layout, &missing, &request, false)
+            .expect_err("safe publication requires an existing parent");
+        assert_eq!(error.error_code, "mission.authority_failed");
+        assert!(error.hint.expect("path guidance").contains("existing real directory"));
+        assert!(!missing.parent().expect("parent").exists());
+        assert!(!layout.ft_dir.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_authoring_append_previews_then_commits_only_its_exact_revision() {
+        let (_dir, layout, path) = mission_authoring_fixture();
+        let request = mission_draft_request(
+            &layout, None, "Append draft", 7, "first", "worker",
+        ).expect("draft request");
+        let (created, _) = run_mission_create(&layout, &path, &request, false).expect("create");
+        let token = created["revision_token"].to_string();
+        let append = mission_assignment_draft_request(9, "private-append-payload", "worker");
+        let before = std::fs::read(&path).expect("initial bytes");
+        let (preview, _) = run_mission_add_assignment(&layout, &path, &token, &append, true)
+            .expect("preview append");
+        assert_eq!(preview["persisted"], false);
+        assert_eq!(preview["assignment_count"], 2);
+        assert_eq!(preview["revision_token"], created["revision_token"]);
+        assert!(!preview.to_string().contains("private-append-payload"));
+        assert_eq!(std::fs::read(&path).expect("unmodified preview bytes"), before);
+        let (added, _) = run_mission_add_assignment(&layout, &path, &token, &append, false)
+            .expect("durable append");
+        assert_eq!(added["revision_token"]["revision"], "1");
+        assert_eq!(added["mutation"]["durability"], "file_and_directory_synced");
+        let mission = load_mission_from_path(&path).expect("extended draft");
+        assert_eq!(mission.assignments[0].assignment_id, request.initial_assignment.assignment_id);
+        assert_eq!(mission.assignments[1].assignment_id, append.assignment_id);
+        let committed = std::fs::read(&path).expect("extended bytes");
+        let stale_append = mission_assignment_draft_request(11, "later", "worker");
+        let error = run_mission_add_assignment(&layout, &path, &token, &stale_append, false)
+            .expect_err("a stale token must not append");
+        assert_eq!(error.error_code, "mission.revision_conflict");
+        assert_eq!(std::fs::read(&path).expect("unchanged stale refusal"), committed);
+        assert!(!layout.db_path.exists());
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_authoring_append_refuses_reviewed_drafts_and_foreign_workspaces() {
+        use frankenterm_core::plan::{MissionAssignmentApprovalDecision, MissionAssignmentApprovalRequest};
+        for foreign_workspace in [false, true] {
+            let (_dir, layout, path) = mission_authoring_fixture();
+            let request = mission_draft_request(
+                &layout, None, "Restricted draft", 7, "first", "worker",
+            ).expect("draft request");
+            let (created, _) = run_mission_create(&layout, &path, &request, false).expect("create");
+            let token = created["revision_token"].to_string();
+            let current = if foreign_workspace {
+                let mut mission = load_mission_from_path(&path).expect("fixture mission");
+                mission.workspace_id = layout.root.join("different").to_str().unwrap().to_string();
+                std::fs::write(
+                    &path, serde_json::to_vec_pretty(&mission).expect("foreign fixture JSON"),
+                ).expect("write foreign fixture before acquiring a mutation guard");
+                let current = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                    &mission,
+                ).expect("foreign fixture token");
+                serde_json::to_string(&current).expect("fixture token")
+            } else {
+                let approval = MissionAssignmentApprovalRequest {
+                    assignment_id: request.initial_assignment.assignment_id.clone(),
+                    decision: MissionAssignmentApprovalDecision::Approve,
+                    actor: "cli-operator".to_string(),
+                    reason_code: "operator.reviewed".to_string(),
+                };
+                let (approved, _) = run_mission_approval_resolution(
+                    &layout, &path, &token, &approval, false,
+                ).expect("reviewing a draft prevents later extension");
+                approved["revision_token"].to_string()
+            };
+            let before = std::fs::read(&path).expect("guarded draft");
+            let append = mission_assignment_draft_request(9, "next", "worker");
+            assert!(run_mission_add_assignment(&layout, &path, &current, &append, false).is_err());
+            assert_eq!(std::fs::read(&path).expect("retained guarded draft"), before);
+            assert!(!layout.db_path.exists());
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_authoring_reaches_approval_then_the_production_durable_driver() {
+        run_async_test(async {
+            use frankenterm_core::plan::{
+                MissionAssignmentApprovalDecision, MissionAssignmentApprovalRequest,
+                MissionLifecycleState, Outcome,
+            };
+            let (_dir, layout, path) = mission_authoring_fixture();
+            let request = mission_draft_request(
+                &layout, None, "Operator mission", 7, "first", "worker",
+            ).expect("draft request");
+            let (created, _) = run_mission_create(&layout, &path, &request, false).expect("create");
+            let append = mission_assignment_draft_request(9, "second", "worker");
+            let (added, _) = run_mission_add_assignment(
+                &layout, &path, &created["revision_token"].to_string(), &append, false,
+            ).expect("append before admission");
+            let token = added["revision_token"].to_string();
+            let guard = acquire_mission_mutation(&layout, &path, Some(&token)).expect("run lock");
+            let mut mission = guard.mission().clone();
+            let plan = mission_run_transition_plan(&mission).expect("draft run request");
+            apply_mission_transition_plan(&mut mission, &plan, mission_now_ms(), "cli_run")
+                .expect("canonical pending-approval admission");
+            assert_eq!(mission.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+            let receipt = guard.commit(&mut mission).expect("persist run request");
+            let mut token = serde_json::to_string(&receipt.current).expect("run token");
+            let ids = [
+                request.initial_assignment.assignment_id.clone(),
+                append.assignment_id.clone(),
+            ];
+            for (index, assignment_id) in ids.iter().enumerate() {
+                let approval = MissionAssignmentApprovalRequest {
+                    assignment_id: assignment_id.clone(),
+                    decision: MissionAssignmentApprovalDecision::Approve,
+                    actor: "cli-operator".to_string(),
+                    reason_code: "operator.reviewed".to_string(),
+                };
+                let (approved, _) = run_mission_approval_resolution(
+                    &layout, &path, &token, &approval, false,
+                ).expect("explicit assignment approval");
+                token = approved["revision_token"].to_string();
+                assert_eq!(approved["resolution"]["blocking_approvals_remaining"], 1 - index);
+            }
+            let mission = load_mission_from_path(&path).expect("approved mission");
+            assert_eq!(mission.lifecycle_state, MissionLifecycleState::Executing);
+            assert_eq!(mission.revision, 4);
+            assert!(mission.assignments.iter().all(|assignment| assignment.outcome.is_none()));
+
+            // Seed real durable receipts through the existing unit executor.
+            // The production drive exercises recovery, not live pane transport.
+            seed_mission_drive_commits(
+                &layout, &path, &token, &[ids[0].0.as_str(), ids[1].0.as_str()],
+            );
+            let output = run_mission_drive(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            ).await.expect("production drive accepts authored approved assignments");
+            assert!(output.error.is_none());
+            assert_eq!(output.progress.committed_actions.len(), 2);
+            let mission = load_mission_from_path(&path).expect("checkpointed authored mission");
+            assert_eq!(mission.revision, 6);
+            assert_eq!(mission.lifecycle_state, MissionLifecycleState::Executing);
+            assert!(mission.assignments.iter().all(|assignment| matches!(
+                assignment.outcome, Some(Outcome::Success { .. })
+            )));
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[test]
     fn mission_approval_cli_requires_explicit_decision_token_and_reason() {
         for args in [
             vec!["ft", "mission", "resolve-approval", "assignment:a"],
@@ -112629,40 +113325,69 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn mission_cli_run_transition_plan_matches_contract() {
-        use frankenterm_core::plan::MissionLifecycleState as State;
+        use frankenterm_core::plan::{ApprovalState, MissionLifecycleState as State};
         use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
-        let plan_for = |state| {
+        let plan_for = |state, approvals_satisfied| {
             let mut mission = sample_cli_mission();
             mission.lifecycle_state = state;
+            if approvals_satisfied {
+                mission.assignments[0].approval_state = ApprovalState::NotRequired;
+            }
             mission_run_transition_plan(&mission)
         };
+        for (satisfied, admission) in [
+            (false, (State::AwaitingApproval, Kind::RequestApproval)),
+            (true, (State::Running, Kind::ExecutionStarted)),
+        ] {
+            assert_eq!(
+                plan_for(State::Planning, satisfied).expect("planning run request"),
+                vec![
+                    (State::Planned, Kind::PlanFinalized),
+                    (State::Dispatching, Kind::DispatchStarted),
+                    admission,
+                ]
+            );
+            assert_eq!(
+                plan_for(State::Planned, satisfied).expect("planned run request"),
+                vec![(State::Dispatching, Kind::DispatchStarted), admission]
+            );
+            assert_eq!(
+                plan_for(State::Dispatching, satisfied).expect("dispatch admission"),
+                vec![admission]
+            );
+        }
         assert_eq!(
-            plan_for(State::Planning).expect("planning should be runnable"),
-            vec![
-                (State::Planned, Kind::PlanFinalized),
-                (State::Dispatching, Kind::DispatchStarted),
-                (State::Running, Kind::ExecutionStarted),
-            ]
-        );
-        assert_eq!(
-            plan_for(State::Planned).expect("planned should be runnable"),
-            vec![
-                (State::Dispatching, Kind::DispatchStarted),
-                (State::Running, Kind::ExecutionStarted),
-            ]
-        );
-        assert_eq!(
-            plan_for(State::Dispatching)
-                .expect("dispatching should transition directly to running"),
-            vec![(State::Running, Kind::ExecutionStarted)]
-        );
-        assert_eq!(
-            plan_for(State::RetryPending).expect("retry pending should resume into running"),
+            plan_for(State::RetryPending, false).expect("retry pending can resume"),
             vec![(State::Running, Kind::RetryResumed)]
         );
-        assert!(plan_for(State::AwaitingApproval).is_err());
-        assert!(plan_for(State::Completed).is_err());
+        assert!(plan_for(State::AwaitingApproval, false).is_err());
+        assert_eq!(
+            plan_for(State::AwaitingApproval, true).expect("resolved approvals admit execution"),
+            vec![(State::Executing, Kind::Approve)]
+        );
+        assert!(plan_for(State::Completed, true).is_err());
+        for approval in [
+            ApprovalState::Denied {
+                denied_by: "operator".to_string(),
+                denied_at_ms: 1_704_200_000_200,
+                reason_code: "operator.declined".to_string(),
+            },
+            ApprovalState::Expired {
+                expired_at_ms: 1_704_200_000_200,
+                reason_code: "approval.expired".to_string(),
+            },
+        ] {
+            for state in [State::Planning, State::Planned, State::Dispatching] {
+                let mut mission = sample_cli_mission();
+                mission.lifecycle_state = state;
+                mission.assignments[0].approval_state = approval.clone();
+                assert_eq!(
+                    mission_run_transition_plan(&mission).expect_err("review barrier").error_code,
+                    "mission.transition.approval_blocked"
+                );
+            }
+        }
     }
 
     #[test]
