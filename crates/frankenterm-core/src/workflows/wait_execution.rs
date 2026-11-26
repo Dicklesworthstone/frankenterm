@@ -3047,7 +3047,6 @@ mod tests {
     fn sleep_wait_uses_cx_virtual_time_without_wall_delay() {
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed_task = std::sync::Arc::clone(&completed);
-        let wall_start = Instant::now();
         let mut runtime = asupersync::LabRuntime::new(
             asupersync::LabConfig::new(7301)
                 .with_auto_advance()
@@ -3080,7 +3079,9 @@ mod tests {
             .expect("spawn virtual-time wait task");
         runtime.scheduler.lock().schedule(task_id, 0);
 
+        let wall_start = Instant::now();
         let report = runtime.run_with_auto_advance();
+        let wall_elapsed = wall_start.elapsed();
 
         assert!(
             !matches!(
@@ -3094,9 +3095,13 @@ mod tests {
             runtime.now() >= asupersync::Time::from_secs(5),
             "virtual time should advance through the five-second wait"
         );
+        // A wall-clock wait cannot finish in under five seconds, so any bound
+        // below five seconds catches one. Four leaves room for a loaded
+        // machine: on Windows the full parallel suite pushed this run past the
+        // old one-second bound, while it takes 0.35 s alone (fwl26).
         assert!(
-            wall_start.elapsed() < Duration::from_secs(1),
-            "virtual-time wait must not consume five wall-clock seconds"
+            wall_elapsed < Duration::from_secs(4),
+            "virtual-time wait must not consume five wall-clock seconds, took {wall_elapsed:?}"
         );
         assert!(
             completed.load(std::sync::atomic::Ordering::SeqCst),
