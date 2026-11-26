@@ -40,6 +40,10 @@ class WorkingDirectoryTests(unittest.TestCase):
     def test_bash(self):
         self.check_directory("bash")
 
+    def test_system_bash(self):
+        # macOS ships Bash 3.2 as /bin/bash, usually behind a newer Bash on PATH.
+        self.check_directory("/bin/bash")
+
     def test_zsh(self):
         self.check_directory("zsh")
 
@@ -77,7 +81,9 @@ class BashPromptTests(unittest.TestCase):
                 with subprocess.Popen(
                     ["bash", "--noprofile", "--rcfile", str(rc), "-i"],
                     stdin=slave, stdout=slave, stderr=slave,
-                    env={**os.environ, "FT_SNIPPETS": str(SNIPPETS), "TERM": "dumb",
+                    # Under TERM=dumb, Bash 3.2's readline redraws the first
+                    # prompt line, repeating its markers. Model a real terminal.
+                    env={**os.environ, "FT_SNIPPETS": str(SNIPPETS), "TERM": "xterm-256color",
                          "HISTFILE": os.devnull, "INPUTRC": os.devnull},
                 ) as child:
                     def read_prompt():

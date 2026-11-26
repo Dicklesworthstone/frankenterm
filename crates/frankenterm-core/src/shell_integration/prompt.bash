@@ -48,9 +48,11 @@ if [[ $- == *i* ]]; then
     if [[ ${PROMPT_COMMAND[0]:-} != __ft_precmd$'\n'*'__ft_finish_prompt' ]] &&
        ! [[ ${PROMPT_COMMAND[0]:-} == __ft_precmd && " ${PROMPT_COMMAND[*]:-} " == *' __ft_finish_prompt '* ]]; then
         # Strip just the previous version's scalar prefix before rebuilding.
+        # Bash 3.2 expands ${PROMPT_COMMAND[0]#...} of a scalar to nothing,
+        # so trim through the scalar name, which is element 0 of an array.
         case ${PROMPT_COMMAND[0]:-} in
             __ft_precmd) PROMPT_COMMAND[0]='' ;;
-            '__ft_precmd;'*) PROMPT_COMMAND[0]=${PROMPT_COMMAND[0]#'__ft_precmd;'} ;;
+            '__ft_precmd;'*) PROMPT_COMMAND[0]=${PROMPT_COMMAND#'__ft_precmd;'} ;;
         esac
         if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
             PROMPT_COMMAND=(__ft_precmd ${PROMPT_COMMAND[@]+"${PROMPT_COMMAND[@]}"} __ft_finish_prompt)
