@@ -592,11 +592,14 @@ fn walk_dir(
                 items,
             )?;
         } else if path.is_file() {
-            let relative = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+            let relative = path.strip_prefix(base).unwrap_or(&path).to_string_lossy();
+            // A plan names its files with '/' on every platform, so its JSON
+            // and ordering do not depend on the host; Windows accepts '/'
+            // where the name is joined back onto a root.
+            #[cfg(windows)]
+            let relative = relative.replace('\\', "/");
+            #[cfg(not(windows))]
+            let relative = relative.into_owned();
             let item = classify_file(
                 &path,
                 &dest_root.join(&relative),
