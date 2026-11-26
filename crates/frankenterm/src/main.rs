@@ -79903,9 +79903,10 @@ async fn resolve_real_tx_runtime(
         None
     };
     let db_path = layout.db_path.to_string_lossy();
-    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+    let storage = match frankenterm_core::storage::StorageHandle::with_config_with_cx(
         &frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request),
         &db_path,
+        frankenterm_core::storage::StorageConfig::from(config),
     )
     .await
     {
@@ -83175,6 +83176,22 @@ fn run_mission_lifecycle(
 }
 
 #[cfg(feature = "subprocess-bridge")]
+fn verify_mission_dispatch_workspace(
+    mutation: &frankenterm_core::tx_execution::MissionMutationGuard,
+) -> Result<(), MissionCommandError> {
+    mutation.verify_dispatch_workspace().map_err(|_| MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: "mission.dispatch.workspace_mismatch",
+        message: "The mission workspace does not match the pinned canonical workspace."
+            .to_string(),
+        hint: Some(
+            "Use the mission's original workspace. Dispatch requires workspace_id to be the exact canonical root; path aliases are refused."
+                .to_string(),
+        ),
+    })
+}
+
+#[cfg(feature = "subprocess-bridge")]
 fn mission_assignment_dispatch_error(
     error: frankenterm_core::mission_dispatch::AssignmentDispatchError,
 ) -> MissionCommandError {
@@ -83310,7 +83327,7 @@ async fn execute_mission_assignment_transaction(
         frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
             .with_resolved_capabilities(resolved_capabilities);
     let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
-        layout.root.to_string_lossy().to_string(),
+        mission_guard.workspace_root().to_string_lossy().to_string(),
     )
     .with_actor(frankenterm_core::policy::ActorKind::Human);
     let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
@@ -83379,6 +83396,7 @@ fn finish_mission_assignment_dispatch(
 > {
     mutation.verify_current().map_err(mission_store_error)?;
     let confirmed = frankenterm_core::tx_execution::recover_mission_assignment_dispatch(
+        &mutation,
         contract_lock,
         expected,
         contract,
@@ -83436,6 +83454,7 @@ async fn run_mission_assignment_dispatch(
     use frankenterm_core::plan::AssignmentId;
 
     let mutation = acquire_mission_mutation(layout, mission_path, Some(expected_token))?;
+    verify_mission_dispatch_workspace(&mutation)?;
     let assignment_id = AssignmentId(assignment_id.to_string());
     let expected = compile_assignment_dispatch(mutation.mission(), &assignment_id)
         .map_err(mission_assignment_dispatch_error)?;
@@ -83496,6 +83515,7 @@ async fn run_mission_assignment_dispatch(
         .map_err(mission_store_error)
         .map_err(|error| mission_assignment_transaction_error(error, contract_path))?;
     let recovered = frankenterm_core::tx_execution::recover_mission_assignment_dispatch(
+        &mutation,
         &contract_lock,
         &expected,
         &mut contract,
@@ -83733,6 +83753,7 @@ where
     }
     let mutation =
         acquire_mission_mutation(layout, request.mission_path, Some(request.expected_token))?;
+    verify_mission_dispatch_workspace(&mutation)?;
     let plan =
         compile_mission_drive(mutation.mission(), request.max_assignments).map_err(|error| {
             MissionCommandError {
@@ -108554,9 +108575,10 @@ mod tests {
         PathBuf,
     ) {
         let dir = tempfile::tempdir().expect("mission lifecycle tempdir");
-        let ft_dir = dir.path().join(".ft");
+        let root = dir.path().canonicalize().expect("canonical mission workspace");
+        let ft_dir = root.join(".ft");
         let layout = frankenterm_core::config::WorkspaceLayout {
-            root: dir.path().to_path_buf(),
+            root,
             ft_dir: ft_dir.clone(),
             db_path: ft_dir.join("ft.db"),
             lock_path: ft_dir.join("ft.lock"),
@@ -108568,9 +108590,11 @@ mod tests {
         };
         let path = default_mission_file_path(&layout);
         std::fs::create_dir_all(path.parent().expect("mission dir")).expect("create mission dir");
+        let mut mission = sample_robot_mission();
+        mission.workspace_id = layout.root.to_str().expect("UTF-8 fixture root").to_string();
         std::fs::write(
             &path,
-            serde_json::to_vec_pretty(&sample_robot_mission()).expect("serialize mission"),
+            serde_json::to_vec_pretty(&mission).expect("serialize mission"),
         )
         .expect("write mission fixture");
         (dir, layout, path)
@@ -108671,6 +108695,7 @@ mod tests {
 
         let (dir, layout, path) = mission_lifecycle_fixture();
         let mut mission = sample_cli_mission();
+        mission.workspace_id = layout.root.to_str().expect("UTF-8 fixture root").to_string();
         mission.lifecycle_state = MissionLifecycleState::Running;
         // Exercise exact decimal token handoff above JavaScript's integer range.
         mission.revision = 9_007_199_254_740_993;
@@ -108742,6 +108767,63 @@ mod tests {
             )
             .expect("persist durable unit-executor success");
         }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_refuses_foreign_and_aliased_workspaces_before_preview_or_execution() {
+        run_async_test(async {
+            for count in [0, 2] {
+                for dry_run in [true, false] {
+                    for alias in [false, true] {
+                        let (_dir, layout, path, _) = mission_drive_fixture(count);
+                        let root = std::fs::canonicalize(&layout.root)
+                            .expect("canonical fixture workspace");
+                        let mut mission = load_mission_from_path(&path)
+                            .expect("load drive fixture");
+                        mission.workspace_id = if alias {
+                            format!("{}/.", root.display())
+                        } else {
+                            root.join("foreign-workspace").to_string_lossy().to_string()
+                        };
+                        std::fs::write(
+                            &path,
+                            serde_json::to_vec_pretty(&mission).expect("mission JSON"),
+                        )
+                        .expect("write mismatched workspace");
+                        let token =
+                            frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                                &mission,
+                            )
+                            .expect("exact changed mission token");
+                        let token = serde_json::to_string(&token).expect("token JSON");
+                        let before = std::fs::read(&path).expect("original mission");
+                        let error = run_mission_drive(
+                            &layout,
+                            &frankenterm_core::config::Config::default(),
+                            None,
+                            MissionDriveRequest {
+                                mission_path: &path,
+                                expected_token: &token,
+                                max_assignments: 2,
+                                admission_budget_ms: 300_000,
+                                dry_run,
+                            },
+                        )
+                        .await
+                        .expect_err("batch admission must validate workspace even for an empty queue");
+                        assert_eq!(error.error_code, "mission.dispatch.workspace_mismatch");
+                        assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
+                        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+                        assert!(!layout.ft_dir.join("tx_ledgers").exists());
+                        assert!(!layout.db_path.exists());
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(all(
@@ -109381,6 +109463,60 @@ mod tests {
             assert_eq!(std::fs::read(&path).expect("reread mission"), before);
             assert!(!layout.ft_dir.join("mission-dispatch").exists());
             assert!(!layout.db_path.exists(), "preview must not open storage");
+        });
+    }
+
+    #[cfg(all(feature = "subprocess-bridge", not(windows)))]
+    #[test]
+    fn mission_dispatch_refuses_foreign_and_alias_workspace_before_preview_or_effects() {
+        run_async_test(async {
+            for dry_run in [false, true] {
+                for alias in [false, true] {
+                    let (_dir, layout, path) = mission_lifecycle_fixture();
+                    let foreign = tempfile::tempdir().expect("foreign workspace");
+                    let mut mission = load_mission_from_path(&path).expect("load mission fixture");
+                    mission.workspace_id = if alias {
+                        format!("{}/.", layout.root.display())
+                    } else {
+                        foreign
+                            .path()
+                            .canonicalize()
+                            .expect("canonical foreign workspace")
+                            .to_str()
+                            .expect("UTF-8 foreign workspace")
+                            .to_string()
+                    };
+                    std::fs::write(
+                        &path,
+                        serde_json::to_vec_pretty(&mission).expect("serialize foreign mission"),
+                    )
+                    .expect("write foreign mission");
+                    let token =
+                        frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                            &mission,
+                        )
+                        .expect("exact revision token");
+                    let token = serde_json::to_string(&token).expect("serialize token");
+                    let before = std::fs::read(&path).expect("read original mission");
+
+                    let error = run_mission_assignment_dispatch(
+                        &layout,
+                        &frankenterm_core::config::Config::default(),
+                        None,
+                        &path,
+                        "assignment:cli-a",
+                        &token,
+                        dry_run,
+                    )
+                    .await
+                    .expect_err("workspace mismatch must refuse before runtime resolution");
+                    assert_eq!(error.error_code, "mission.dispatch.workspace_mismatch");
+                    assert_eq!(std::fs::read(&path).expect("reread mission"), before);
+                    assert!(!layout.ft_dir.join("mission-dispatch").exists());
+                    assert!(!layout.ft_dir.join("tx_ledgers").exists());
+                    assert!(!layout.db_path.exists());
+                }
+            }
         });
     }
 

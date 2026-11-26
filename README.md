@@ -3782,7 +3782,7 @@ Shape per `pub struct Mission` in `plan.rs`:
   "generation": "<storage incarnation, generated once at creation>",
   "revision": 0,
   "title": "Refactor pricing module across services",
-  "workspace_id": "frankenterm",
+  "workspace_id": "/absolute/canonical/path/to/frankenterm",
   "lifecycle_state": "planning",
   "ownership": { "...": "MissionOwnership shape" },
   "created_at_ms": 1747371600000,
@@ -3807,6 +3807,8 @@ Required fields: `mission_version`, `mission_id`, `generation`, `revision`, `tit
 `ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state and the exact `revision_token` required by assignment dispatch.
 
 ### Dispatch one assignment
+
+The mission's `workspace_id` must exactly match the canonical root of the workspace running the command. Set this when creating the mission. A copied mission from another workspace or a path alias such as `/project/.` is refused before preview, transaction publication or recovery; changing the spelling must not create a new retry identity for an existing assignment. Run an existing mission from its original workspace.
 
 In default Linux and macOS builds, `ft mission dispatch` executes one existing assignment whose action is an explicit pane send or pane-bound wait. It requires the mission to be running or executing, an unsettled assignment, and eligible approval metadata. Live execution additionally checks policy, approvals, target capabilities and the persisted kill switch through the same transaction executor as `ft tx run`. Assignments requiring file reservations are refused by this path.
 

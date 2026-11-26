@@ -2279,6 +2279,23 @@ impl MissionMutationGuard {
         &self.mission
     }
 
+    /// The canonical workspace pinned when this mission was locked.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.guard.workspace_display
+    }
+
+    /// Bind pane dispatch to the exact canonical workspace spelling.
+    ///
+    /// Do not canonicalize the supplied ID: aliases would produce different
+    /// durable assignment identities for the same workspace and action.
+    pub fn verify_dispatch_workspace(&self) -> Result<(), MissionStoreError> {
+        if self.workspace_root().to_str() != Some(self.mission.workspace_id.as_str()) {
+            return Err(MissionStoreError::Authority);
+        }
+        Ok(())
+    }
+
     /// Recheck the locked mission immediately before admitting external work.
     /// Recovery reads may use a detached descriptor, but effects require the
     /// original namespace and every byte of the observed revision to remain
@@ -2336,6 +2353,7 @@ impl MissionMutationGuard {
         use cap_std::fs::DirBuilderExt as _;
         use rustix::fs::{RenameFlags, renameat_with};
 
+        self.verify_dispatch_workspace()?;
         self.verify_current()?;
         let expected =
             crate::mission_dispatch::compile_assignment_dispatch(self.mission(), assignment_id)
@@ -2596,6 +2614,7 @@ impl MissionMutationGuard {
     }
 }
 
+#[cfg(feature = "subprocess-bridge")]
 fn mission_dispatch_contract_matches(
     expected: &MissionTxContract,
     actual: &MissionTxContract,
@@ -4543,6 +4562,8 @@ fn compensation_idempotency_key(
 /// guard. A true result means that the matching action has durable success
 /// evidence and its terminal transaction contract has been saved and synced.
 /// Keep the mission mutation guard until the assignment outcome is also saved.
+/// Recovery verifies the pinned workspace and recompiles the expected action
+/// from this guard's current mission incarnation before consulting durable proof.
 ///
 /// A false result supplies no execution authority: the normal transaction
 /// executor must still classify absent, failed, or unsettled durable outcomes.
@@ -4551,12 +4572,22 @@ fn compensation_idempotency_key(
 ///
 /// Fails closed on a foreign contract, unsupported compiler shape, stale loaded
 /// snapshot, unavailable proof, or a contract persistence failure.
+#[cfg(feature = "subprocess-bridge")]
 pub fn recover_mission_assignment_dispatch(
+    mission_guard: &MissionMutationGuard,
     contract_lock: &TxContractLockGuard,
     expected: &MissionTxContract,
     contract: &mut MissionTxContract,
     now_ms: i64,
 ) -> Result<bool, MissionStoreError> {
+    mission_guard.verify_dispatch_workspace()?;
+    mission_guard.verify_current()?;
+    if mission_guard.guard.workspace_identity != contract_lock.workspace_identity
+        || mission_guard.guard.control_identity != contract_lock.control_identity
+        || mission_guard.guard.workspace_display != contract_lock.workspace_display
+    {
+        return Err(MissionStoreError::Authority);
+    }
     expected
         .validate()
         .map_err(|_| MissionStoreError::Invalid)?;
@@ -4622,7 +4653,14 @@ pub fn recover_mission_assignment_dispatch(
     {
         return Err(MissionStoreError::Invalid);
     }
-    if !mission_dispatch_contract_matches(expected, contract)? {
+    let bound = crate::mission_dispatch::compile_assignment_dispatch(
+        mission_guard.mission(),
+        &binding.1,
+    )
+    .map_err(|_| MissionStoreError::Invalid)?;
+    if !mission_dispatch_contract_matches(&bound, expected)?
+        || !mission_dispatch_contract_matches(expected, contract)?
+    {
         return Err(MissionStoreError::Conflict);
     }
 
@@ -8878,6 +8916,14 @@ mod tests {
     ))]
     fn stored_dispatch_mission_fixture(path: &Path) -> Mission {
         let mut mission = stored_mission_fixture(path);
+        mission.workspace_id = path
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         mission.candidates.push(crate::plan::CandidateAction {
             candidate_id: crate::plan::CandidateActionId("candidate:dispatch".into()),
             requested_by: crate::plan::MissionActorRole::Planner,
@@ -8906,6 +8952,40 @@ mod tests {
         mission.validate().unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
         mission
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_refuses_foreign_and_alias_workspace_ids() {
+        for alias in [false, true] {
+            let (_dir, root) = canonical_tempdir();
+            let (_foreign_dir, foreign_root) = canonical_tempdir();
+            let path = root.join("mission.json");
+            let mut mission = stored_dispatch_mission_fixture(&path);
+            mission.workspace_id = if alias {
+                format!("{}/.", root.display())
+            } else {
+                foreign_root.to_str().unwrap().to_string()
+            };
+            std::fs::write(&path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let mutation = MissionMutationGuard::acquire(&root, &path, None).unwrap();
+
+            assert_eq!(mutation.workspace_root(), root.as_path());
+            assert_eq!(
+                mutation
+                    .publish_assignment_dispatch(&mission.assignments[0].assignment_id)
+                    .err()
+                    .unwrap(),
+                MissionStoreError::Authority
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!root.join(".ft/mission-dispatch").exists());
+            assert!(!root.join(".ft/tx_ledgers").exists());
+        }
     }
 
     #[cfg(all(
@@ -19532,33 +19612,28 @@ mod tests {
 
     // Mission assignment recovery regression tests.
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn mission_dispatch_recovery_contract() -> MissionTxContract {
-        let mut contract = make_test_contract(1);
-        let digest = "ab".repeat(32);
-        contract.intent = TxIntent {
-            tx_id: TxId(format!("mission-tx:{digest}")),
-            requested_by: MissionActorRole::Dispatcher,
-            summary: serde_json::to_string(&(
-                "frankenterm.mission.assignment-binding.v1",
-                crate::plan::AssignmentId("assignment:recovery".to_string()),
-                "worker:recovery",
-                crate::plan::CandidateActionId("candidate:recovery".to_string()),
-            ))
-            .unwrap(),
-            correlation_id: format!("mission-dispatch:{digest}"),
-            created_at_ms: 1_000,
-        };
-        contract.plan.tx_id = contract.intent.tx_id.clone();
-        contract.plan.plan_id = TxPlanId(format!("mission-plan:{digest}"));
-        contract.plan.steps[0].step_id = TxStepId(format!("assignment:{digest}"));
-        contract.plan.steps[0].description =
-            "Execute the assignment's explicit pane action".to_string();
-        contract.plan.compensations.clear();
-        contract
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn mission_dispatch_recovery_contract(
+        root: &Path,
+    ) -> (MissionMutationGuard, MissionTxContract) {
+        let path = root.join("mission.json");
+        let mission = stored_dispatch_mission_fixture(&path);
+        let mutation = MissionMutationGuard::acquire(root, &path, None).unwrap();
+        let contract = crate::mission_dispatch::compile_assignment_dispatch(
+            mutation.mission(),
+            &mission.assignments[0].assignment_id,
+        )
+        .unwrap();
+        (mutation, contract)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn seed_mission_dispatch_recovery_outcome(
         guard: &TxContractLockGuard,
         contract: &MissionTxContract,
@@ -19607,12 +19682,15 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_recovers_durable_success_after_contract_and_mission_save_crash() {
         let (_dir, root) = canonical_tempdir();
         let path = root.join("mission-dispatch.json");
-        let expected = mission_dispatch_recovery_contract();
+        let (mutation, expected) = mission_dispatch_recovery_contract(&root);
         write_authoritative_contract(&path, &expected);
         let guard = acquire_tx_contract_lock(&root, &path).unwrap();
         seed_mission_dispatch_recovery_outcome(
@@ -19625,7 +19703,14 @@ mod tests {
         let mut contract = expected.clone();
 
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000).unwrap()
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            )
+            .unwrap()
         );
         assert_eq!(contract.lifecycle_state, MissionTxState::Committed);
         assert_eq!(contract.outcome, TxOutcome::Committed);
@@ -19650,19 +19735,29 @@ mod tests {
         let mut reloaded: MissionTxContract =
             serde_json::from_slice(&guard.read_authoritative_contract_bytes().unwrap()).unwrap();
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut reloaded, 7_000).unwrap()
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut reloaded,
+                7_000,
+            )
+            .unwrap()
         );
         assert_eq!(reloaded.receipts, receipts);
         assert_eq!(reloaded.lifecycle_state, MissionTxState::Committed);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_receipts_and_terminal_json_are_not_durable_success_proof() {
         for claimed_committed in [false, true] {
             let (_dir, root) = canonical_tempdir();
             let path = root.join("mission-dispatch.json");
-            let expected = mission_dispatch_recovery_contract();
+            let (mutation, expected) = mission_dispatch_recovery_contract(&root);
             let mut contract = expected.clone();
             if claimed_committed {
                 contract.receipts = recovered_commit_success_report(
@@ -19679,15 +19774,22 @@ mod tests {
             let guard = acquire_tx_contract_lock(&root, &path).unwrap();
             let original = guard.read_authoritative_contract_bytes().unwrap();
 
-            assert!(
-                !recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
-                    .unwrap()
-            );
+            assert!(!recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            )
+            .unwrap());
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_does_not_recover_pending_or_failed_actions() {
         for outcome in [
@@ -19700,29 +19802,36 @@ mod tests {
         ] {
             let (_dir, root) = canonical_tempdir();
             let path = root.join("mission-dispatch.json");
-            let expected = mission_dispatch_recovery_contract();
+            let (mutation, expected) = mission_dispatch_recovery_contract(&root);
             write_authoritative_contract(&path, &expected);
             let guard = acquire_tx_contract_lock(&root, &path).unwrap();
             seed_mission_dispatch_recovery_outcome(&guard, &expected, outcome);
             let original = guard.read_authoritative_contract_bytes().unwrap();
             let mut contract = expected.clone();
 
-            assert!(
-                !recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
-                    .unwrap()
-            );
+            assert!(!recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            )
+            .unwrap());
             assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
             assert!(contract.receipts.is_empty());
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_recovery_binds_assignment_creation_time_beyond_tx_hash() {
         let (_dir, root) = canonical_tempdir();
         let path = root.join("mission-dispatch.json");
-        let expected = mission_dispatch_recovery_contract();
+        let (mutation, expected) = mission_dispatch_recovery_contract(&root);
         let mut foreign = expected.clone();
         foreign.intent.created_at_ms += 1;
         assert_eq!(
@@ -19740,19 +19849,28 @@ mod tests {
         let original = guard.read_authoritative_contract_bytes().unwrap();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut foreign, 6_000),
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut foreign,
+                6_000,
+            ),
             Err(MissionStoreError::Conflict)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         assert_eq!(foreign.lifecycle_state, MissionTxState::Planned);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_recovery_rejects_unsaved_mutable_snapshot() {
         let (_dir, root) = canonical_tempdir();
         let path = root.join("mission-dispatch.json");
-        let expected = mission_dispatch_recovery_contract();
+        let (mutation, expected) = mission_dispatch_recovery_contract(&root);
         write_authoritative_contract(&path, &expected);
         let guard = acquire_tx_contract_lock(&root, &path).unwrap();
         seed_mission_dispatch_recovery_outcome(
@@ -19765,18 +19883,27 @@ mod tests {
         stale.lifecycle_state = MissionTxState::Prepared;
 
         assert_eq!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut stale, 6_000),
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut stale,
+                6_000,
+            ),
             Err(MissionStoreError::Conflict)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_recovery_rejects_contracts_with_compensation() {
         let (_dir, root) = canonical_tempdir();
         let path = root.join("mission-dispatch.json");
-        let mut expected = mission_dispatch_recovery_contract();
+        let (mutation, mut expected) = mission_dispatch_recovery_contract(&root);
         expected.plan.compensations.push(TxCompensation {
             for_step_id: expected.plan.steps[0].step_id.clone(),
             action: expected.plan.steps[0].action.clone(),
@@ -19787,18 +19914,27 @@ mod tests {
         let original = guard.read_authoritative_contract_bytes().unwrap();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000),
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            ),
             Err(MissionStoreError::Invalid)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn mission_dispatch_recovery_waits_for_live_durable_proof_ownership() {
         let (_dir, root) = canonical_tempdir();
         let path = root.join("mission-dispatch.json");
-        let expected = mission_dispatch_recovery_contract();
+        let (mutation, expected) = mission_dispatch_recovery_contract(&root);
         write_authoritative_contract(&path, &expected);
         let guard = acquire_tx_contract_lock(&root, &path).unwrap();
         seed_mission_dispatch_recovery_outcome(
@@ -19810,21 +19946,168 @@ mod tests {
             .open_idempotency_store(IdempotencyPolicy::default())
             .unwrap();
         let key = test_commit_key(&expected, &expected.plan.steps[0].step_id.0);
-        let proof = other_store
-            .acquire_durable_key_leases([key], 6_000)
-            .unwrap();
+        let proof = other_store.acquire_durable_key_leases([key], 6_000).unwrap();
         let original = guard.read_authoritative_contract_bytes().unwrap();
         let mut contract = expected.clone();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000),
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            ),
             Err(MissionStoreError::InProgress)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         drop(proof);
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 7_000).unwrap()
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                7_000,
+            )
+            .unwrap()
         );
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_recovery_refuses_foreign_and_alias_workspace_ids() {
+        for alias in [false, true] {
+            let (_dir, root) = canonical_tempdir();
+            let (_foreign_dir, foreign_root) = canonical_tempdir();
+            let mission_path = root.join("mission.json");
+            let mut mission = stored_dispatch_mission_fixture(&mission_path);
+            mission.workspace_id = if alias {
+                format!("{}/.", root.display())
+            } else {
+                foreign_root.to_str().unwrap().to_string()
+            };
+            std::fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
+            let mutation = MissionMutationGuard::acquire(&root, &mission_path, None).unwrap();
+            let expected = crate::mission_dispatch::compile_assignment_dispatch(
+                mutation.mission(),
+                &mission.assignments[0].assignment_id,
+            )
+            .unwrap();
+            let path = root.join("mission-dispatch.json");
+            write_authoritative_contract(&path, &expected);
+            let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+            seed_mission_dispatch_recovery_outcome(
+                &guard,
+                &expected,
+                StepOutcome::Success { result: None },
+            );
+            let original = guard.read_authoritative_contract_bytes().unwrap();
+            let mission_before = std::fs::read(&mission_path).unwrap();
+            let ledger_before = durable_ledger_file_snapshot(&root.join(".ft"));
+            let mut contract = expected.clone();
+
+            assert_eq!(
+                recover_mission_assignment_dispatch(
+                    &mutation,
+                    &guard,
+                    &expected,
+                    &mut contract,
+                    6_000,
+                ),
+                Err(MissionStoreError::Authority)
+            );
+            assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+            assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+            assert_eq!(std::fs::read(&mission_path).unwrap(), mission_before);
+            assert_eq!(durable_ledger_file_snapshot(&root.join(".ft")), ledger_before);
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_recovery_refuses_another_workspace_transaction_guard() {
+        let (_dir, root) = canonical_tempdir();
+        let (_foreign_dir, foreign_root) = canonical_tempdir();
+        let (mutation, expected) = mission_dispatch_recovery_contract(&root);
+        let path = foreign_root.join("mission-dispatch.json");
+        write_authoritative_contract(&path, &expected);
+        let guard = acquire_tx_contract_lock(&foreign_root, &path).unwrap();
+        seed_mission_dispatch_recovery_outcome(
+            &guard,
+            &expected,
+            StepOutcome::Success { result: None },
+        );
+        let original = guard.read_authoritative_contract_bytes().unwrap();
+        let mut contract = expected.clone();
+
+        assert_eq!(
+            recover_mission_assignment_dispatch(
+                &mutation,
+                &guard,
+                &expected,
+                &mut contract,
+                6_000,
+            ),
+            Err(MissionStoreError::Authority)
+        );
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+        assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_recovery_binds_locked_mission_incarnation_and_action() {
+        for change_action in [false, true] {
+            let (_dir, root) = canonical_tempdir();
+            let (mutation, expected) = mission_dispatch_recovery_contract(&root);
+            let other_path = root.join("other-mission.json");
+            if change_action {
+                let mut changed = mutation.mission().clone();
+                let StepAction::SendText { text, .. } = &mut changed.candidates[0].action else {
+                    panic!("fixture must contain a pane send");
+                };
+                text.push_str("different action");
+                std::fs::write(&other_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+            } else {
+                let other = stored_dispatch_mission_fixture(&other_path);
+                assert_ne!(other.generation, mutation.mission().generation);
+            }
+            let other_mutation =
+                MissionMutationGuard::acquire(&root, &other_path, None).unwrap();
+            let path = root.join("mission-dispatch.json");
+            write_authoritative_contract(&path, &expected);
+            let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+            seed_mission_dispatch_recovery_outcome(
+                &guard,
+                &expected,
+                StepOutcome::Success { result: None },
+            );
+            let original = guard.read_authoritative_contract_bytes().unwrap();
+            let mut contract = expected.clone();
+
+            assert_eq!(
+                recover_mission_assignment_dispatch(
+                    &other_mutation,
+                    &guard,
+                    &expected,
+                    &mut contract,
+                    6_000,
+                ),
+                Err(MissionStoreError::Conflict)
+            );
+            assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+            assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+        }
     }
 
     // End mission assignment recovery regression tests.
