@@ -2221,6 +2221,115 @@ impl Assignment {
     }
 }
 
+/// Maximum queue length admitted by explicit operator draft authoring.
+pub const MISSION_AUTHORING_MAX_ASSIGNMENTS: usize = 100;
+/// Maximum UTF-8 bytes in one explicitly authored pane send.
+pub const MISSION_AUTHORING_MAX_TEXT_BYTES: usize = 64 * 1024;
+
+/// An explicitly selected pane action; no objective or shell text is inferred.
+///
+/// IDs must be fresh within the mission. The actor is audit attribution, not
+/// an authentication credential. Literal SendText is the supported authoring
+/// action; its stored text and paste mode are preserved exactly. Execution
+/// retains the existing SendText submission semantics, including the executor's
+/// appended newline; this request does not define a separate raw-input mode.
+#[derive(Debug, Clone)]
+pub struct MissionAssignmentDraftRequest {
+    pub assignment_id: AssignmentId,
+    pub candidate_id: CandidateActionId,
+    pub assignee: String,
+    pub actor: String,
+    pub action: StepAction,
+}
+
+/// Inputs for a fresh draft containing one explicit pending assignment.
+///
+/// The caller generates the fresh IDs/incarnation and supplies the canonical
+/// workspace path. The durable publisher independently verifies that workspace
+/// and refuses an existing target; this pure projection performs no I/O.
+#[derive(Debug, Clone)]
+pub struct MissionDraftRequest {
+    pub mission_id: MissionId,
+    pub generation: String,
+    pub title: String,
+    pub workspace_id: String,
+    pub ownership: MissionOwnership,
+    pub initial_assignment: MissionAssignmentDraftRequest,
+}
+
+/// Content-free refusals from explicit draft authoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MissionAuthoringError {
+    #[error("the mission contract is invalid")]
+    InvalidMission,
+    #[error("assignments can be appended only while a mission is planning or planned")]
+    NotDraft,
+    #[error("a reviewed assignment or recorded execution/control history prevents draft changes")]
+    ReviewedDraft,
+    #[error("IDs must contain 1-128 ASCII letters, digits, dots, underscores, colons or hyphens")]
+    InvalidIdentity,
+    #[error("the incarnation must be a nonzero 128-bit lowercase hexadecimal value")]
+    InvalidGeneration,
+    #[error("the title must be a nonempty printable label of at most 256 bytes")]
+    InvalidTitle,
+    #[error("the workspace must be an absolute path of at most 4096 bytes")]
+    InvalidWorkspace,
+    #[error("actors and assignees must be nonempty printable labels of at most 128 bytes")]
+    InvalidActor,
+    #[error("draft authoring supports only an explicit pane SendText action")]
+    UnsupportedAction,
+    #[error("pane text must contain 1-65536 UTF-8 bytes without NUL characters")]
+    InvalidText,
+    #[error("the authoring timestamp predates recorded mission or assignment state")]
+    InvalidTimestamp,
+    #[error("the candidate ID already exists")]
+    DuplicateCandidate,
+    #[error("the assignment ID already exists")]
+    DuplicateAssignment,
+    #[error("draft authoring permits at most 100 candidates and assignments")]
+    CapacityExceeded,
+    #[error("the revision cannot represent another durable assignment")]
+    RevisionExhausted,
+}
+
+impl MissionAuthoringError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidMission => "mission.authoring.invalid_mission",
+            Self::NotDraft => "mission.authoring.not_draft",
+            Self::ReviewedDraft => "mission.authoring.reviewed_draft",
+            Self::InvalidIdentity => "mission.authoring.invalid_identity",
+            Self::InvalidGeneration => "mission.authoring.invalid_generation",
+            Self::InvalidTitle => "mission.authoring.invalid_title",
+            Self::InvalidWorkspace => "mission.authoring.invalid_workspace",
+            Self::InvalidActor => "mission.authoring.invalid_actor",
+            Self::UnsupportedAction => "mission.authoring.unsupported_action",
+            Self::InvalidText => "mission.authoring.invalid_text",
+            Self::InvalidTimestamp => "mission.authoring.invalid_timestamp",
+            Self::DuplicateCandidate => "mission.authoring.duplicate_candidate",
+            Self::DuplicateAssignment => "mission.authoring.duplicate_assignment",
+            Self::CapacityExceeded => "mission.authoring.capacity_exceeded",
+            Self::RevisionExhausted => "mission.authoring.revision_exhausted",
+        }
+    }
+}
+
+fn valid_mission_authoring_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_mission_authoring_label(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 /// Canonical mission object for planner/dispatcher/operator orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -2276,6 +2385,207 @@ impl Mission {
             assignments: Vec::new(),
             pause_resume_state: MissionPauseResumeState::default(),
         }
+    }
+
+    /// Construct a fresh draft with one pending explicit pane assignment.
+    ///
+    /// No random identity, filesystem publication, policy grant, or external
+    /// action is created here. The caller owns fresh ID generation and durable
+    /// no-replace publication. A run request and explicit approval resolution
+    /// are still required before the assignment is eligible for dispatch.
+    pub fn create_draft(
+        request: &MissionDraftRequest,
+        now_ms: i64,
+    ) -> Result<Self, MissionAuthoringError> {
+        if !valid_mission_authoring_id(&request.mission_id.0) {
+            return Err(MissionAuthoringError::InvalidIdentity);
+        }
+        if request.generation.len() != 32
+            || request.generation.bytes().all(|byte| byte == b'0')
+            || !request
+                .generation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(MissionAuthoringError::InvalidGeneration);
+        }
+        if !valid_mission_authoring_label(&request.title, 256) {
+            return Err(MissionAuthoringError::InvalidTitle);
+        }
+        let workspace = std::path::Path::new(&request.workspace_id);
+        if !valid_mission_authoring_label(&request.workspace_id, 4096)
+            || !workspace.is_absolute()
+            || workspace.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(MissionAuthoringError::InvalidWorkspace);
+        }
+        if [
+            &request.ownership.planner,
+            &request.ownership.dispatcher,
+            &request.ownership.operator,
+        ]
+        .iter()
+        .any(|actor| !valid_mission_authoring_label(actor, 128))
+            || request.ownership.validate().is_err()
+        {
+            return Err(MissionAuthoringError::InvalidActor);
+        }
+        if now_ms < 0 {
+            return Err(MissionAuthoringError::InvalidTimestamp);
+        }
+        let empty = Self {
+            mission_version: MISSION_SCHEMA_VERSION,
+            mission_id: request.mission_id.clone(),
+            generation: request.generation.clone(),
+            revision: 0,
+            title: request.title.clone(),
+            workspace_id: request.workspace_id.clone(),
+            lifecycle_state: MissionLifecycleState::Planning,
+            ownership: request.ownership.clone(),
+            provenance: None,
+            created_at_ms: now_ms,
+            updated_at_ms: None,
+            candidates: Vec::new(),
+            assignments: Vec::new(),
+            pause_resume_state: MissionPauseResumeState::default(),
+        };
+        let mut draft = empty.append_assignment(&request.initial_assignment, now_ms)?;
+        // Initial contents are creation, not an accepted update of an earlier
+        // snapshot. The durable creator publishes revision zero as a whole.
+        draft.updated_at_ms = None;
+        Ok(draft)
+    }
+
+    /// Append one unreviewed assignment without altering prior queue contents.
+    ///
+    /// The caller must hold the canonical mutation guard with the operator's
+    /// exact revision token and commit the returned projection. This method
+    /// leaves the input and revision unchanged, including on every refusal.
+    /// Reviewed approvals bind their full snapshot: even an Approved assignment
+    /// in Planning/Planned prevents appending a different queue around it.
+    pub fn append_assignment(
+        &self,
+        request: &MissionAssignmentDraftRequest,
+        now_ms: i64,
+    ) -> Result<Self, MissionAuthoringError> {
+        self.validate()
+            .map_err(|_| MissionAuthoringError::InvalidMission)?;
+        if !matches!(
+            self.lifecycle_state,
+            MissionLifecycleState::Planning | MissionLifecycleState::Planned
+        ) {
+            return Err(MissionAuthoringError::NotDraft);
+        }
+        if self.pause_resume_state != MissionPauseResumeState::default()
+            || self.assignments.iter().any(|assignment| {
+                !matches!(assignment.approval_state, ApprovalState::Pending { .. })
+                    || assignment.outcome.is_some()
+                    || assignment.escalation.is_some()
+                    || assignment.reservation_intent.is_some()
+            })
+        {
+            return Err(MissionAuthoringError::ReviewedDraft);
+        }
+        if self.revision == u64::MAX {
+            return Err(MissionAuthoringError::RevisionExhausted);
+        }
+        if self.candidates.len() >= MISSION_AUTHORING_MAX_ASSIGNMENTS
+            || self.assignments.len() >= MISSION_AUTHORING_MAX_ASSIGNMENTS
+        {
+            return Err(MissionAuthoringError::CapacityExceeded);
+        }
+        if !valid_mission_authoring_id(&request.assignment_id.0)
+            || !valid_mission_authoring_id(&request.candidate_id.0)
+        {
+            return Err(MissionAuthoringError::InvalidIdentity);
+        }
+        if !valid_mission_authoring_label(&request.assignee, 128)
+            || !valid_mission_authoring_label(&request.actor, 128)
+        {
+            return Err(MissionAuthoringError::InvalidActor);
+        }
+        match &request.action {
+            StepAction::SendText { text, .. } => {
+                if text.is_empty()
+                    || text.len() > MISSION_AUTHORING_MAX_TEXT_BYTES
+                    || text.contains('\0')
+                {
+                    return Err(MissionAuthoringError::InvalidText);
+                }
+            }
+            _ => return Err(MissionAuthoringError::UnsupportedAction),
+        }
+        if self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.candidate_id == request.candidate_id)
+        {
+            return Err(MissionAuthoringError::DuplicateCandidate);
+        }
+        if self
+            .assignments
+            .iter()
+            .any(|assignment| assignment.assignment_id == request.assignment_id)
+        {
+            return Err(MissionAuthoringError::DuplicateAssignment);
+        }
+        let valid_time = |recorded| recorded >= self.created_at_ms && recorded <= now_ms;
+        if now_ms < self.created_at_ms
+            || !valid_time(self.updated_at_ms.unwrap_or(self.created_at_ms))
+            || self
+                .candidates
+                .iter()
+                .any(|candidate| !valid_time(candidate.created_at_ms))
+            || self.assignments.iter().any(|assignment| {
+                !valid_time(assignment.created_at_ms)
+                    || !valid_time(assignment.updated_at_ms.unwrap_or(assignment.created_at_ms))
+                    || assignment
+                        .updated_at_ms
+                        .is_some_and(|updated| updated < assignment.created_at_ms)
+                    || matches!(
+                        assignment.approval_state,
+                        ApprovalState::Pending { requested_at_ms, .. }
+                            if !valid_time(requested_at_ms)
+                                || requested_at_ms < assignment.created_at_ms
+                    )
+            })
+        {
+            return Err(MissionAuthoringError::InvalidTimestamp);
+        }
+        let mut draft = self.clone();
+        draft.candidates.push(CandidateAction {
+            candidate_id: request.candidate_id.clone(),
+            requested_by: MissionActorRole::Operator,
+            action: request.action.clone(),
+            rationale: "Explicit operator-authored pane action".to_string(),
+            score: None,
+            created_at_ms: now_ms,
+        });
+        draft.assignments.push(Assignment {
+            assignment_id: request.assignment_id.clone(),
+            candidate_id: request.candidate_id.clone(),
+            assigned_by: MissionActorRole::Operator,
+            assignee: request.assignee.clone(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Pending {
+                requested_by: request.actor.clone(),
+                requested_at_ms: now_ms,
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: now_ms,
+            updated_at_ms: None,
+        });
+        draft.updated_at_ms = Some(now_ms);
+        draft
+            .validate()
+            .map_err(|_| MissionAuthoringError::InvalidMission)?;
+        Ok(draft)
     }
 
     /// Whether every unsettled assignment has resolved its admission approval.
@@ -8975,6 +9285,384 @@ mod tests {
         });
         mission.lifecycle_state = MissionLifecycleState::Completed;
         mission
+    }
+
+    fn authored_assignment(index: usize) -> MissionAssignmentDraftRequest {
+        MissionAssignmentDraftRequest {
+            assignment_id: AssignmentId(format!("assignment:authored-{index}")),
+            candidate_id: CandidateActionId(format!("candidate:authored-{index}")),
+            assignee: format!("executor-{index}"),
+            actor: "cli-operator".to_string(),
+            action: StepAction::SendText {
+                pane_id: 9_007_199_254_740_993 + index as u64,
+                text: "printf '$HOME'\\n界".to_string(),
+                paste_mode: Some(false),
+            },
+        }
+    }
+
+    fn authored_draft_request() -> MissionDraftRequest {
+        MissionDraftRequest {
+            mission_id: MissionId("mission:authored".to_string()),
+            generation: "1234567890abcdef1234567890abcdef".to_string(),
+            title: "Explicit pane work".to_string(),
+            workspace_id: std::env::temp_dir()
+                .join("frankenterm-authoring-fixture")
+                .to_string_lossy()
+                .into_owned(),
+            ownership: MissionOwnership {
+                planner: "cli-planner".to_string(),
+                dispatcher: "cli-dispatcher".to_string(),
+                operator: "cli-operator".to_string(),
+            },
+            initial_assignment: authored_assignment(0),
+        }
+    }
+
+    #[test]
+    fn mission_authoring_creates_a_fresh_pending_draft_with_exact_stored_action() {
+        let request = authored_draft_request();
+        let draft = Mission::create_draft(&request, 1_000).expect("valid explicit draft");
+        draft.validate().expect("canonical mission");
+        assert_eq!(draft.mission_id, request.mission_id);
+        assert_eq!(draft.generation, request.generation);
+        assert_eq!(draft.workspace_id, request.workspace_id);
+        assert_eq!(draft.ownership, request.ownership);
+        assert_eq!(draft.lifecycle_state, MissionLifecycleState::Planning);
+        assert_eq!(draft.revision, 0);
+        assert_eq!(draft.created_at_ms, 1_000);
+        assert_eq!(draft.updated_at_ms, None);
+        assert_eq!(draft.pause_resume_state, MissionPauseResumeState::default());
+        assert!(draft.provenance.is_none());
+        assert_eq!((draft.candidates.len(), draft.assignments.len()), (1, 1));
+        let assignment = &draft.assignments[0];
+        assert_eq!(assignment.assignment_id, request.initial_assignment.assignment_id);
+        assert_eq!(assignment.candidate_id, request.initial_assignment.candidate_id);
+        assert_eq!(assignment.assignee, request.initial_assignment.assignee);
+        assert_eq!(assignment.created_at_ms, 1_000);
+        assert_eq!(assignment.updated_at_ms, None);
+        assert!(assignment.outcome.is_none());
+        assert!(assignment.reservation_intent.is_none());
+        assert!(assignment.escalation.is_none());
+        assert!(matches!(
+            &assignment.approval_state,
+            ApprovalState::Pending { requested_by, requested_at_ms }
+                if requested_by == "cli-operator" && *requested_at_ms == 1_000
+        ));
+        assert_eq!(
+            serde_json::to_value(&draft.candidates[0].action).unwrap(),
+            serde_json::to_value(&request.initial_assignment.action).unwrap(),
+            "authoring must not interpolate, trim, or append to the stored text"
+        );
+    }
+
+    #[test]
+    fn mission_authoring_append_preserves_every_prior_field_and_revision() {
+        let mut draft = Mission::create_draft(&authored_draft_request(), 1_000).unwrap();
+        draft.lifecycle_state = MissionLifecycleState::Planned;
+        draft.revision = 9_007_199_254_740_993;
+        draft.provenance = Some(MissionProvenance {
+            bead_id: Some("ft-majms".to_string()),
+            ..MissionProvenance::default()
+        });
+        let before = serde_json::to_value(&draft).unwrap();
+        let request = authored_assignment(1);
+        let appended = draft.append_assignment(&request, 1_001).unwrap();
+        assert_eq!(serde_json::to_value(&draft).unwrap(), before);
+        assert_eq!(appended.revision, draft.revision);
+        assert_eq!(appended.lifecycle_state, MissionLifecycleState::Planned);
+        assert_eq!(appended.updated_at_ms, Some(1_001));
+        assert_eq!(appended.assignments[1].assignment_id, request.assignment_id);
+        assert_eq!(appended.assignments[1].created_at_ms, 1_001);
+        assert_eq!(appended.candidates[1].created_at_ms, 1_001);
+        let mut prior = serde_json::to_value(&appended).unwrap();
+        prior["candidates"].as_array_mut().unwrap().pop();
+        prior["assignments"].as_array_mut().unwrap().pop();
+        prior.as_object_mut().unwrap().remove("updated_at_ms");
+        assert_eq!(prior, before, "existing immutable bindings must remain exact");
+    }
+
+    #[test]
+    fn mission_authoring_refuses_duplicate_ids_and_nondraft_lifecycle() {
+        let draft = Mission::create_draft(&authored_draft_request(), 1_000).unwrap();
+        let before = serde_json::to_value(&draft).unwrap();
+        let mut request = authored_assignment(1);
+        request.candidate_id = draft.candidates[0].candidate_id.clone();
+        assert_eq!(
+            draft.append_assignment(&request, 1_001).unwrap_err(),
+            MissionAuthoringError::DuplicateCandidate
+        );
+        request = authored_assignment(1);
+        request.assignment_id = draft.assignments[0].assignment_id.clone();
+        assert_eq!(
+            draft.append_assignment(&request, 1_001).unwrap_err(),
+            MissionAuthoringError::DuplicateAssignment
+        );
+        assert_eq!(serde_json::to_value(&draft).unwrap(), before);
+        for state in [
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::AwaitingApproval,
+            MissionLifecycleState::Running,
+            MissionLifecycleState::Executing,
+            MissionLifecycleState::RetryPending,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::Paused,
+            MissionLifecycleState::Completed,
+            MissionLifecycleState::Cancelled,
+            MissionLifecycleState::Failed,
+        ] {
+            let mut active = draft.clone();
+            active.lifecycle_state = state;
+            let before = serde_json::to_value(&active).unwrap();
+            assert!(active.append_assignment(&authored_assignment(1), 1_001).is_err());
+            assert_eq!(serde_json::to_value(&active).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn mission_authoring_refuses_reviewed_or_previously_controlled_drafts() {
+        let mut draft = Mission::create_draft(&authored_draft_request(), 1_000).unwrap();
+        draft.lifecycle_state = MissionLifecycleState::Planned;
+        let approval = MissionAssignmentApprovalRequest {
+            assignment_id: draft.assignments[0].assignment_id.clone(),
+            decision: MissionAssignmentApprovalDecision::Approve,
+            actor: "cli-operator".to_string(),
+            reason_code: "operator.reviewed".to_string(),
+        };
+        let (reviewed, _) = draft.resolve_assignment_approval(&approval, 1_001).unwrap();
+        assert_eq!(reviewed.lifecycle_state, MissionLifecycleState::Planned);
+        assert_eq!(
+            reviewed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+            MissionAuthoringError::ReviewedDraft,
+            "an approval binds the prior full snapshot even before run"
+        );
+        for state in [
+            ApprovalState::NotRequired,
+            ApprovalState::Denied {
+                denied_by: "operator".to_string(),
+                denied_at_ms: 1_001,
+                reason_code: "operator.refused".to_string(),
+            },
+            ApprovalState::Expired {
+                expired_at_ms: 1_001,
+                reason_code: "approval.expired".to_string(),
+            },
+        ] {
+            let mut changed = draft.clone();
+            changed.assignments[0].approval_state = state;
+            assert_eq!(
+                changed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+                MissionAuthoringError::ReviewedDraft
+            );
+        }
+        let mut settled = draft.clone();
+        settled.assignments[0].outcome = Some(Outcome::Success {
+            reason_code: "mission.assignment_action_committed".to_string(),
+            completed_at_ms: 1_001,
+        });
+        let mut escalated = draft.clone();
+        escalated.assignments[0].escalation = Some(Escalation {
+            level: EscalationLevel::Human,
+            triggered_by: MissionActorRole::Operator,
+            reason_code: "operator.review".to_string(),
+            error_code: None,
+            summary: None,
+            escalated_at_ms: 1_001,
+        });
+        let mut controlled = draft;
+        controlled.pause_resume_state.total_abort_count = 1;
+        for changed in [settled, escalated, controlled] {
+            assert_eq!(
+                changed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+                MissionAuthoringError::ReviewedDraft
+            );
+        }
+    }
+
+    #[test]
+    fn mission_authoring_bounds_metadata_text_and_action_kind() {
+        let request = authored_draft_request();
+        for id in [
+            "".to_string(),
+            "not an id".to_string(),
+            "é".to_string(),
+            "x".repeat(129),
+        ] {
+            let mut invalid = request.clone();
+            invalid.mission_id = MissionId(id);
+            assert_eq!(
+                Mission::create_draft(&invalid, 1_000).unwrap_err(),
+                MissionAuthoringError::InvalidIdentity
+            );
+        }
+        for generation in ["0".repeat(32), "A".repeat(32), "a".repeat(31)] {
+            let mut invalid = request.clone();
+            invalid.generation = generation;
+            assert_eq!(
+                Mission::create_draft(&invalid, 1_000).unwrap_err(),
+                MissionAuthoringError::InvalidGeneration
+            );
+        }
+        for title in [
+            "".to_string(),
+            " title".to_string(),
+            "line\nspoof".to_string(),
+            "x".repeat(257),
+        ] {
+            let mut invalid = request.clone();
+            invalid.title = title;
+            assert_eq!(
+                Mission::create_draft(&invalid, 1_000).unwrap_err(),
+                MissionAuthoringError::InvalidTitle
+            );
+        }
+        let mut invalid = request.clone();
+        invalid.workspace_id = "relative/workspace".to_string();
+        assert_eq!(
+            Mission::create_draft(&invalid, 1_000).unwrap_err(),
+            MissionAuthoringError::InvalidWorkspace
+        );
+        invalid = request.clone();
+        invalid.ownership.operator = invalid.ownership.planner.clone();
+        assert_eq!(
+            Mission::create_draft(&invalid, 1_000).unwrap_err(),
+            MissionAuthoringError::InvalidActor
+        );
+        invalid = request.clone();
+        invalid.initial_assignment.actor = "actor\nspoof".to_string();
+        assert_eq!(
+            Mission::create_draft(&invalid, 1_000).unwrap_err(),
+            MissionAuthoringError::InvalidActor
+        );
+        invalid = request.clone();
+        invalid.initial_assignment.action = StepAction::RunWorkflow {
+            workflow_id: "unreviewed-action".to_string(),
+            params: None,
+        };
+        assert_eq!(
+            Mission::create_draft(&invalid, 1_000).unwrap_err(),
+            MissionAuthoringError::UnsupportedAction
+        );
+        for text in [
+            String::new(),
+            "embedded\0nul".to_string(),
+            "é".repeat(MISSION_AUTHORING_MAX_TEXT_BYTES / 2 + 1),
+        ] {
+            let mut invalid = request.clone();
+            if let StepAction::SendText { text: stored, .. } =
+                &mut invalid.initial_assignment.action
+            {
+                *stored = text;
+            }
+            assert_eq!(
+                Mission::create_draft(&invalid, 1_000).unwrap_err(),
+                MissionAuthoringError::InvalidText
+            );
+        }
+        let mut boundary = request;
+        if let StepAction::SendText { text, .. } = &mut boundary.initial_assignment.action {
+            *text = "é".repeat(MISSION_AUTHORING_MAX_TEXT_BYTES / 2);
+        }
+        assert!(
+            Mission::create_draft(&boundary, 1_000).is_ok(),
+            "the byte limit is inclusive"
+        );
+    }
+
+    #[test]
+    fn mission_authoring_refuses_backwards_time_exhausted_revision_and_full_queue() {
+        let request = authored_draft_request();
+        assert_eq!(
+            Mission::create_draft(&request, -1).unwrap_err(),
+            MissionAuthoringError::InvalidTimestamp
+        );
+        let draft = Mission::create_draft(&request, 1_000).unwrap();
+        let mut exhausted = draft.clone();
+        exhausted.revision = u64::MAX;
+        assert_eq!(
+            exhausted
+                .append_assignment(&authored_assignment(1), 1_001)
+                .unwrap_err(),
+            MissionAuthoringError::RevisionExhausted
+        );
+        let future = draft.append_assignment(&authored_assignment(1), 2_000).unwrap();
+        assert_eq!(
+            future
+                .append_assignment(&authored_assignment(2), 1_999)
+                .unwrap_err(),
+            MissionAuthoringError::InvalidTimestamp
+        );
+        let mut future_approval = draft.clone();
+        future_approval.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "operator".to_string(),
+            requested_at_ms: 2_000,
+        };
+        assert_eq!(
+            future_approval
+                .append_assignment(&authored_assignment(1), 1_001)
+                .unwrap_err(),
+            MissionAuthoringError::InvalidTimestamp
+        );
+        let mut full = draft;
+        for index in 1..MISSION_AUTHORING_MAX_ASSIGNMENTS {
+            full = full
+                .append_assignment(&authored_assignment(index), 1_000 + index as i64)
+                .unwrap();
+        }
+        assert_eq!(full.assignments.len(), MISSION_AUTHORING_MAX_ASSIGNMENTS);
+        assert_eq!(
+            full.append_assignment(
+                &authored_assignment(MISSION_AUTHORING_MAX_ASSIGNMENTS),
+                2_000,
+            )
+            .unwrap_err(),
+            MissionAuthoringError::CapacityExceeded
+        );
+    }
+
+    #[cfg(feature = "subprocess-bridge")]
+    #[test]
+    fn mission_authoring_run_then_approval_compiles_the_exact_stored_send() {
+        use crate::mission_dispatch::{AssignmentDispatchError, compile_assignment_dispatch};
+        let request = authored_draft_request();
+        let mut draft = Mission::create_draft(&request, 1_000).unwrap();
+        let assignment_id = &request.initial_assignment.assignment_id;
+        assert_eq!(
+            compile_assignment_dispatch(&draft, assignment_id).unwrap_err(),
+            AssignmentDispatchError::NotRunning
+        );
+        for transition in [
+            MissionLifecycleTransitionKind::PlanFinalized,
+            MissionLifecycleTransitionKind::DispatchStarted,
+            MissionLifecycleTransitionKind::RequestApproval,
+        ] {
+            draft.apply_lifecycle_transition(transition, 1_001).unwrap();
+        }
+        assert_eq!(draft.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        let (admitted, _) = draft
+            .resolve_assignment_approval(
+                &MissionAssignmentApprovalRequest {
+                    assignment_id: assignment_id.clone(),
+                    decision: MissionAssignmentApprovalDecision::Approve,
+                    actor: "operator".to_string(),
+                    reason_code: "operator.reviewed".to_string(),
+                },
+                1_002,
+            )
+            .unwrap();
+        assert_eq!(admitted.lifecycle_state, MissionLifecycleState::Executing);
+        let contract = compile_assignment_dispatch(&admitted, assignment_id).unwrap();
+        assert_eq!(contract.intent.created_at_ms, 1_000);
+        assert_eq!(contract.plan.steps.len(), 1);
+        assert!(contract.plan.compensations.is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract.plan.steps[0].action).unwrap(),
+            serde_json::to_value(&request.initial_assignment.action).unwrap()
+        );
+        assert!(
+            admitted.assignments[0].outcome.is_none(),
+            "admission is not execution"
+        );
     }
 
     fn pending_approval_mission(count: usize) -> Mission {
