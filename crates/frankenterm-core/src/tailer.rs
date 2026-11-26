@@ -5896,7 +5896,11 @@ mod tests {
         #[cfg(unix)]
         let _listener =
             std::os::unix::net::UnixListener::bind(&sock_path).expect("bind temp mux socket");
-        #[cfg(not(unix))]
+        // Windows also accepts only a real AF_UNIX socket (f093c78b2).
+        #[cfg(windows)]
+        let _listener =
+            frankenterm_uds::UnixListener::bind(&sock_path).expect("bind temp mux socket");
+        #[cfg(not(any(unix, windows)))]
         std::fs::write(&sock_path, b"").expect("create temp socket file");
 
         let mut config = crate::config::Config::default();
