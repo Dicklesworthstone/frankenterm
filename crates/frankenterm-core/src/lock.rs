@@ -150,13 +150,36 @@ pub(crate) fn is_lock_contended(error: &io::Error) -> bool {
     }
 }
 
+/// Take the lock a holder keeps on its metadata sidecar for as long as it
+/// holds the watcher lock. Exclusive on Unix. Windows byte-range locks are
+/// mandatory: an exclusive one denies every other handle the bytes
+/// (`ERROR_LOCK_VIOLATION`), so no observer could name the holder. The holder
+/// keeps a shared lock there, which still lets others read.
+fn lock_sidecar_for_authority(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        FileExt::try_lock_shared(file)
+    }
+    #[cfg(not(windows))]
+    {
+        FileExt::try_lock_exclusive(file)
+    }
+}
+
 fn require_external_advisory_lock(
     file: &File,
     phase: &'static str,
 ) -> Result<(), LockSidecarReadFailure> {
     // Only an exclusive holder is authority. Shared observation locks must
     // coexist so one observer cannot impersonate a holder to another.
-    match FileExt::try_lock_shared(file) {
+    // On Windows the holder's lock is shared (lock_sidecar_for_authority),
+    // so the probe there is exclusive: refused while the holder lives, and
+    // released at once when granted. Observers keep no lock on Windows.
+    #[cfg(windows)]
+    let probe = FileExt::try_lock_exclusive(file);
+    #[cfg(not(windows))]
+    let probe = FileExt::try_lock_shared(file);
+    match probe {
         Err(error) if is_lock_contended(&error) => Ok(()),
         Ok(()) => {
             release_advisory_lock(file, "metadata_probe_unlock")?;
@@ -869,8 +892,7 @@ fn write_lock_sidecar_in_directory_atomically(
                 .map_err(|_| LockSidecarWriteError::Unavailable)?;
             let metadata_file = temp_file.into_std();
             if lock_for_authority {
-                metadata_file
-                    .try_lock_exclusive()
+                lock_sidecar_for_authority(&metadata_file)
                     .map_err(|_| LockSidecarWriteError::Unavailable)?;
             }
             let authority_cleanup = lock_for_authority
