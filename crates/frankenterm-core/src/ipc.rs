@@ -6098,7 +6098,11 @@ mod tests {
         runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_idle();
         assert!(observed.lock().expect("deadline result").is_none());
-        assert_eq!(runtime.pending_timer_count(), 1);
+        assert_eq!(
+            runtime.pending_timer_count(),
+            lab_budget_deadline_timer_baseline(0x135C_CC01, deadline) + 1,
+            "the idle connection wait arms its context deadline and nothing else"
+        );
 
         let report = runtime.run_with_auto_advance();
         assert_eq!(
@@ -6295,6 +6299,32 @@ mod tests {
         }
     }
 
+    /// Timers LabRuntime holds for an idle task whose budget has `deadline`,
+    /// before the task arms any of its own. asupersync 0.6.2 arms one to
+    /// enforce the budget deadline, so a wait that arms only its context
+    /// deadline shows this plus one.
+    fn lab_budget_deadline_timer_baseline(seed: u64, deadline: asupersync::Time) -> usize {
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(seed)
+                .with_auto_advance()
+                .max_steps(10_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(
+                region,
+                asupersync::Budget::new().with_deadline(deadline),
+                std::future::pending::<()>(),
+            )
+            .expect("spawn budget-deadline baseline task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+        runtime.pending_timer_count()
+    }
+
     #[test]
     fn accept_wait_arms_only_its_context_deadline() {
         let deadline = asupersync::Time::from_secs(5);
@@ -6334,7 +6364,11 @@ mod tests {
         runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_idle();
         assert!(observed.lock().expect("deadline result").is_none());
-        assert_eq!(runtime.pending_timer_count(), 1);
+        assert_eq!(
+            runtime.pending_timer_count(),
+            lab_budget_deadline_timer_baseline(0x135A_CC01, deadline) + 1,
+            "the idle accept wait arms its context deadline and nothing else"
+        );
 
         let report = runtime.run_with_auto_advance();
         assert_eq!(
