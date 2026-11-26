@@ -3837,6 +3837,30 @@ Each assignment incarnation owns one stable transaction under `.ft/mission-dispa
 
 Assignment success confirms the selected pane action, such as delivery of input or satisfaction of a wait. It does not certify completion of the agent's coding task or the whole mission. Builds without `subprocess-bridge` return `mission.dispatch.feature_unavailable`.
 
+### Resolve an assignment's approval
+
+A pending assignment can be approved or denied through the same locked, exact-token mutation path as mission lifecycle controls. Read the current token, preview the decision, and then commit it against the reviewed revision:
+
+```bash
+mission_file=".ft/mission/active.json"
+mission_token=$(ft mission status --mission-file "$mission_file" -f json |
+  jq -c '.data.revision_token')
+
+ft mission resolve-approval assignment:a --mission-file "$mission_file" \
+  --decision approve --reason-code operator.reviewed_assignment \
+  --expected-token "$mission_token" --dry-run -f json
+
+ft mission resolve-approval assignment:a --mission-file "$mission_file" \
+  --decision approve --reason-code operator.reviewed_assignment \
+  --expected-token "$mission_token" -f json
+```
+
+Use `--decision deny` to record a refusal. Only pending, unsettled assignments can be resolved; existing decisions and completed actions cannot be overwritten through this command. The required reason is a bounded identifier such as `operator.reviewed_assignment`, not free-form evidence or a secret. A changed revision refuses the operation. Dry-run returns the projected decision without saving it or executing an action.
+
+Resolving the final blocking approval moves an awaiting-approval mission to executing. Paused and blocked missions retain their control state. If an approval was resolved while paused from awaiting-approval, explicitly resume the mission and use `ft mission run` to admit the now-resolved state.
+
+The response includes the decision, remaining approval barriers, actual revision token and mutation receipt. Approval is mission admission metadata: it creates no runtime policy grant, sends no terminal input and preserves the assignment's durable transaction identity. `mission dispatch` and `mission drive` still perform live policy, target and kill-switch checks. Read the new token before either command.
+
 ### Drive a stored assignment queue
 
 In default Linux and macOS builds, `ft mission drive` executes the next bounded batch of unresolved assignments in their stored array order. It uses the same real execution, stable transaction slots and durable recovery as single-assignment dispatch. The mission must already be running or executing.

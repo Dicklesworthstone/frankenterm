@@ -846,6 +846,7 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft mission plan                    Validate mission contract and compute hash
     ft mission run                     Record a run request in the mission lifecycle
+    ft mission resolve-approval <id> --decision approve --reason-code operator.reviewed --expected-token '<token>'
     ft mission status -f json          Read lifecycle, assignments and exact revision token
     ft mission dispatch <id> --expected-token '<token>' --dry-run
     ft mission drive --expected-token '<token>' --max-assignments 10 --dry-run
@@ -6406,6 +6407,21 @@ enum WorkflowCommands {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MissionApprovalDecisionArg {
+    Approve,
+    Deny,
+}
+
+impl From<MissionApprovalDecisionArg> for frankenterm_core::plan::MissionAssignmentApprovalDecision {
+    fn from(decision: MissionApprovalDecisionArg) -> Self {
+        match decision {
+            MissionApprovalDecisionArg::Approve => Self::Approve,
+            MissionApprovalDecisionArg::Deny => Self::Deny,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum MissionCommands {
     /// Compile an operator objective into a read-only dry-run plan
@@ -6437,6 +6453,36 @@ enum MissionCommands {
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Resolve one pending assignment approval without executing its pane action
+    ResolveApproval {
+        /// Exact assignment ID from mission status or explain
+        assignment_id: String,
+
+        /// Explicit operator decision for this pending assignment
+        #[arg(long, value_enum)]
+        decision: MissionApprovalDecisionArg,
+
+        /// Exact revision_token JSON from mission status; stale tokens fail closed
+        #[arg(long)]
+        expected_token: String,
+
+        /// Bounded audit reason code, for example operator.reviewed_assignment
+        #[arg(long)]
+        reason_code: String,
+
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Preview the approval and lifecycle change without persisting it
+        #[arg(long)]
+        dry_run: bool,
 
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
@@ -82908,7 +82954,7 @@ async fn run_tx_reconcile(
 }
 
 fn mission_run_transition_plan(
-    state: frankenterm_core::plan::MissionLifecycleState,
+    mission: &frankenterm_core::plan::Mission,
 ) -> Result<
     Vec<(
         frankenterm_core::plan::MissionLifecycleState,
@@ -82919,7 +82965,7 @@ fn mission_run_transition_plan(
     use frankenterm_core::plan::MissionLifecycleState as State;
     use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
-    match state {
+    match mission.lifecycle_state {
         State::Planning => Ok(vec![
             (State::Planned, Kind::PlanFinalized),
             (State::Dispatching, Kind::DispatchStarted),
@@ -82934,17 +82980,26 @@ fn mission_run_transition_plan(
             Ok(vec![(State::Running, Kind::RetryResumed)])
         }
         State::Running | State::Executing => Ok(Vec::new()),
+        State::AwaitingApproval if mission.assignment_approvals_satisfied() => {
+            Ok(vec![(State::Executing, Kind::Approve)])
+        }
         State::AwaitingApproval => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.awaiting_approval",
             message: "Mission is awaiting approval and cannot enter run state directly."
                 .to_string(),
-            hint: Some("Resolve approval first, then retry `ft mission run`.".to_string()),
+            hint: Some(
+                "Resolve pending assignments with ft mission resolve-approval, then retry ft mission run."
+                    .to_string(),
+            ),
         }),
         State::Completed | State::Failed | State::Cancelled => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.terminal_state",
-            message: format!("Mission is terminal ({state}) and cannot be run."),
+            message: format!(
+                "Mission is terminal ({}) and cannot be run.",
+                mission.lifecycle_state
+            ),
             hint: None,
         }),
     }
@@ -82963,11 +83018,13 @@ fn mission_pause_transition_plan(
     use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
     match state {
-        State::Dispatching | State::Running | State::Executing | State::RetryPending => {
-            Ok(vec![(State::Paused, Kind::ExecutionBlocked)])
-        }
+        State::Dispatching
+        | State::AwaitingApproval
+        | State::Running
+        | State::Executing
+        | State::RetryPending => Ok(vec![(State::Paused, Kind::ExecutionBlocked)]),
         State::Blocked | State::Paused => Ok(Vec::new()),
-        State::Planning | State::Planned | State::AwaitingApproval => Err(MissionCommandError {
+        State::Planning | State::Planned => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.pause_not_active",
             message: format!("Mission is {state} and cannot be paused."),
@@ -84109,6 +84166,88 @@ fn emit_mission_drive_output(
     Ok(())
 }
 
+fn mission_assignment_approval_error(
+    error: frankenterm_core::plan::MissionAssignmentApprovalError,
+) -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: error.code(),
+        message: error.to_string(),
+        hint: Some(
+            "Inspect mission status and its exact revision token. Only unresolved Pending assignment approvals can be decided; existing decisions and settled outcomes are retained."
+                .to_string(),
+        ),
+    }
+}
+
+/// Resolve admission under one exact-token lock. No transaction, approval store
+/// or terminal runtime is opened; live policy grants remain a separate boundary.
+fn run_mission_approval_resolution(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_path: &Path,
+    expected_token: &str,
+    request: &frankenterm_core::plan::MissionAssignmentApprovalRequest,
+    dry_run: bool,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    let mutation = acquire_mission_mutation(layout, mission_path, Some(expected_token))?;
+    let observed = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+        mutation.mission(),
+    )
+    .map_err(mission_store_error)?;
+    let (mut resolved, resolution) = mutation
+        .mission()
+        .resolve_assignment_approval(request, mission_now_ms())
+        .map_err(mission_assignment_approval_error)?;
+    let receipt = if dry_run {
+        mutation.verify_current().map_err(mission_store_error)?;
+        None
+    } else {
+        Some(mutation.commit(&mut resolved).map_err(mission_store_error)?)
+    };
+    let revision_token = receipt
+        .as_ref()
+        .map_or(observed, |receipt| receipt.current.clone());
+    let decision = match request.decision {
+        frankenterm_core::plan::MissionAssignmentApprovalDecision::Approve => "approve",
+        frankenterm_core::plan::MissionAssignmentApprovalDecision::Deny => "deny",
+    };
+    let data = serde_json::json!({
+        "command": "resolve_approval",
+        "mission_file": mission_path.display().to_string(),
+        "mission_id": resolved.mission_id,
+        "assignment_id": request.assignment_id,
+        "dry_run": dry_run,
+        "persisted": !dry_run,
+        "action_executed": false,
+        "runtime_policy_grant_created": false,
+        "resolution": resolution,
+        "revision_token": revision_token,
+        "mutation": receipt,
+    });
+    let plain_lines = vec![
+        format!(
+            "Mission approval {}: {}",
+            if dry_run { "preview" } else { "resolved" },
+            request.assignment_id
+        ),
+        format!("  Decision: {decision}; reason: {}", request.reason_code),
+        format!(
+            "  {} lifecycle: {} -> {}",
+            if dry_run { "Projected" } else { "Persisted" },
+            resolution.lifecycle_from,
+            resolution.lifecycle_to
+        ),
+        format!(
+            "  Remaining assignment approval blockers: {}",
+            resolution.blocking_approvals_remaining
+        ),
+        format!("  Decision digest: {}", resolution.decision_digest),
+        "  Assignment admission only; dispatch/drive still evaluate live policy, targets and approvals."
+            .to_string(),
+    ];
+    Ok((data, plain_lines))
+}
+
 async fn handle_mission_command(
     command: MissionCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
@@ -84722,6 +84861,36 @@ async fn handle_mission_command(
             }
         }
 
+        MissionCommands::ResolveApproval {
+            assignment_id,
+            decision,
+            expected_token,
+            reason_code,
+            mission_file,
+            dry_run,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let request = frankenterm_core::plan::MissionAssignmentApprovalRequest {
+                assignment_id: frankenterm_core::plan::AssignmentId(assignment_id),
+                decision: decision.into(),
+                actor: "cli-operator".to_string(),
+                reason_code,
+            };
+            let (data, plain_lines) = match run_mission_approval_resolution(
+                layout,
+                &mission_path,
+                &expected_token,
+                &request,
+                dry_run,
+            ) {
+                Ok(result) => result,
+                Err(error) => emit_mission_error(output_format, error),
+            };
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
         MissionCommands::Run {
             expected_token,
             mission_file,
@@ -84735,7 +84904,7 @@ async fn handle_mission_command(
                     Err(err) => emit_mission_error(output_format, err),
                 };
             let mut mission = mutation.mission().clone();
-            let plan = match mission_run_transition_plan(mission.lifecycle_state) {
+            let plan = match mission_run_transition_plan(&mission) {
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
@@ -108680,6 +108849,271 @@ mod tests {
     }
 
     #[test]
+    fn mission_approval_cli_requires_explicit_decision_token_and_reason() {
+        for args in [
+            vec!["ft", "mission", "resolve-approval", "assignment:a"],
+            vec!["ft", "mission", "resolve-approval", "assignment:a", "--decision", "approve", "--reason-code", "reviewed", "--dry-run"],
+            vec!["ft", "mission", "resolve-approval", "assignment:a", "--expected-token", "{}", "--reason-code", "reviewed"],
+            vec!["ft", "mission", "resolve-approval", "assignment:a", "--decision", "approve", "--expected-token", "{}"],
+            vec!["ft", "mission", "resolve-approval", "assignment:a", "--decision", "skip", "--expected-token", "{}", "--reason-code", "reviewed"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "ft", "mission", "resolve-approval", "assignment:a",
+            "--decision", "deny", "--expected-token", "{}",
+            "--reason-code", "operator.declined", "--dry-run", "-f", "json",
+        ]).expect("explicit approval resolution arguments");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Mission {
+                command: MissionCommands::ResolveApproval {
+                    assignment_id, decision, expected_token, reason_code, dry_run, format, ..
+                },
+            }) => {
+                assert_eq!(assignment_id, "assignment:a");
+                assert!(matches!(decision, MissionApprovalDecisionArg::Deny));
+                assert_eq!(expected_token, "{}");
+                assert_eq!(reason_code, "operator.declined");
+                assert!(dry_run);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected mission approval resolution"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mission_approval_fixture() -> (
+        tempfile::TempDir,
+        frankenterm_core::config::WorkspaceLayout,
+        PathBuf,
+        String,
+    ) {
+        let (dir, layout, path) = mission_lifecycle_fixture();
+        let mut mission = sample_cli_mission();
+        mission.workspace_id = layout.root.to_str().expect("UTF-8 fixture root").to_string();
+        mission.revision = 9_007_199_254_740_993;
+        if let frankenterm_core::plan::StepAction::SendText { text, .. } =
+            &mut mission.candidates[0].action
+        {
+            *text = "private-approval-cli-payload".to_string();
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&mission).expect("mission JSON"))
+            .expect("write pending approval mission");
+        let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+            .expect("exact revision token");
+        (dir, layout, path, serde_json::to_string(&token).expect("token JSON"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mission_approval_test_request(
+        decision: frankenterm_core::plan::MissionAssignmentApprovalDecision,
+    ) -> frankenterm_core::plan::MissionAssignmentApprovalRequest {
+        frankenterm_core::plan::MissionAssignmentApprovalRequest {
+            assignment_id: frankenterm_core::plan::AssignmentId("assignment:cli-a".to_string()),
+            decision,
+            actor: "cli-operator".to_string(),
+            reason_code: "operator.reviewed_assignment".to_string(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_approval_preview_preserves_file_and_does_not_open_runtime_or_grants() {
+        let (_dir, layout, path, token) = mission_approval_fixture();
+        let before = std::fs::read(&path).expect("original mission");
+        let request = mission_approval_test_request(
+            frankenterm_core::plan::MissionAssignmentApprovalDecision::Approve,
+        );
+        let (data, lines) =
+            run_mission_approval_resolution(&layout, &path, &token, &request, true)
+                .expect("preview is a pure approval projection under the snapshot lock");
+        assert_eq!(data["dry_run"], true);
+        assert_eq!(data["persisted"], false);
+        assert_eq!(data["action_executed"], false);
+        assert_eq!(data["runtime_policy_grant_created"], false);
+        assert_eq!(data["resolution"]["previous_approval"]["state"], "pending");
+        assert_eq!(data["resolution"]["current_approval"]["state"], "approved");
+        assert_eq!(data["resolution"]["lifecycle_to"], "executing");
+        assert_eq!(data["revision_token"], serde_json::from_str::<serde_json::Value>(&token).expect("original token"));
+        assert!(data["mutation"].is_null());
+        assert!(!data.to_string().contains("private-approval-cli-payload"));
+        assert!(lines.iter().any(|line| line.contains("Projected lifecycle")));
+        assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+        assert!(!layout.db_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_approval_commits_exact_successor_and_refuses_stale_or_replaced_decisions() {
+        use frankenterm_core::plan::{ApprovalState, MissionAssignmentApprovalDecision, MissionLifecycleState};
+        let (_dir, layout, path, token) = mission_approval_fixture();
+        let request = mission_approval_test_request(MissionAssignmentApprovalDecision::Approve);
+        let (data, _) =
+            run_mission_approval_resolution(&layout, &path, &token, &request, false)
+                .expect("durable approval decision");
+        assert_eq!(data["persisted"], true);
+        assert_eq!(data["mutation"]["changed"], true);
+        assert_eq!(data["mutation"]["durability"], "file_and_directory_synced");
+        assert_eq!(data["mutation"]["owner_acknowledgement"], "unavailable_no_mission_driver");
+        assert_eq!(data["revision_token"]["revision"], "9007199254740994");
+        assert_eq!(data["mutation"]["previous"]["revision"], "9007199254740993");
+        let mission = load_mission_from_path(&path).expect("persisted approval");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Executing);
+        assert!(matches!(
+            &mission.assignments[0].approval_state,
+            ApprovalState::Approved { approval_code_hash, .. }
+                if approval_code_hash.starts_with("operator-decision:sha256:")
+        ));
+        assert!(mission.assignments[0].outcome.is_none());
+        assert!(!layout.db_path.exists(), "assignment admission must not mint runtime grants");
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+        let after = std::fs::read(&path).expect("approved mission bytes");
+        let denial = mission_approval_test_request(MissionAssignmentApprovalDecision::Deny);
+        let stale = run_mission_approval_resolution(&layout, &path, &token, &denial, false)
+            .expect_err("stale opposite decision cannot overwrite approval");
+        assert_eq!(stale.error_code, frankenterm_core::tx_execution::MissionStoreError::Conflict.code());
+        let current = data["revision_token"].to_string();
+        let replaced = run_mission_approval_resolution(&layout, &path, &current, &denial, false)
+            .expect_err("even a current token cannot silently replace a resolved decision");
+        assert_eq!(replaced.error_code, "mission.approval.not_pending");
+        assert_eq!(std::fs::read(&path).expect("approval retained"), after);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_approval_stale_snapshot_cannot_overwrite_accepted_abort() {
+        let (_dir, layout, path, token) = mission_approval_fixture();
+        run_mission_lifecycle(
+            &layout, &path, MissionLifecycleVerb::Abort, Some(&token),
+            Some("operator cancelled"), "competing-operator",
+        ).expect("accepted abort");
+        let aborted = std::fs::read(&path).expect("aborted mission");
+        let request = mission_approval_test_request(
+            frankenterm_core::plan::MissionAssignmentApprovalDecision::Approve,
+        );
+        let error = run_mission_approval_resolution(&layout, &path, &token, &request, false)
+            .expect_err("old approval authority cannot supersede abort");
+        assert_eq!(error.error_code, frankenterm_core::tx_execution::MissionStoreError::Conflict.code());
+        assert_eq!(std::fs::read(&path).expect("abort retained"), aborted);
+        assert!(!layout.db_path.exists());
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_approval_denial_stays_blocked_without_manufacturing_execution_failure() {
+        use frankenterm_core::plan::{ApprovalState, MissionAssignmentApprovalDecision, MissionLifecycleState};
+        let (_dir, layout, path, token) = mission_approval_fixture();
+        let request = mission_approval_test_request(MissionAssignmentApprovalDecision::Deny);
+        let (data, _) =
+            run_mission_approval_resolution(&layout, &path, &token, &request, false)
+                .expect("durable denial");
+        assert_eq!(data["resolution"]["blocking_approvals_remaining"], 1);
+        assert_eq!(data["runtime_policy_grant_created"], false);
+        let mission = load_mission_from_path(&path).expect("denied mission");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert!(matches!(mission.assignments[0].approval_state, ApprovalState::Denied { .. }));
+        assert!(mission.assignments[0].outcome.is_none());
+        assert_eq!(
+            mission_run_transition_plan(&mission).expect_err("denial still blocks run").error_code,
+            "mission.transition.awaiting_approval"
+        );
+        assert!(!layout.db_path.exists());
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_approval_while_paused_requires_resume_then_guarded_run_admission() {
+        use frankenterm_core::plan::{MissionAssignmentApprovalDecision, MissionLifecycleState};
+        let (_dir, layout, path, token) = mission_approval_fixture();
+        let (paused, _) = run_mission_lifecycle(
+            &layout, &path, MissionLifecycleVerb::Pause, Some(&token),
+            Some("review hold"), "operator",
+        ).expect("CLI pause accepts an awaiting-approval mission");
+        let mission = load_mission_from_path(&path).expect("persisted pause");
+        let checkpoint = serde_json::to_value(&mission.pause_resume_state).expect("checkpoint");
+        let token = paused["mutation"]["current"].to_string();
+        let request = mission_approval_test_request(MissionAssignmentApprovalDecision::Approve);
+        let (approved, _) =
+            run_mission_approval_resolution(&layout, &path, &token, &request, false)
+                .expect("resolve admission while remaining paused");
+        let mission = load_mission_from_path(&path).expect("approved paused mission");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Paused);
+        assert_eq!(serde_json::to_value(&mission.pause_resume_state).expect("checkpoint"), checkpoint);
+        let token = approved["revision_token"].to_string();
+        let (resumed, _) = run_mission_lifecycle(
+            &layout, &path, MissionLifecycleVerb::Resume, Some(&token), None, "operator",
+        ).expect("explicit resume");
+        let token = resumed["mutation"]["current"].to_string();
+        let guard = acquire_mission_mutation(&layout, &path, Some(&token)).expect("run lock");
+        let mut mission = guard.mission().clone();
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        let plan = mission_run_transition_plan(&mission).expect("resolved approval permits run request");
+        apply_mission_transition_plan(&mut mission, &plan, mission_now_ms(), "cli_run")
+            .expect("canonical approval admission");
+        guard.commit(&mut mission).expect("durable run request");
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Executing);
+        assert!(mission.assignments[0].outcome.is_none());
+        assert!(!layout.db_path.exists());
+        assert!(!layout.ft_dir.join("mission-dispatch").exists());
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_approval_unblocks_the_production_durable_drive_path() {
+        run_async_test(async {
+            use frankenterm_core::plan::{MissionAssignmentApprovalDecision, MissionLifecycleState, Outcome};
+            let (_dir, layout, path, token) = mission_approval_fixture();
+            let request = mission_approval_test_request(MissionAssignmentApprovalDecision::Approve);
+            let (approved, _) =
+                run_mission_approval_resolution(&layout, &path, &token, &request, false)
+                    .expect("approve pending assignment");
+            let token = approved["revision_token"].to_string();
+            let guard = acquire_mission_mutation(&layout, &path, Some(&token)).expect("run lock");
+            let mut mission = guard.mission().clone();
+            let plan = mission_run_transition_plan(&mission).expect("approved mission is runnable");
+            apply_mission_transition_plan(&mut mission, &plan, mission_now_ms(), "cli_run")
+                .expect("run request");
+            let receipt = guard.commit(&mut mission).expect("run checkpoint");
+            assert!(!receipt.changed, "already admitted lifecycle is an unchanged run request");
+            let token = serde_json::to_string(&receipt.current).expect("run token");
+
+            // Existing unit executor seeds the real durable engine and ledger.
+            // This is recovery/checkpoint evidence, not a live-pane claim.
+            seed_mission_drive_commits(&layout, &path, &token, &["assignment:cli-a"]);
+            let output = run_mission_drive(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 1,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            ).await.expect("drive admitted approved assignment");
+            assert!(output.error.is_none());
+            assert_eq!(output.progress.committed_actions.len(), 1);
+            assert!(output.progress.committed_actions[0].replayed);
+            let persisted = load_mission_from_path(&path).expect("action checkpoint");
+            assert_eq!(persisted.lifecycle_state, MissionLifecycleState::Executing);
+            assert_eq!(persisted.revision, 9_007_199_254_740_995);
+            assert!(matches!(
+                &persisted.assignments[0].outcome,
+                Some(Outcome::Success { reason_code, .. })
+                    if reason_code == "mission.assignment_action_committed"
+            ));
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[test]
     fn mission_drive_cli_requires_token_and_bounds_admission() {
         for args in [
             vec!["ft", "mission", "drive"],
@@ -112198,8 +112632,13 @@ reason = "overly conservative pending threshold"
         use frankenterm_core::plan::MissionLifecycleState as State;
         use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
+        let plan_for = |state| {
+            let mut mission = sample_cli_mission();
+            mission.lifecycle_state = state;
+            mission_run_transition_plan(&mission)
+        };
         assert_eq!(
-            mission_run_transition_plan(State::Planning).expect("planning should be runnable"),
+            plan_for(State::Planning).expect("planning should be runnable"),
             vec![
                 (State::Planned, Kind::PlanFinalized),
                 (State::Dispatching, Kind::DispatchStarted),
@@ -112207,24 +112646,23 @@ reason = "overly conservative pending threshold"
             ]
         );
         assert_eq!(
-            mission_run_transition_plan(State::Planned).expect("planned should be runnable"),
+            plan_for(State::Planned).expect("planned should be runnable"),
             vec![
                 (State::Dispatching, Kind::DispatchStarted),
                 (State::Running, Kind::ExecutionStarted),
             ]
         );
         assert_eq!(
-            mission_run_transition_plan(State::Dispatching)
+            plan_for(State::Dispatching)
                 .expect("dispatching should transition directly to running"),
             vec![(State::Running, Kind::ExecutionStarted)]
         );
         assert_eq!(
-            mission_run_transition_plan(State::RetryPending)
-                .expect("retry pending should resume into running"),
+            plan_for(State::RetryPending).expect("retry pending should resume into running"),
             vec![(State::Running, Kind::RetryResumed)]
         );
-        assert!(mission_run_transition_plan(State::AwaitingApproval).is_err());
-        assert!(mission_run_transition_plan(State::Completed).is_err());
+        assert!(plan_for(State::AwaitingApproval).is_err());
+        assert!(plan_for(State::Completed).is_err());
     }
 
     #[test]
