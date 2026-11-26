@@ -1403,6 +1403,87 @@ impl ApprovalState {
     }
 }
 
+/// Explicit operator decision about an assignment's admission gate.
+///
+/// This changes mission metadata only. Runtime policy approvals are separately
+/// evaluated and consumed by the pane transaction executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionAssignmentApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// One bounded, attributable decision against the caller's locked snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentApprovalRequest {
+    pub assignment_id: AssignmentId,
+    pub decision: MissionAssignmentApprovalDecision,
+    /// Audit attribution, not an authentication credential.
+    pub actor: String,
+    /// A nonempty ASCII identifier; free-form text and secrets do not belong here.
+    pub reason_code: String,
+}
+
+/// Payload-free result of resolving a pending assignment approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionAssignmentApprovalResolution {
+    pub assignment_id: AssignmentId,
+    pub decision: MissionAssignmentApprovalDecision,
+    pub actor: String,
+    pub reason_code: String,
+    /// Binds the exact input snapshot and decision; it is not an allow-once code.
+    pub decision_digest: String,
+    pub previous_approval: ApprovalState,
+    pub current_approval: ApprovalState,
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
+    pub blocking_approvals_remaining: usize,
+}
+
+/// Failures contain classifications, never pane input or caller evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MissionAssignmentApprovalError {
+    #[error("the mission contract is invalid")]
+    InvalidMission,
+    #[error("the mission is terminal and cannot accept approval decisions")]
+    TerminalMission,
+    #[error("the assignment does not exist in this mission")]
+    AssignmentNotFound,
+    #[error("the assignment already has a settled outcome")]
+    AssignmentSettled,
+    #[error("only a pending assignment approval can be resolved")]
+    ApprovalNotPending,
+    #[error("the approval actor must be a nonempty printable identifier of at most 128 bytes")]
+    InvalidActor,
+    #[error("the approval reason must be 1-128 ASCII letters, digits, dots, underscores, colons or hyphens")]
+    InvalidReasonCode,
+    #[error("the approval timestamp predates the mission or assignment")]
+    InvalidTimestamp,
+    #[error("the mission revision cannot represent another durable decision")]
+    RevisionExhausted,
+    #[error("the approval lifecycle transition is invalid")]
+    InvalidTransition,
+}
+
+impl MissionAssignmentApprovalError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidMission => "mission.approval.invalid_mission",
+            Self::TerminalMission => "mission.approval.terminal_mission",
+            Self::AssignmentNotFound => "mission.approval.assignment_not_found",
+            Self::AssignmentSettled => "mission.approval.assignment_settled",
+            Self::ApprovalNotPending => "mission.approval.not_pending",
+            Self::InvalidActor => "mission.approval.invalid_actor",
+            Self::InvalidReasonCode => "mission.approval.invalid_reason_code",
+            Self::InvalidTimestamp => "mission.approval.invalid_timestamp",
+            Self::RevisionExhausted => "mission.approval.revision_exhausted",
+            Self::InvalidTransition => "mission.approval.invalid_transition",
+        }
+    }
+}
+
 /// Final assignment execution outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2195,6 +2276,173 @@ impl Mission {
             assignments: Vec::new(),
             pause_resume_state: MissionPauseResumeState::default(),
         }
+    }
+
+    /// Whether every unsettled assignment has resolved its admission approval.
+    ///
+    /// This is a metadata predicate, not live policy, target, reservation or
+    /// execution proof. Failed/cancelled outcomes are handled by dispatch gates.
+    #[must_use]
+    pub fn assignment_approvals_satisfied(&self) -> bool {
+        self.assignments
+            .iter()
+            .filter(|assignment| assignment.outcome.is_none())
+            .all(|assignment| {
+                matches!(
+                    assignment.approval_state,
+                    ApprovalState::NotRequired | ApprovalState::Approved { .. }
+                )
+            })
+    }
+
+    /// Resolve one pending assignment approval without external side effects.
+    ///
+    /// The caller must hold the canonical mission mutation guard, verify the
+    /// operator's exact revision token, and durably commit the returned mission.
+    /// This pure projection leaves the input and its revision unchanged, so
+    /// validation failures and previews cannot partially mutate authority.
+    ///
+    /// Approvals carry an explicit operator-decision digest in the historical
+    /// approval_code_hash metadata field. That digest never issues, consumes,
+    /// or substitutes for an ApprovalStore runtime policy grant. Denials retain
+    /// the actor, timestamp and reason; the returned digest binds either decision.
+    ///
+    /// Resolving the final blocking approval can apply the existing Approve
+    /// lifecycle transition from AwaitingApproval. Paused and blocked missions
+    /// stay paused/blocked, and no transition acknowledges live execution.
+    pub fn resolve_assignment_approval(
+        &self,
+        request: &MissionAssignmentApprovalRequest,
+        now_ms: i64,
+    ) -> Result<(Self, MissionAssignmentApprovalResolution), MissionAssignmentApprovalError> {
+        self.validate()
+            .map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
+        if matches!(
+            self.lifecycle_state,
+            MissionLifecycleState::Completed
+                | MissionLifecycleState::Failed
+                | MissionLifecycleState::Cancelled
+        ) {
+            return Err(MissionAssignmentApprovalError::TerminalMission);
+        }
+        if self.revision == u64::MAX {
+            return Err(MissionAssignmentApprovalError::RevisionExhausted);
+        }
+        if request.actor.is_empty()
+            || request.actor.len() > 128
+            || request.actor.trim() != request.actor
+            || request.actor.chars().any(char::is_control)
+        {
+            return Err(MissionAssignmentApprovalError::InvalidActor);
+        }
+        if request.reason_code.is_empty()
+            || request.reason_code.len() > 128
+            || !request.reason_code.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+        {
+            return Err(MissionAssignmentApprovalError::InvalidReasonCode);
+        }
+        let assignment_index = self
+            .assignments
+            .iter()
+            .position(|assignment| assignment.assignment_id == request.assignment_id)
+            .ok_or(MissionAssignmentApprovalError::AssignmentNotFound)?;
+        let assignment = &self.assignments[assignment_index];
+        if assignment.outcome.is_some() {
+            return Err(MissionAssignmentApprovalError::AssignmentSettled);
+        }
+        let requested_at_ms = match &assignment.approval_state {
+            ApprovalState::Pending { requested_at_ms, .. } => *requested_at_ms,
+            _ => return Err(MissionAssignmentApprovalError::ApprovalNotPending),
+        };
+        let candidate = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == assignment.candidate_id)
+            .ok_or(MissionAssignmentApprovalError::InvalidMission)?;
+        let recorded_times = [
+            self.created_at_ms,
+            self.updated_at_ms.unwrap_or(self.created_at_ms),
+            candidate.created_at_ms,
+            assignment.created_at_ms,
+            assignment.updated_at_ms.unwrap_or(assignment.created_at_ms),
+            requested_at_ms,
+        ];
+        if recorded_times
+            .iter()
+            .any(|recorded| *recorded < 0 || now_ms < *recorded)
+        {
+            return Err(MissionAssignmentApprovalError::InvalidTimestamp);
+        }
+
+        // Use the same full serialized snapshot as MissionRevisionToken,
+        // including vector order and all 64 revision bits. Canonical mission
+        // scoring hashes sort assignments and are not mutation authority.
+        let snapshot = serde_json::to_vec(self)
+            .map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
+        let content_sha256 = hex::encode(Sha256::digest(&snapshot));
+        let decision_bytes = serde_json::to_vec(&(
+            "frankenterm.mission.assignment-approval-decision.v1",
+            &self.mission_id,
+            &self.generation,
+            self.revision.to_string(),
+            content_sha256,
+            request,
+            now_ms,
+        ))
+        .map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
+        let decision_digest = format!("sha256:{}", hex::encode(Sha256::digest(&decision_bytes)));
+        let current_approval = match request.decision {
+            MissionAssignmentApprovalDecision::Approve => ApprovalState::Approved {
+                approved_by: request.actor.clone(),
+                approved_at_ms: now_ms,
+                approval_code_hash: format!("operator-decision:{decision_digest}"),
+            },
+            MissionAssignmentApprovalDecision::Deny => ApprovalState::Denied {
+                denied_by: request.actor.clone(),
+                denied_at_ms: now_ms,
+                reason_code: request.reason_code.clone(),
+            },
+        };
+        let mut resolved = self.clone();
+        resolved.assignments[assignment_index].approval_state = current_approval.clone();
+        resolved.assignments[assignment_index].updated_at_ms = Some(now_ms);
+        resolved.updated_at_ms = Some(now_ms);
+        if resolved.lifecycle_state == MissionLifecycleState::AwaitingApproval
+            && resolved.assignment_approvals_satisfied()
+        {
+            resolved
+                .apply_lifecycle_transition(MissionLifecycleTransitionKind::Approve, now_ms)
+                .map_err(|_| MissionAssignmentApprovalError::InvalidTransition)?;
+        }
+        resolved
+            .validate()
+            .map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
+        let blocking_approvals_remaining = resolved
+            .assignments
+            .iter()
+            .filter(|assignment| {
+                assignment.outcome.is_none()
+                    && !matches!(
+                        assignment.approval_state,
+                        ApprovalState::NotRequired | ApprovalState::Approved { .. }
+                    )
+            })
+            .count();
+        let resolution = MissionAssignmentApprovalResolution {
+            assignment_id: request.assignment_id.clone(),
+            decision: request.decision,
+            actor: request.actor.clone(),
+            reason_code: request.reason_code.clone(),
+            decision_digest,
+            previous_approval: assignment.approval_state.clone(),
+            current_approval,
+            lifecycle_from: self.lifecycle_state,
+            lifecycle_to: resolved.lifecycle_state,
+            blocking_approvals_remaining,
+        };
+        Ok((resolved, resolution))
     }
 
     /// Advance mission lifecycle state using the transition table.
@@ -8727,6 +8975,338 @@ mod tests {
         });
         mission.lifecycle_state = MissionLifecycleState::Completed;
         mission
+    }
+
+    fn pending_approval_mission(count: usize) -> Mission {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission.revision = 9_007_199_254_740_993;
+        mission.updated_at_ms = Some(mission.created_at_ms + 800);
+        let candidate = mission.candidates[0].clone();
+        let assignment = mission.assignments[0].clone();
+        mission.candidates = Vec::new();
+        mission.assignments = Vec::new();
+        for index in 0..count {
+            let mut candidate = candidate.clone();
+            candidate.candidate_id = CandidateActionId(format!("candidate:approval-{index}"));
+            candidate.action = StepAction::SendText {
+                pane_id: 7 + u64::try_from(index).expect("small fixture index"),
+                text: format!("private-approval-payload-{index}"),
+                paste_mode: Some(false),
+            };
+            let mut assignment = assignment.clone();
+            assignment.assignment_id = AssignmentId(format!("assignment:approval-{index}"));
+            assignment.candidate_id = candidate.candidate_id.clone();
+            assignment.approval_state = ApprovalState::Pending {
+                requested_by: "planner-agent".to_string(),
+                requested_at_ms: mission.created_at_ms + 220,
+            };
+            assignment.reservation_intent = None;
+            assignment.outcome = None;
+            mission.candidates.push(candidate);
+            mission.assignments.push(assignment);
+        }
+        mission.validate().expect("valid pending approval mission");
+        mission
+    }
+
+    fn approval_request(decision: MissionAssignmentApprovalDecision) -> MissionAssignmentApprovalRequest {
+        MissionAssignmentApprovalRequest {
+            assignment_id: AssignmentId("assignment:approval-0".to_string()),
+            decision,
+            actor: "operator-human".to_string(),
+            reason_code: "operator.reviewed_assignment".to_string(),
+        }
+    }
+
+    #[test]
+    fn mission_approval_resolves_only_selected_admission_and_preserves_input() {
+        let mission = pending_approval_mission(2);
+        let before = serde_json::to_value(&mission).expect("input snapshot");
+        let request = approval_request(MissionAssignmentApprovalDecision::Approve);
+        let (resolved, receipt) = mission
+            .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            .expect("explicit pending approval");
+        assert_eq!(serde_json::to_value(&mission).expect("unchanged input"), before);
+        assert_eq!(resolved.revision, mission.revision, "only durable commit advances revision");
+        assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(receipt.blocking_approvals_remaining, 1);
+        assert_eq!(receipt.actor, request.actor);
+        assert_eq!(receipt.reason_code, request.reason_code);
+        assert!(matches!(
+            &resolved.assignments[0].approval_state,
+            ApprovalState::Approved { approved_by, approved_at_ms, approval_code_hash }
+                if approved_by == "operator-human"
+                    && *approved_at_ms == mission.created_at_ms + 1_000
+                    && approval_code_hash == &format!("operator-decision:{}", receipt.decision_digest)
+        ));
+        let mut expected = before.clone();
+        expected["assignments"][0]["approval_state"] =
+            serde_json::to_value(&receipt.current_approval).expect("approval metadata");
+        expected["assignments"][0]["updated_at_ms"] = serde_json::json!(mission.created_at_ms + 1_000);
+        expected["updated_at_ms"] = serde_json::json!(mission.created_at_ms + 1_000);
+        assert_eq!(serde_json::to_value(&resolved).expect("projected snapshot"), expected);
+        assert!(!serde_json::to_string(&receipt).expect("receipt").contains("private-approval-payload"));
+
+        let second = MissionAssignmentApprovalRequest {
+            assignment_id: AssignmentId("assignment:approval-1".to_string()),
+            ..request
+        };
+        let (ready, receipt) = resolved
+            .resolve_assignment_approval(&second, mission.created_at_ms + 1_001)
+            .expect("final pending approval");
+        assert_eq!(ready.lifecycle_state, MissionLifecycleState::Executing);
+        assert_eq!(receipt.lifecycle_from, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(receipt.lifecycle_to, MissionLifecycleState::Executing);
+        assert_eq!(receipt.blocking_approvals_remaining, 0);
+        assert!(ready.assignment_approvals_satisfied());
+        assert!(ready.assignments.iter().all(|assignment| assignment.outcome.is_none()));
+    }
+
+    #[test]
+    fn mission_approval_denied_or_expired_sibling_prevents_lifecycle_admission() {
+        let mission = pending_approval_mission(2);
+        let request = approval_request(MissionAssignmentApprovalDecision::Deny);
+        let (denied, receipt) = mission
+            .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            .expect("explicit denial");
+        assert_eq!(denied.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(receipt.blocking_approvals_remaining, 2);
+        assert!(matches!(
+            &denied.assignments[0].approval_state,
+            ApprovalState::Denied { denied_by, reason_code, .. }
+                if denied_by == &request.actor && reason_code == &request.reason_code
+        ));
+        assert!(denied.assignments[0].outcome.is_none());
+
+        for sibling in [
+            ApprovalState::Denied {
+                denied_by: "operator".to_string(),
+                denied_at_ms: mission.created_at_ms + 800,
+                reason_code: "operator.refused".to_string(),
+            },
+            ApprovalState::Expired {
+                expired_at_ms: mission.created_at_ms + 800,
+                reason_code: "approval.expired".to_string(),
+            },
+        ] {
+            let mut blocked = mission.clone();
+            blocked.assignments[1].approval_state = sibling;
+            let (resolved, receipt) = blocked
+                .resolve_assignment_approval(
+                    &approval_request(MissionAssignmentApprovalDecision::Approve),
+                    mission.created_at_ms + 1_000,
+                )
+                .expect("resolve the one pending target");
+            assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+            assert_eq!(receipt.blocking_approvals_remaining, 1);
+            assert!(!resolved.assignment_approvals_satisfied());
+        }
+    }
+
+    #[test]
+    fn mission_approval_keeps_paused_checkpoint_and_blocked_control_state() {
+        let mut mission = pending_approval_mission(1);
+        mission
+            .pause_mission("operator", "review", mission.created_at_ms + 900, None)
+            .expect("pause from awaiting approval");
+        let checkpoint = serde_json::to_value(&mission.pause_resume_state).expect("checkpoint");
+        let (mut resolved, receipt) = mission
+            .resolve_assignment_approval(
+                &approval_request(MissionAssignmentApprovalDecision::Approve),
+                mission.created_at_ms + 1_000,
+            )
+            .expect("resolve approval while retaining operator pause");
+        assert_eq!(resolved.lifecycle_state, MissionLifecycleState::Paused);
+        assert_eq!(receipt.lifecycle_to, MissionLifecycleState::Paused);
+        assert_eq!(serde_json::to_value(&resolved.pause_resume_state).expect("checkpoint"), checkpoint);
+        resolved
+            .resume_mission("operator", "review_done", mission.created_at_ms + 1_100, None)
+            .expect("explicit resume restores awaiting approval");
+        assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert!(resolved.assignment_approvals_satisfied());
+
+        for state in [
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Planned,
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::Running,
+            MissionLifecycleState::Executing,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::RetryPending,
+        ] {
+            let mut mission = pending_approval_mission(1);
+            mission.lifecycle_state = state;
+            let (resolved, _) = mission
+                .resolve_assignment_approval(
+                    &approval_request(MissionAssignmentApprovalDecision::Approve),
+                    mission.created_at_ms + 1_000,
+                )
+                .expect("approval does not run or resume a mission");
+            assert_eq!(resolved.lifecycle_state, state);
+        }
+    }
+
+    #[test]
+    fn mission_approval_cannot_replace_settled_or_nonpending_decisions() {
+        let mission = pending_approval_mission(1);
+        let request = approval_request(MissionAssignmentApprovalDecision::Approve);
+        for previous in [
+            ApprovalState::NotRequired,
+            ApprovalState::Approved {
+                approved_by: "earlier-operator".to_string(),
+                approved_at_ms: mission.created_at_ms + 800,
+                approval_code_hash: "sha256:previous".to_string(),
+            },
+            ApprovalState::Denied {
+                denied_by: "earlier-operator".to_string(),
+                denied_at_ms: mission.created_at_ms + 800,
+                reason_code: "operator.refused".to_string(),
+            },
+            ApprovalState::Expired {
+                expired_at_ms: mission.created_at_ms + 800,
+                reason_code: "approval.expired".to_string(),
+            },
+        ] {
+            let mut locked = mission.clone();
+            locked.assignments[0].approval_state = previous;
+            let before = serde_json::to_value(&locked).expect("before");
+            assert_eq!(
+                locked.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                    .expect_err("existing decision is not silently overwritten"),
+                MissionAssignmentApprovalError::ApprovalNotPending
+            );
+            assert_eq!(serde_json::to_value(&locked).expect("after"), before);
+        }
+        let mut settled = mission.clone();
+        settled.assignments[0].outcome = Some(Outcome::Success {
+            reason_code: "action.committed".to_string(),
+            completed_at_ms: mission.created_at_ms + 800,
+        });
+        assert_eq!(
+            settled.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                .expect_err("settled action cannot be reapproved"),
+            MissionAssignmentApprovalError::AssignmentSettled
+        );
+        settled.lifecycle_state = MissionLifecycleState::Completed;
+        assert_eq!(
+            settled.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                .expect_err("terminal mission cannot reopen admission"),
+            MissionAssignmentApprovalError::TerminalMission
+        );
+    }
+
+    #[test]
+    fn mission_approval_refuses_invalid_metadata_time_identity_and_revision() {
+        let mission = pending_approval_mission(1);
+        let request = approval_request(MissionAssignmentApprovalDecision::Approve);
+        for actor in ["".to_string(), " operator".to_string(), "actor\nspoof".to_string(), "x".repeat(129)] {
+            let invalid = MissionAssignmentApprovalRequest { actor, ..request.clone() };
+            assert_eq!(
+                mission.resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
+                    .expect_err("invalid actor"),
+                MissionAssignmentApprovalError::InvalidActor
+            );
+        }
+        for reason_code in ["".to_string(), "contains spaces".to_string(), "path/secret".to_string(), "é".to_string(), "x".repeat(129)] {
+            let invalid = MissionAssignmentApprovalRequest { reason_code, ..request.clone() };
+            assert_eq!(
+                mission.resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
+                    .expect_err("invalid reason code"),
+                MissionAssignmentApprovalError::InvalidReasonCode
+            );
+        }
+        let mut future_request = mission.clone();
+        future_request.assignments[0].approval_state = ApprovalState::Pending {
+            requested_by: "planner".to_string(),
+            requested_at_ms: mission.created_at_ms + 2_000,
+        };
+        assert_eq!(
+            future_request.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                .expect_err("decision cannot predate request"),
+            MissionAssignmentApprovalError::InvalidTimestamp
+        );
+        let mut exhausted = mission.clone();
+        exhausted.revision = u64::MAX;
+        assert_eq!(
+            exhausted.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                .expect_err("decision must be durably representable"),
+            MissionAssignmentApprovalError::RevisionExhausted
+        );
+        let missing = MissionAssignmentApprovalRequest {
+            assignment_id: AssignmentId("assignment:missing".to_string()),
+            ..request
+        };
+        assert_eq!(
+            mission.resolve_assignment_approval(&missing, mission.created_at_ms + 1_000)
+                .expect_err("unknown target"),
+            MissionAssignmentApprovalError::AssignmentNotFound
+        );
+    }
+
+    #[test]
+    fn mission_approval_digest_binds_exact_snapshot_order_and_decision() {
+        let mission = pending_approval_mission(2);
+        let request = approval_request(MissionAssignmentApprovalDecision::Approve);
+        let now = mission.created_at_ms + 1_000;
+        let digest = |mission: &Mission, request: &MissionAssignmentApprovalRequest, now| {
+            mission.resolve_assignment_approval(request, now)
+                .expect("valid decision").1.decision_digest
+        };
+        let expected = digest(&mission, &request, now);
+        assert_eq!(expected, digest(&mission, &request, now));
+        let mut changed = mission.clone();
+        changed.revision += 1;
+        assert_ne!(expected, digest(&changed, &request, now));
+        let mut changed = mission.clone();
+        changed.generation = "b".repeat(32);
+        assert_ne!(expected, digest(&changed, &request, now));
+        let mut changed = mission.clone();
+        changed.assignments.reverse();
+        assert_ne!(expected, digest(&changed, &request, now));
+        let mut changed = mission.clone();
+        changed.assignments[0].assignee = "different-agent".to_string();
+        assert_ne!(expected, digest(&changed, &request, now));
+        let mut changed = mission.clone();
+        if let StepAction::SendText { text, .. } = &mut changed.candidates[0].action {
+            *text = "different action".to_string();
+        }
+        assert_ne!(expected, digest(&changed, &request, now));
+        let denied = MissionAssignmentApprovalRequest {
+            decision: MissionAssignmentApprovalDecision::Deny,
+            ..request.clone()
+        };
+        assert_ne!(expected, digest(&mission, &denied, now));
+        let reason = MissionAssignmentApprovalRequest {
+            reason_code: "operator.different_review".to_string(),
+            ..request.clone()
+        };
+        assert_ne!(expected, digest(&mission, &reason, now));
+        assert_ne!(expected, digest(&mission, &request, now + 1));
+    }
+
+    #[cfg(feature = "subprocess-bridge")]
+    #[test]
+    fn mission_approval_preserves_the_existing_assignment_transaction_identity() {
+        let mission = pending_approval_mission(1);
+        let request = approval_request(MissionAssignmentApprovalDecision::Approve);
+        let (approved, _) = mission
+            .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            .expect("resolve assignment admission");
+        let mut already_admitted = mission.clone();
+        already_admitted.lifecycle_state = MissionLifecycleState::Executing;
+        already_admitted.assignments[0].approval_state = ApprovalState::NotRequired;
+        let before = crate::mission_dispatch::compile_assignment_dispatch(
+            &already_admitted, &request.assignment_id,
+        ).expect("same action without an assignment approval gate");
+        let after = crate::mission_dispatch::compile_assignment_dispatch(
+            &approved, &request.assignment_id,
+        ).expect("approved action");
+        assert_eq!(
+            serde_json::to_value(before).expect("prior transaction"),
+            serde_json::to_value(after).expect("approved transaction"),
+            "approval metadata must not manufacture a fresh dispatch identity or policy grant"
+        );
     }
 
     #[test]
