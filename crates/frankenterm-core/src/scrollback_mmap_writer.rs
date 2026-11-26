@@ -2310,6 +2310,10 @@ fn secure_writer_directory(directory: &CapDir, path: &Path) -> Result<(), MmapSc
             }
         }
     }
+    // The flush makes the permission migration above durable. Windows has no
+    // migration, and FlushFileBuffers refuses the read-only directory handle
+    // ("Access is denied"), as in sync_directory_for_publication.
+    #[cfg(not(windows))]
     if let Err(source) = handle.sync_all() {
         if !matches!(source.raw_os_error(), Some(9 | 22 | 95)) {
             return Err(MmapScrollbackError::Sync {

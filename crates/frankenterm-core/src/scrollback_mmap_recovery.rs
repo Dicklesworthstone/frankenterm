@@ -2682,10 +2682,9 @@ mod tests {
             .write(true)
             .open(path.with_extension("bin.lock"))
             .unwrap();
-        assert_eq!(
-            competing.try_lock_exclusive().unwrap_err().kind(),
-            ErrorKind::WouldBlock
-        );
+        assert!(crate::lock::is_lock_contended(
+            &competing.try_lock_exclusive().unwrap_err()
+        ));
         let snapshot = candidate.read_records(recovery_limits()).unwrap();
         assert!(snapshot.records.is_empty());
         assert_eq!(snapshot.header.pane_uuid, [0x61; 32]);
@@ -2768,10 +2767,9 @@ mod tests {
             .write(true)
             .open(&lock_path)
             .unwrap();
-        assert_eq!(
-            reusable_lock.try_lock_exclusive().unwrap_err().kind(),
-            ErrorKind::WouldBlock
-        );
+        assert!(crate::lock::is_lock_contended(
+            &reusable_lock.try_lock_exclusive().unwrap_err()
+        ));
 
         let receipt = candidate.discard().expect("identity-checked discard");
 
