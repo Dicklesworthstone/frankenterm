@@ -12563,7 +12563,22 @@ fn mux_socket_path_is_usable(path: &std::path::Path) -> bool {
             .unwrap_or(false)
     }
 
-    #[cfg(not(unix))]
+    // A Windows AF_UNIX socket is a reparse point (IO_REPARSE_TAG_AF_UNIX)
+    // that is not a name surrogate, so not a link; a regular file has no
+    // reparse point. `metadata` cannot open the socket, so do not follow.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            !metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         path.exists()
     }
@@ -15630,11 +15645,22 @@ mod unified_tests {
         assert!(sel.reason.contains("socket not discovered"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn mux_socket_path_rejects_regular_files() {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         assert!(!mux_socket_path_is_usable(file.path()));
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(!mux_socket_path_is_usable(dir.path()));
+        assert!(!mux_socket_path_is_usable(&dir.path().join("missing.sock")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mux_socket_path_accepts_windows_af_unix_socket() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket_path = dir.path().join("mux.sock");
+        let _listener = frankenterm_uds::UnixListener::bind(&socket_path).expect("unix socket");
+        assert!(mux_socket_path_is_usable(&socket_path));
     }
 
     #[cfg(unix)]
