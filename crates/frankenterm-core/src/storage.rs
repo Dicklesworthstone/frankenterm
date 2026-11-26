@@ -1754,15 +1754,6 @@ const FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_EVEN
 /// [round-4 M8] Env opt-in for [`StorageConfig::group_commit_adaptive`].
 const FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE";
 
-/// Longest an idle writer stays parked on its condvar without a wake.
-///
-/// Every enqueue notifies the writer, and the last command sender's drop
-/// notifies it too, so work and disconnects wake it immediately. This ceiling
-/// is only a safety net against a missed notification; it is not a poll
-/// interval. (The writer used to sleep 1 ms per empty `try_recv`, about 1,000
-/// idle wakeups a second: frankenterm#135.)
-const WRITER_IDLE_PARK_CEILING: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Upper bound on the adaptive group-commit linger (`group_commit_adaptive`).
 ///
 /// It equals the 1 ms idle poll the writer used before it parked on a condvar,
@@ -1791,16 +1782,17 @@ fn storage_env_flag_enabled(name: &str) -> bool {
 /// Condvar-based wakeup shared between [`WriteCommandSender`] and the storage
 /// writer thread.
 ///
-/// The sender calls [`WriterWakeup::notify`] after enqueuing a command (and
-/// [`WriterDisconnectWake`] calls it when the last sender is dropped); the
-/// writer calls [`WriterWakeup::park_for_work`] when `try_recv` returns empty.
+/// The sender calls [`WriterWakeup::notify`] after enqueuing a command, and
+/// [`WriterDisconnectWake`] publishes a sticky disconnect when the last sender
+/// is dropped. The writer calls [`WriterWakeup::park_for_work`] when `try_recv`
+/// returns empty.
 /// The park re-checks the shared `queued_depth` counter under the lock before
 /// sleeping, which closes the classic enqueue/park lost-wakeup race: any command
 /// made visible (depth incremented) before the writer parks is observed and the
 /// park is skipped. The same applies to the last sender's drop, through
-/// `senders_gone`. Even if a wake were somehow lost, the bounded `wait_timeout`
-/// guarantees the writer re-polls, so durability/ordering never depend on the
-/// signal — only latency does.
+/// `senders_gone`. Both notifications acquire the same lock, so the idle wait
+/// needs no timer. Spurious notifications re-check the predicates without
+/// returning to the channel poll.
 struct WriterWakeup {
     lock: Mutex<()>,
     condvar: std::sync::Condvar,
@@ -1809,7 +1801,7 @@ struct WriterWakeup {
     /// Set by [`WriterDisconnectWake`] once the last sender is gone. The last
     /// sender can drop after the writer's empty `try_recv` but before it takes
     /// `lock`; that notification finds no waiter, so `park_for_work` re-checks
-    /// this flag under the lock rather than sleeping out its ceiling.
+    /// this flag under the lock rather than missing the disconnect.
     senders_gone: AtomicBool,
     /// `park_for_work` calls, so tests can prove an idle writer stays parked.
     #[cfg(test)]
@@ -1860,21 +1852,24 @@ impl WriterWakeup {
         self.notify();
     }
 
-    /// Park until notified or `timeout` elapses, skipping the sleep entirely if
-    /// `queued_depth` already shows pending work or every sender is gone.
-    fn park_for_work(&self, timeout: std::time::Duration, queued_depth: &AtomicUsize) {
-        #[cfg(test)]
-        self.parks.fetch_add(1, AtomicOrdering::Relaxed);
-        let guard = self
+    /// Park until work is queued or every sender is gone, with no idle timer.
+    /// Re-check the sticky predicates under the notification lock before each
+    /// wait so pre-park and spurious notifications cannot lose or invent work.
+    fn park_for_work(&self, queued_depth: &AtomicUsize) {
+        let mut guard = self
             .lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if queued_depth.load(AtomicOrdering::Acquire) > 0
-            || self.senders_gone.load(AtomicOrdering::Acquire)
+        #[cfg(test)]
+        self.parks.fetch_add(1, AtomicOrdering::Relaxed);
+        while queued_depth.load(AtomicOrdering::Acquire) == 0
+            && !self.senders_gone.load(AtomicOrdering::Acquire)
         {
-            return;
+            guard = self
+                .condvar
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
         }
-        let _ = self.condvar.wait_timeout(guard, timeout);
     }
 
     fn wait_for_terminal_depth_change(
@@ -1902,8 +1897,7 @@ impl WriterWakeup {
 ///
 /// Every sender clone shares one `Arc` of this guard. It is declared after the
 /// sender's channel handle, so by the time the last guard drops the channel is
-/// already disconnected, and the woken writer observes `Disconnected` and exits
-/// instead of sleeping out [`WRITER_IDLE_PARK_CEILING`].
+/// already disconnected, and the woken writer observes `Disconnected` and exits.
 struct WriterDisconnectWake {
     wakeup: Arc<WriterWakeup>,
 }
@@ -14872,8 +14866,9 @@ fn writer_loop(
             }
             Err(mpsc::RecvError::Empty) => {
                 // Park until a sender signals fresh work or the last sender
-                // drops; the ceiling only bounds a missed notification.
-                writer_wakeup.park_for_work(WRITER_IDLE_PARK_CEILING, queued_depth);
+                // drops. Sticky state under the notification lock makes this
+                // wait safe without a periodic idle wakeup.
+                writer_wakeup.park_for_work(queued_depth);
             }
             Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
                 #[cfg(test)]
@@ -18941,7 +18936,7 @@ mod writer_io_scheduler_tests {
                 .expect("read events");
             assert_eq!(events.len(), 16, "condvar-park writer persisted all events");
             // Clean shutdown proves the Shutdown command notifies and wakes the
-            // parked writer rather than waiting out the park ceiling.
+            // parked writer without an idle timer.
             storage.shutdown().await.expect("shutdown");
         });
     }
@@ -18962,6 +18957,80 @@ mod writer_io_scheduler_tests {
             ignore_reason: None,
             last_decision_at: None,
         }
+    }
+
+    fn wait_for_writer_park_for_test(wakeup: &WriterWakeup) -> bool {
+        let started = Instant::now();
+        while wakeup.parks.load(AtomicOrdering::Relaxed) == 0 {
+            if started.elapsed() >= std::time::Duration::from_secs(5) {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        // The writer increments `parks` while holding this lock. Acquiring it
+        // proves the writer has atomically entered its condvar wait (or has
+        // incorrectly returned), so the observation window starts after park.
+        drop(wakeup.lock.lock().unwrap_or_else(|poison| poison.into_inner()));
+        true
+    }
+
+    #[test]
+    fn idle_writer_wait_has_no_timeout_and_ignores_spurious_notifications() {
+        let wakeup = Arc::new(WriterWakeup::new());
+        let queued_depth = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let wakeup = Arc::clone(&wakeup);
+            let queued_depth = Arc::clone(&queued_depth);
+            std::thread::spawn(move || {
+                wakeup.park_for_work(&queued_depth);
+                let _ = finished_tx.send(());
+            })
+        };
+        let parked = wait_for_writer_park_for_test(&wakeup);
+
+        // This exceeds the old one-second safety ceiling: a timeout-backed
+        // implementation returns here even though no producer published work.
+        let before_work = finished_rx.recv_timeout(std::time::Duration::from_millis(1_200));
+        wakeup.notify();
+        let after_spurious = finished_rx.recv_timeout(std::time::Duration::from_millis(50));
+
+        queued_depth.store(1, AtomicOrdering::Release);
+        wakeup.notify();
+        let after_work = finished_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Always release and join before assertions, including a failing
+        // enqueue-wakeup path, so no regression can strand this test thread.
+        wakeup.notify_senders_gone();
+        let joined = waiter.join();
+
+        assert!(parked, "the waiter must reach its idle park");
+        assert_eq!(before_work, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(after_spurious, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(after_work, Ok(()), "published work must wake the idle writer");
+        assert!(joined.is_ok(), "the parked writer must exit cleanly");
+    }
+
+    #[test]
+    fn enqueue_between_empty_poll_and_park_does_not_strand_the_writer() {
+        let wakeup = Arc::new(WriterWakeup::new());
+        let queued_depth = Arc::new(AtomicUsize::new(1));
+        // The enqueue's notification runs before there is a condvar waiter.
+        wakeup.notify();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let wakeup = Arc::clone(&wakeup);
+            let queued_depth = Arc::clone(&queued_depth);
+            std::thread::spawn(move || {
+                wakeup.park_for_work(&queued_depth);
+                let _ = finished_tx.send(());
+            })
+        };
+        let observed = finished_rx.recv_timeout(std::time::Duration::from_millis(500));
+        wakeup.notify_senders_gone();
+        let joined = waiter.join();
+
+        assert_eq!(observed, Ok(()), "the park must observe already-queued work");
+        assert!(joined.is_ok(), "the writer must exit cleanly");
     }
 
     /// frankenterm#135: an idle writer sleeps until work arrives. It used to
@@ -18998,22 +19067,21 @@ mod writer_io_scheduler_tests {
                 .await
                 .expect("append after idle");
             assert!(
-                started.elapsed() < WRITER_IDLE_PARK_CEILING / 2,
-                "an enqueue must wake the parked writer, not its safety ceiling"
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "an enqueue must wake the parked writer promptly"
             );
             storage.shutdown().await.expect("shutdown");
         });
     }
 
     /// Dropping the last handle without a `Shutdown` command wakes the parked
-    /// writer, which then sees the closed channel and exits instead of
-    /// sleeping out its safety ceiling.
+    /// writer, which then sees the closed channel and exits without an idle
+    /// timer.
     ///
     /// The bound times the writer's own wake: from the drop to the moment the
     /// writer loop sees the closed channel. Runtime teardown, the SQLite close
     /// and the join that follow are not part of it, so a loaded machine slowing
-    /// those down cannot fail the test, while a writer that is not woken still
-    /// sleeps out the ceiling and fails it.
+    /// those down cannot fail the test. Only notification latency is measured.
     #[test]
     fn dropping_the_last_handle_wakes_the_parked_writer() {
         let mut dropped = None;
@@ -19050,28 +19118,37 @@ mod writer_io_scheduler_tests {
             .expect("the writer exits through the closed channel");
         let woke_after = observed_at.saturating_duration_since(dropped_at);
         assert!(
-            woke_after < WRITER_IDLE_PARK_CEILING / 2,
+            woke_after < std::time::Duration::from_millis(500),
             "dropping the last sender must wake the parked writer; it saw the closed channel {woke_after:?} after the drop"
         );
     }
 
     /// The last sender can drop after the writer's empty `try_recv` but before
     /// it parks. That notification finds no waiter, so the park itself has to
-    /// see the disconnect instead of sleeping out its ceiling.
+    /// see the disconnect instead of sleeping indefinitely.
     #[test]
     fn disconnect_between_empty_poll_and_park_does_not_strand_the_writer() {
         let wakeup = Arc::new(WriterWakeup::new());
         drop(WriterDisconnectWake {
             wakeup: Arc::clone(&wakeup),
         });
-        let queued_depth = AtomicUsize::new(0);
-        let started = Instant::now();
-        wakeup.park_for_work(std::time::Duration::from_secs(5), &queued_depth);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "a disconnect before the park must not be a lost wakeup; parked {:?}",
-            started.elapsed()
-        );
+        let queued_depth = Arc::new(AtomicUsize::new(0));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let wakeup = Arc::clone(&wakeup);
+            let queued_depth = Arc::clone(&queued_depth);
+            std::thread::spawn(move || {
+                wakeup.park_for_work(&queued_depth);
+                let _ = finished_tx.send(());
+            })
+        };
+        let observed = finished_rx.recv_timeout(std::time::Duration::from_millis(500));
+        queued_depth.store(1, AtomicOrdering::Release);
+        wakeup.notify();
+        let joined = waiter.join();
+
+        assert_eq!(observed, Ok(()), "the park must observe the sticky disconnect");
+        assert!(joined.is_ok(), "the disconnected writer must exit cleanly");
     }
 
     // ----------------------------------------------------------------------
@@ -47238,7 +47315,20 @@ mod writer_response_cancellation_tests {
                 .await
                 .expect("open writer cancellation fixture");
             let (entered, release) = storage.pause_writer_before_receive_for_test();
-            storage.write_tx.wakeup.notify();
+            // A bare notification carries no work and must leave an idle
+            // writer parked. Queue a real read to reach the owned barrier
+            // before admitting the mutation whose receipt is cancelled.
+            let (wake_tx, _wake_rx) = oneshot::channel();
+            let wake_result = storage
+                .write_tx
+                .send_with_cx(
+                    &live_cx,
+                    WriteCommand::GetConfigValue {
+                        key: "writer-barrier-wakeup".to_string(),
+                        respond: wake_tx,
+                    },
+                )
+                .await;
             let entered_result = entered.recv_timeout(std::time::Duration::from_secs(5));
             let caller_cx = crate::cx::for_testing();
             let waker = Waker::from(Arc::new(WakeCounter::default()));
@@ -47260,6 +47350,7 @@ mod writer_response_cancellation_tests {
             // Release the writer even on assertion failure. Its queued command
             // retains ownership independently of the dropped response receiver.
             let _ = release.send(());
+            wake_result.expect("admit the real writer wakeup read");
             entered_result.expect("writer must enter the owned pre-receive barrier");
             assert!(initially_pending, "write must be admitted before publication");
             let Poll::Ready(Err(error)) = cancelled else {

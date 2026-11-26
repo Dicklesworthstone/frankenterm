@@ -19083,6 +19083,19 @@ mod tests {
                         .put(pane_id, CachedCaptureCheckpoint::Certain(baseline));
                 }
                 let (entered, release) = storage.pause_writer_before_receive_for_test();
+                // The idle writer has no timeout wake. A real read reaches
+                // the barrier without changing the capture rows under test.
+                let mut wake = Box::pin(storage.get_config_value_with_cx(
+                    &checkpoint_cx,
+                    "writer-barrier-wakeup",
+                ));
+                let wake_completed = match futures::poll!(wake.as_mut()) {
+                    std::task::Poll::Ready(result) => {
+                        result.expect("complete writer wakeup read");
+                        true
+                    }
+                    std::task::Poll::Pending => false,
+                };
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     match entered.try_recv() {
@@ -19097,6 +19110,10 @@ mod tests {
                         Err(error) => panic!("writer barrier failed: {error}"),
                     }
                 }
+                // The read may have completed before the writer reached the
+                // barrier, or may still be queued behind it. In either case
+                // require both capture writes to be admitted before a reply.
+                let queued_before_capture = storage.write_queue_depth();
                 let (retirement_tx, retirement_rx) = spsc_channel(1);
                 drop(retirement_tx);
                 let persistence = runtime.spawn_persistence_task(
@@ -19107,7 +19124,7 @@ mod tests {
                     retirement_rx,
                     Arc::new(StdMutex::new(())),
                 );
-                while storage.write_queue_depth() != 2 {
+                while storage.write_queue_depth() != queued_before_capture + 2 {
                     assert!(
                         Instant::now() < deadline,
                         "normal recorder watch must admit both writes before either reply"
@@ -19120,6 +19137,9 @@ mod tests {
                 );
                 assert_eq!(runtime.metrics.segments_persisted(), 0);
                 release.send(()).unwrap();
+                if !wake_completed {
+                    wake.await.expect("settle writer wakeup read");
+                }
                 persistence.await.unwrap();
                 let cx = crate::cx::for_testing();
                 let pending = storage

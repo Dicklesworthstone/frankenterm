@@ -9086,8 +9086,8 @@ pub enum SpawnBlockingWithCxError {
     /// cancellation.
     #[error("blocking task runtime failure")]
     RuntimeFailure,
-    /// The bounded cancellation watcher timer failed while the Cx itself was
-    /// still live.
+    /// The cancellation/deadline watcher failed while the Cx itself was still
+    /// live.
     #[error("blocking cancellation watcher timer failure")]
     CancellationWatcherTimerFailure,
 }
@@ -9127,8 +9127,9 @@ fn spawn_blocking_root_cancel_kind(cx: &crate::cx::Cx) -> Option<crate::outcome:
 ///
 /// **Mid-flight cancel:** if the Cx cancels while the blocking
 /// work is queued or running, the await resolves with
-/// [`SpawnBlockingWithCxError::CancelledMidFlight`] within ~50–100 ms
-/// (the cancel-watcher checkpoints the Cx on a 50 ms cadence). The
+/// [`SpawnBlockingWithCxError::CancelledMidFlight`] when its cancellation
+/// notification wakes the await. Infinite-budget waits arm no timer; a finite
+/// budget arms only its actual deadline. The
 /// blocking pool may skip work that is still queued. Once the OS-thread
 /// closure has started, however, it **continues to run** until it returns
 /// naturally and its result is discarded. The exact explicit Cx is installed
@@ -9170,50 +9171,26 @@ where
         });
     }
 
-    use futures::future::{Either, select};
-
     // The explicit Cx is authoritative inside the blocking closure even when
     // this future is polled under a different ambient task. Pool selection is
     // independently derived from the installed runtime handle; the closure
     // installs the explicit identity/mask because TLS does not migrate between
     // executor and blocking-pool threads.
     let blocking_context = Some((cx.clone(), crate::cx::effective_cap_mask(cx)));
-    let join_fut = std::pin::pin!(spawn_blocking_in_context(
-        blocking_context,
-        current_runtime_handle(),
-        work,
-    ));
-    let cancel_watcher = std::pin::pin!(async {
-        loop {
-            // 50 ms poll mirrors distributed::race_with_cx_cancel
-            // (tick 387). A budget deadline can make `sleep_with_cx`
-            // return `Err` without first latching the cancellation bit, so
-            // every wakeup must run a checkpoint. Ignoring that error used
-            // to turn an expired finite budget into a non-yielding hot loop
-            // until the blocking closure happened to finish.
-            if sleep_with_cx(cx, std::time::Duration::from_millis(50))
-                .await
-                .is_err()
-            {
-                if cx.checkpoint().is_err() {
-                    return Ok(());
-                }
-                return Err(());
-            }
-            if cx.checkpoint().is_err() {
-                return Ok(());
-            }
-        }
-    });
+    let join_fut = spawn_blocking_in_context(blocking_context, current_runtime_handle(), work);
 
-    match select(join_fut, cancel_watcher).await {
-        Either::Left((result, _)) => map_spawn_blocking_runtime_result(result),
-        Either::Right((Ok(()), _)) => Err(SpawnBlockingWithCxError::CancelledMidFlight {
-            kind: spawn_blocking_root_cancel_kind(cx),
-        }),
-        Either::Right((Err(()), _)) => {
-            Err(SpawnBlockingWithCxError::CancellationWatcherTimerFailure)
+    // The canonical waiter registers for cancellation and the actual budget
+    // deadline instead of waking periodically to re-check the context. Ready
+    // results still win the race, and dropping an unfinished join retains the
+    // blocking pool's existing queued-work cancellation/started-work contract.
+    match until_cancelled(cx, join_fut).await {
+        Ok(result) => map_spawn_blocking_runtime_result(result),
+        Err(_) if cx.checkpoint().is_err() => {
+            Err(SpawnBlockingWithCxError::CancelledMidFlight {
+                kind: spawn_blocking_root_cancel_kind(cx),
+            })
         }
+        Err(_) => Err(SpawnBlockingWithCxError::CancellationWatcherTimerFailure),
     }
 }
 
@@ -14671,6 +14648,79 @@ mod tests {
                     .contains("injected blocking closure panic")
             );
             assert!(!format!("{error:?}").contains("injected blocking closure panic"));
+        });
+    }
+
+    /// #135: pending blocking work waits on cancellation and completion
+    /// notifications without arming a periodic timer on the caller's clock.
+    #[test]
+    fn spawn_blocking_with_cx_has_no_idle_timer_and_cancels_on_notification() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_clock, cx) =
+                virtual_timeout_context(asupersync::Time::ZERO, asupersync::Budget::INFINITE);
+            let timer = cx.timer_driver().expect("blocking caller's virtual clock");
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (completed_tx, completed_rx) = oneshot::channel::<()>();
+            let (probe, waker) = probe_waker(false);
+
+            let mut waiting = Box::pin(spawn_blocking_with_cx(&cx, move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("notification-only blocking closure release");
+                let delivery_cx = crate::cx::for_request();
+                let _ = completed_tx.send_with_cx(&delivery_cx, ());
+                42_u64
+            }));
+            let initially_pending = waiting
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_pending();
+            let started = timeout(Duration::from_secs(5), oneshot_recv(started_rx)).await;
+            let pending_timers = timer.pending_count();
+            let wakes_before_cancel = probe.count();
+
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("blocking notification-only wait"),
+            );
+            let cancellation_woke_waiter = probe.count() > wakes_before_cancel;
+            let cancelled = initially_pending.then(|| {
+                waiting
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+            });
+            drop(waiting);
+            let timers_after_drop = timer.pending_count();
+
+            // Release and observe the already-started closure before asserting:
+            // cancellation settles the await, not an OS-thread operation.
+            let released = release_tx.send(());
+            let completed = timeout(Duration::from_secs(5), oneshot_recv(completed_rx)).await;
+            assert!(initially_pending, "the closure must wait for its release");
+            assert!(matches!(&started, Ok(Ok(()))), "closure start: {started:?}");
+            assert_eq!(pending_timers, 0, "pending blocking work needs no idle timer");
+            assert!(cancellation_woke_waiter, "cancellation must wake the registered task");
+            assert!(
+                matches!(
+                    &cancelled,
+                    Some(std::task::Poll::Ready(Err(
+                        SpawnBlockingWithCxError::CancelledMidFlight {
+                            kind: Some(crate::outcome::CancelKind::User)
+                        }
+                    )))
+                ),
+                "cancellation must settle without advancing the clock: {cancelled:?}"
+            );
+            assert!(released.is_ok(), "the running closure must retain its release receiver");
+            assert!(matches!(&completed, Ok(Ok(()))), "closure completion: {completed:?}");
+            assert_eq!(timer.now(), asupersync::Time::ZERO);
+            assert_eq!(timers_after_drop, 0, "dropping the wait must unregister timers");
         });
     }
 
