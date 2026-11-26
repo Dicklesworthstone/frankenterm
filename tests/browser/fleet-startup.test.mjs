@@ -178,7 +178,11 @@ function fixture(t, options = {}) {
     get("pane-output-id").value = id;
     get("pane-output-form").requestSubmit();
     const source = sources.at(-1);
-    source.emit("ready", { data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${id},"resume_after_id":null}}` });
+    const cursor = `delta-v1:pane:${id}:0`;
+    source.emit("ready", {
+      data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${id},"resume_after_id":0,"cursor":${JSON.stringify(cursor)}}}`,
+      lastEventId: cursor,
+    });
   };
   return { app, doc, host, get, sources, requests, viewers, renderers, frames, timers, intervals, observers,
     selection, frame, openPane, notifications, Notification,

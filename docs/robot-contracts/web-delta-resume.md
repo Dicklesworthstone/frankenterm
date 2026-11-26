@@ -7,15 +7,19 @@ authentication credential.
 
 ## Starting and resuming
 
-A request without a resume cursor is a fresh live subscription. It retains the
-existing capture-time cutoff at connection admission rather than replaying all
-history. To explicitly replay retained history, use `?since_id=0`; to resume
+A request without a resume cursor is a fresh live subscription. After subscribing
+to notifications, the server reads the greatest currently retained segment ID
+in the requested pane scope, or zero for an empty scope, and starts after that
+boundary. Capture timestamps do not determine arrival: output committed after
+the boundary remains eligible even when the clock moves backward. To explicitly
+replay retained history, use `?since_id=0`; to resume
 from a known segment, use `?since_id=<last_received_segment_id>`. The id is the
 persisted `data.segment_id`, not the frame's `seq` or the pane-local `data.seq`.
 `pane_id`, when supplied, must be a nonnegative unsigned integer; invalid text
 is rejected rather than interpreted as an all-pane subscription.
 
-Each `delta` message now carries an opaque, versioned SSE id:
+The initial `ready` checkpoint and each `delta` message carry an opaque,
+versioned SSE id:
 
 - All panes: `delta-v1:all:<segment_id>`.
 - One pane: `delta-v1:pane:<pane_id>:<segment_id>`.
@@ -32,10 +36,11 @@ data: {"schema":"ft.stream.v1","stream":"deltas","kind":"delta","seq":2,"ts_ms":
 A reconnecting EventSource supplies that id in `Last-Event-ID`. A nonempty,
 valid header takes precedence over the original URL's `since_id`, so an
 unchanged bootstrap URL cannot repeatedly replay already-received output.
-An absent or empty header falls back to `since_id`. Resume removes the new
-connection's capture-time cutoff: older retained segments after the cursor
-must remain eligible. It starts scanning immediately, without needing another
-EventBus notification.
+An absent or empty header falls back to `since_id`. Both fresh and resumed
+connections scan strictly after their admitted segment ID; older capture
+timestamps remain eligible. Scanning starts immediately, without needing another
+EventBus notification. Failure to read a fresh boundary returns HTTP 503 with
+`storage_error` before opening the stream.
 
 A cursor is bound to the same pane selection. Reusing a pane-7 cursor for pane
 8 or for all panes fails with HTTP 400 and `delta_cursor_scope_mismatch`.
@@ -54,11 +59,15 @@ migrating from that format can bootstrap with the actual last received
 `data.segment_id` through `since_id`. Without that information, it must choose
 an explicit history or fresh-subscription boundary.
 
-The JSON envelope's `seq` remains per connection. Only `delta` frames set the
-SSE `id` field. `ready`, `gap`, `lag`, `error`, and keepalive comments carry no
-id field at all; in particular, they do not send an empty `id:` that would
-clear the browser's cursor. The ready payload reports `cursor_format`,
-`resume_after_id`, and `recovery: retained_segments_only`.
+The JSON envelope's `seq` remains per connection. `ready` sets the SSE `id` to
+the admitted boundary, including zero for an empty fresh scope or explicit
+history replay. Its payload reports the same `cursor` and `resume_after_id`,
+along with `cursor_format` and `recovery: retained_segments_only`. This checkpoint
+allows a connection that has received no output yet to recover output committed
+while disconnected; it does not acknowledge any transcript delivery or complete
+history catch-up. Subsequent `delta` frames advance the cursor. `gap`, `lag`,
+`error`, and keepalive comments carry no id field; they never send an empty `id:`
+that would clear the browser's cursor.
 
 ## Delivery and failure boundaries
 
@@ -82,17 +91,22 @@ It does not recreate retention-deleted output, replay historical capture-gap
 notifications, detect database replacement or restore, or replay in-place
 changes to previously delivered rows. Sparse ids alone do not prove deletion,
 because filtered panes also create holes. Do not reuse these cursors across
-database replacement or an unrelated server. A fresh connection that fails
-before receiving its first delta has no stored SSE cursor unless the caller
-provided an explicit bootstrap boundary. These limits are not a claim of
-unconditional lossless terminal capture.
+database replacement or an unrelated server. The current segment allocator can
+reuse IDs after deletion of the highest retained IDs; the cursor has no database
+epoch or retention-reset fence, so it cannot guarantee recovery across that
+reset. A fresh connection that fails before receiving `ready` still has no
+stored SSE checkpoint unless the caller supplied an explicit bootstrap boundary.
+These limits are not a claim of unconditional lossless terminal capture.
 
 ## Regression coverage
 
 `web::sse::delta::tests` contains source-level regressions for bounded-page
 catch-up, full-channel delivery, shutdown, query failures, malformed pages,
-redaction, cursor parsing and scope, control-frame ids, historical resume, and
-disconnect with unread queued frames. Tests were added with this implementation
+redaction, cursor parsing and scope, ready checkpoints, historical resume, and
+disconnect with unread queued frames. The real HTTP/SQLite regression in
+`tests/web.rs` also covers empty and populated fresh tails, ready-only reconnect,
+backward capture timestamps and repair without a bus notification. Tests were
+added with this implementation
 but were not executed in the authoring environment: Rust tools and the required
 RCH execution capability were unavailable. Compile, focused runtime tests,
 Clippy, formatting, and HTTP/SQLite end-to-end verification remain required;
@@ -132,9 +146,13 @@ region that announces every output chunk.
 
 Both the scoped SSE cursor and JSON identities must agree with the selected
 pane, preserving the full u64/i64 ranges without JavaScript Number rounding.
-Malformed frames do not advance the received cursor. Gap/lag notifications,
-retention truncation, server failures, and reconnection before the first cursor
-remain visible. The database-identity and retained-history limits above apply.
+Malformed frames do not advance the received cursor. A validated ready checkpoint
+is retained across quiet reconnect, pause and page suspension without claiming
+that output was delivered. Its scoped SSE ID, payload cursor and exact numeric
+boundary must agree; reconnect may not jump past an already accepted boundary.
+Gap/lag notifications, retention truncation, server failures, and reconnection
+before the first checkpoint remain visible. The database-identity and
+retained-history limits above apply.
 
 Build and deploy a fresh browser package through the approved build lane;
 updating only HTML is insufficient because the viewer adds the `selectedPaneId`

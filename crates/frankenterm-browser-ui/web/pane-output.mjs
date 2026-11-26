@@ -26,12 +26,12 @@ export function decodeFrame(payload) {
   return { frame, exact };
 }
 
-function cursorFor(id, pane) {
+function cursorFor(id, pane, allowZero = false) {
   if (typeof id !== "string" || id.length > 64) return null;
   const match = /^delta-v1:pane:([0-9]{1,20}):([0-9]{1,19})$/.exec(id);
   if (!match || unsigned(match[1], U64_MAX) !== pane) return null;
   const segment = unsigned(match[2], I64_MAX);
-  return segment !== null && segment !== "0" ? segment : null;
+  return segment !== null && (allowZero || segment !== "0") ? segment : null;
 }
 
 function safeSuffix(text, limit) {
@@ -282,19 +282,24 @@ export function createPaneOutput({
           if (typeof data.pane_id !== "number" || unsigned(exact.data.pane_id, U64_MAX) !== selectedPane) {
             throw new Error("wrong ready pane");
           }
-          // On native reconnect the browser can send Last-Event-ID even when
-          // the original URL had no since_id. The server echoes what it
-          // actually admitted. A missing resume starts at the live tail.
+          // Ready establishes the fresh tail even before the first delta.
+          // Validate the scoped wire cursor as well as the exact JSON ID:
+          // native reconnect may use Last-Event-ID from this checkpoint.
           const expectedResume = received ?? url.searchParams.get("since_id");
           const resume = unsigned(exact.data.resume_after_id, I64_MAX);
-          const safeResume = expectedResume === null
-            ? data.resume_after_id === null
-            : typeof data.resume_after_id === "number" && resume !== null
-              && (capture !== null ? resume === expectedResume : BigInt(resume) <= BigInt(expectedResume));
+          const checkpoint = cursorFor(message.lastEventId, selectedPane, true);
+          const safeResume = typeof data.resume_after_id === "number" && resume !== null
+            && checkpoint === resume && data.cursor === message.lastEventId
+            && (expectedResume === null
+              || (capture !== null ? resume === expectedResume : BigInt(resume) <= BigInt(expectedResume)));
           if (!safeResume) {
             reconnect("output replay boundary changed; received cursor unchanged");
             return;
           }
+          // Preserve a validated baseline across pause, suspension and owned
+          // replacement without pretending that any transcript was delivered.
+          // A finite historical capture acknowledges only its requested row.
+          if (capture === null && received === null) received = resume;
           ready = true;
           clearReadyDeadline();
           status = capture === null ? "connected" : "loading";

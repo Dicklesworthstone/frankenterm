@@ -23,8 +23,12 @@ function fixture(options = {}) {
       this.handlers.set(type, list);
     }
     close() { this.closed = true; this.readyState = Source.CLOSED; }
-    emit(type, data, lastEventId = "") {
-      if (type === "ready") this.serverReady = true;
+    emit(type, data, lastEventId) {
+      if (type === "ready") {
+        this.serverReady = true;
+        lastEventId ??= JSON.parse(data).data.cursor;
+      }
+      lastEventId ??= "";
       for (const handler of this.handlers.get(type) ?? []) handler({ type, data, lastEventId });
     }
     fail(permanent = true) {
@@ -51,13 +55,14 @@ function fixture(options = {}) {
 
 // The server writes resume_after_id as an integer token, even above 2^53.
 function readyPayload(pane, resume) {
-  return `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${pane},"resume_after_id":${resume}}}`;
+  const cursor = `delta-v1:pane:${pane}:${resume}`;
+  return `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${pane},"resume_after_id":${resume},"cursor":${JSON.stringify(cursor)}}}`;
 }
 
-function control(source, kind, data = { pane_id: 7 }, inheritedId = "") {
+function control(source, kind, data = { pane_id: 7 }, inheritedId) {
   if (kind === "ready") {
-    const after = source.lastDelta ?? source.url.searchParams.get("since_id");
-    source.emit(kind, readyPayload(data.pane_id, after ?? "null"), inheritedId);
+    const after = source.lastDelta ?? source.url.searchParams.get("since_id") ?? "0";
+    source.emit(kind, readyPayload(data.pane_id, after), inheritedId);
     return;
   }
   source.emit(kind, JSON.stringify({ schema: "ft.stream.v1", stream: "deltas", kind, data }), inheritedId);
@@ -86,7 +91,74 @@ test("selection opens one pane-scoped, read-only live stream", () => {
   assert.equal(f.output.snapshot().status, "connecting");
   control(f.latest(), "ready");
   assert.equal(f.output.snapshot().status, "connected");
-  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().cursor, "0");
+});
+
+test("fresh ready checkpoints survive quiet reconnect, pause and suspension with exact identities", () => {
+  const pane = "18446744073709551615";
+  for (const baseline of ["0", "9007199254740993", "9223372036854775806"]) {
+    for (const action of ["native", "replacement", "pause", "suspend"]) {
+      const f = fixture(); f.output.select(pane);
+      const first = f.latest();
+      first.emit("ready", readyPayload(pane, baseline));
+      assert.equal(f.output.snapshot().status, "connected");
+      assert.equal(f.output.snapshot().cursor, baseline);
+      assert.equal(f.output.snapshot().sequence, null);
+      assert.equal(f.output.snapshot().text, "");
+      assert.equal(f.timers.size, 0);
+      if (action === "native") first.fail(false);
+      else if (action === "replacement") { first.fail(); f.retry(); }
+      else if (action === "pause") { f.output.pause(); f.output.resume(); }
+      else { f.output.suspend(); f.output.restore(); }
+      if (action === "native") assert.equal(f.sources.length, 1);
+      else assert.equal(f.latest().url.searchParams.get("since_id"), baseline);
+      assert.equal(f.output.snapshot().unanchored, false);
+      f.latest().emit("ready", readyPayload(pane, baseline));
+      const next = (BigInt(baseline) + 1n).toString();
+      delta(f.latest(), next, "after quiet disconnect", pane, { sequence: "0" });
+      assert.equal(f.output.snapshot().cursor, next);
+      assert.equal(f.output.snapshot().text, "after quiet disconnect");
+      assert.equal(f.output.snapshot().sequenceDiscontinuities, 0);
+      assert.equal(f.output.snapshot().retainedPrefixMissing, false);
+      assert.equal(f.timers.size, 0);
+    }
+  }
+});
+
+test("fresh ready rejects missing, inconsistent, malformed and wrong-scope checkpoints", () => {
+  const valid = readyPayload("7", "9007199254740993");
+  const cases = [
+    [readyPayload("7", "null"), "delta-v1:pane:7:0"],
+    [readyPayload("7", '"9007199254740993"'), "delta-v1:pane:7:9007199254740993"],
+    [readyPayload("7", "9223372036854775808"), "delta-v1:pane:7:9223372036854775808"],
+    [valid, ""], [valid, "1"], [valid, "delta-v1:all:9007199254740993"],
+    [valid, "delta-v1:pane:8:9007199254740993"],
+    [valid, "delta-v1:pane:7:9007199254740992"],
+    [valid.replace('"cursor":', '"ignored_cursor":'), "delta-v1:pane:7:9007199254740993"],
+  ];
+  for (const [payload, cursor] of cases) {
+    const f = fixture(); f.output.select("7");
+    f.latest().emit("ready", payload, cursor);
+    assert.equal(f.latest().closed, true);
+    assert.equal(f.output.snapshot().cursor, null);
+    assert.equal(f.output.snapshot().text, "");
+    assert.equal(f.output.snapshot().status, "retrying");
+    f.retry();
+    assert.equal(f.latest().url.searchParams.has("since_id"), false);
+  }
+});
+
+test("ready-only reconnect cannot jump ahead of its validated checkpoint", () => {
+  const f = fixture(); f.output.select("7");
+  const first = f.latest();
+  first.emit("ready", readyPayload("7", "9007199254740993"));
+  first.fail(false);
+  first.emit("ready", readyPayload("7", "9007199254740994"));
+  assert.equal(first.closed, true);
+  assert.equal(f.output.snapshot().cursor, "9007199254740993");
+  assert.equal(f.output.snapshot().text, "");
+  f.retry();
+  assert.equal(f.latest().url.searchParams.get("since_id"), "9007199254740993");
 });
 
 test("a hanging initial output connection is replaced without accepting a late pane response", () => {
@@ -230,7 +302,7 @@ test("neighboring large numeric identities cannot masquerade as the selected pan
     cursor: "delta-v1:pane:9007199254740992:9007199254740993",
   });
   assert.equal(f.output.snapshot().text, "");
-  assert.equal(f.output.snapshot().cursor, null);
+  assert.equal(f.output.snapshot().cursor, "0");
   assert.equal(f.latest().closed, true);
 });
 
