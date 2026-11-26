@@ -5368,13 +5368,13 @@ pub mod process {
             );
         }
         // `Command` retains custom Stdio handles for possible reuse. Drop it
-        // and our original write endpoints immediately so only the child (or
-        // descendants that deliberately inherit them) can keep either stream
-        // open. This is essential for reliable EOF detection.
+        // and our original write endpoints so only the child (or descendants
+        // that deliberately inherit them) can keep either stream open. This is
+        // essential for reliable EOF detection. Windows keeps the parent's
+        // capture writers until the child is reaped; see OutputCaptureWriters.
         drop(cmd);
         drop(stdin_read);
-        drop(stdout_write);
-        drop(stderr_write);
+        let mut capture_writers = OutputCaptureWriters::after_spawn(stdout_write, stderr_write);
 
         let mut stdin_state = stdin
             .zip(stdin_write)
@@ -5403,6 +5403,7 @@ pub mod process {
                     status.is_some(),
                     CommandCleanupTrigger::Cancelled,
                     &mut stdin_state,
+                    &mut capture_writers,
                     &mut stdout_reader,
                     &mut stderr_reader,
                     &mut stdout,
@@ -5419,6 +5420,7 @@ pub mod process {
                     status.is_some(),
                     CommandCleanupTrigger::TimedOut,
                     &mut stdin_state,
+                    &mut capture_writers,
                     &mut stdout_reader,
                     &mut stderr_reader,
                     &mut stdout,
@@ -5436,6 +5438,7 @@ pub mod process {
                         status.is_some(),
                         CommandCleanupTrigger::StdinWrite,
                         &mut stdin_state,
+                        &mut capture_writers,
                         &mut stdout_reader,
                         &mut stderr_reader,
                         &mut stdout,
@@ -5459,6 +5462,7 @@ pub mod process {
                         status.is_some(),
                         output_cleanup_trigger_for_capture_error(&error),
                         &mut stdin_state,
+                        &mut capture_writers,
                         &mut stdout_reader,
                         &mut stderr_reader,
                         &mut stdout,
@@ -5481,6 +5485,7 @@ pub mod process {
                         status.is_some(),
                         output_cleanup_trigger_for_capture_error(&error),
                         &mut stdin_state,
+                        &mut capture_writers,
                         &mut stdout_reader,
                         &mut stderr_reader,
                         &mut stdout,
@@ -5508,6 +5513,7 @@ pub mod process {
                                 true,
                                 CommandCleanupTrigger::StdinWrite,
                                 &mut stdin_state,
+                                &mut capture_writers,
                                 &mut stdout_reader,
                                 &mut stderr_reader,
                                 &mut stdout,
@@ -5516,6 +5522,10 @@ pub mod process {
                             )?;
                             return Err(error);
                         }
+                        // The child is reaped: close the parent's capture
+                        // writers so the streams can end (Windows; a no-op
+                        // elsewhere, where they closed at spawn).
+                        capture_writers.release();
                         status = Some(exit_status);
                         post_exit_deadline =
                             Some(process_deadline_after(PROCESS_POST_EXIT_DRAIN_TIMEOUT));
@@ -5537,6 +5547,7 @@ pub mod process {
                         let settlement_deadline =
                             process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT);
                         stdin_state.take();
+                        capture_writers.release();
                         let cleanup = settle_output_command(
                             &mut child,
                             false,
@@ -5606,6 +5617,7 @@ pub mod process {
                         true,
                         CommandCleanupTrigger::ReadinessPoll,
                         &mut stdin_state,
+                        &mut capture_writers,
                         &mut stdout_reader,
                         &mut stderr_reader,
                         &mut stdout,
@@ -5627,6 +5639,7 @@ pub mod process {
                     false,
                     CommandCleanupTrigger::ReadinessPoll,
                     &mut stdin_state,
+                    &mut capture_writers,
                     &mut stdout_reader,
                     &mut stderr_reader,
                     &mut stdout,
@@ -5696,6 +5709,36 @@ pub mod process {
     ) -> std::io::Result<(FileDescriptor, FileDescriptor)> {
         while_no_command_spawns(socketpair)
             .map_err(|error| process_capture_setup_error(stream, error))
+    }
+
+    /// The parent's copies of the stdout/stderr capture write ends.
+    ///
+    /// Off Windows they close right after spawn, so EOF on a capture stream
+    /// means every writer the child handed on has gone. On Windows the streams
+    /// are loopback sockets, and when the exiting child holds the last handle
+    /// its exit closes the socket abortively: the reader gets a reset (os error
+    /// 10054) instead of EOF, which failed every captured command, and bytes
+    /// not yet sent can be dropped. So Windows keeps the parent's copies until
+    /// the child is reaped or terminated; the last close is then the parent's
+    /// graceful one, which delivers everything before the end of the stream.
+    struct OutputCaptureWriters(Option<(FileDescriptor, FileDescriptor)>);
+
+    impl OutputCaptureWriters {
+        fn after_spawn(stdout: FileDescriptor, stderr: FileDescriptor) -> Self {
+            #[cfg(windows)]
+            {
+                Self(Some((stdout, stderr)))
+            }
+            #[cfg(not(windows))]
+            {
+                drop((stdout, stderr));
+                Self(None)
+            }
+        }
+
+        fn release(&mut self) {
+            self.0.take();
+        }
     }
 
     fn validate_command_input(stdin: Option<&[u8]>, limit: usize) -> std::io::Result<()> {
@@ -5933,6 +5976,14 @@ pub mod process {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     return Ok(CaptureDrainState::Pending);
                 }
+                // Windows closes a capture socket abortively when its last
+                // holder exits without the parent's graceful close: a killed
+                // child, or a descendant that outlived it. That reset ends
+                // the stream, as EOF does elsewhere (OutputCaptureWriters).
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return Ok(CaptureDrainState::Eof);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -6061,6 +6112,7 @@ pub mod process {
         leader_already_reaped: bool,
         trigger: CommandCleanupTrigger,
         stdin_state: &mut Option<CommandInputState>,
+        capture_writers: &mut OutputCaptureWriters,
         stdout_reader: &mut Option<FileDescriptor>,
         stderr_reader: &mut Option<FileDescriptor>,
         stdout: &mut Vec<u8>,
@@ -6071,6 +6123,9 @@ pub mod process {
         // supervisor failure path stops retaining secret-bearing input and
         // gives a still-running child an immediate EOF opportunity.
         stdin_state.take();
+        // Released before the kill, so once the child is gone no writer of
+        // ours remains and the drain below can reach the end of both streams.
+        capture_writers.release();
         // One shared deadline covers the leader probe, external group-signal
         // helper, direct owned-child kill, reap, and descriptor drain. The
         // helper receives this exact deadline, so its internal 100 ms phases
@@ -6323,6 +6378,24 @@ pub mod process {
         use super::*;
         #[cfg(unix)]
         use crate::runtime_async::CompatRuntime;
+
+        /// A real program's output is captured to its end on every platform.
+        /// On Windows the exiting child closed its capture sockets abortively,
+        /// so every captured command failed with a reset (os error 10054). The
+        /// test binary itself is a program every platform has.
+        #[test]
+        fn captures_a_real_program_to_its_end_on_every_platform() {
+            const NAME: &str = "captures_a_real_program_to_its_end_on_every_platform";
+            let output = Command::new(std::env::current_exe().expect("current test executable"))
+                .args([NAME, "--list"])
+                .stdout_limit(64 * 1024)
+                .stderr_limit(64 * 1024)
+                .output_blocking(Duration::from_secs(30))
+                .expect("listing this test must be captured to its end");
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains(&format!("{NAME}: test")), "{stdout}");
+        }
 
         /// A spawn takes `CAPTURE_DESCRIPTOR_INHERITANCE` shared, so it has
         /// to wait out a creation, which holds it alone. Checked from inside
