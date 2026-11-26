@@ -2632,6 +2632,10 @@ fn sync_directory_for_publication(
     directory: &CapDir,
     expected_identity: LinearRecordSourceIdentity,
 ) -> std::io::Result<()> {
+    // Skipped on Windows: FlushFileBuffers refuses a read-only directory
+    // handle ("Access is denied"), and NTFS journals directory entries
+    // itself, as mmap_store and the publication store assume.
+    #[cfg(not(windows))]
     if let Err(err) = directory.open(".").and_then(|handle| handle.sync_all()) {
         if !matches!(err.raw_os_error(), Some(9 | 22 | 95)) {
             return Err(err);

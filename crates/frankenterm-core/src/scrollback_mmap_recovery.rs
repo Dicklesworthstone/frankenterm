@@ -633,6 +633,9 @@ impl OrphanCandidate {
                 reason: "opened data identity changed during discard",
             });
         }
+        // Skipped on Windows: FlushFileBuffers refuses a read-only directory
+        // handle ("Access is denied"), and NTFS journals the unlink itself.
+        #[cfg(not(windows))]
         if let Err(source) = directory
             .directory
             .open(".")
