@@ -1403,6 +1403,30 @@ impl PaneFile {
         Ok(())
     }
 
+    /// `File::set_len` for a pane file opened for append. Windows gives an
+    /// append handle `FILE_APPEND_DATA` without `FILE_WRITE_DATA`, and
+    /// setting the end of file needs the latter ("Access is denied", os
+    /// error 5), so there the length is set and synced through a second,
+    /// write-only handle to `path`. Appends through `file` then land at the
+    /// new end. Like the rest of this store on Windows, the reopen has no
+    /// file identity check (ft-8r43i.16).
+    fn set_append_file_len(file: &File, path: &Path, len: u64) -> Result<(), MmapStoreError> {
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            file.set_len(len)?;
+        }
+        #[cfg(windows)]
+        {
+            let _ = file;
+            let writer = OpenOptions::new().write(true).open(path)?;
+            Self::revalidate_open_file(path, &writer)?;
+            writer.set_len(len)?;
+            writer.sync_data()?;
+        }
+        Ok(())
+    }
+
     fn revalidate_open_file(path: &Path, file: &File) -> Result<(), MmapStoreError> {
         let handle_metadata = file.metadata()?;
         if !handle_metadata.is_file() {
@@ -1738,7 +1762,7 @@ impl PaneFile {
             // An empty synchronized content log is authoritative for clear.
             // Reset any journal value left by a crash between clearing the log
             // and clearing its sequence sidecar.
-            base_seq_file.set_len(0)?;
+            Self::set_append_file_len(&base_seq_file, &base_seq_path, 0)?;
             base_seq_file.sync_data()?;
             PaneSequenceJournalState {
                 latest: None,
@@ -1865,7 +1889,7 @@ impl PaneFile {
             .expect("checkpoint stage was created");
         Self::harden_open_file_permissions(&stage.file)?;
         Self::revalidate_open_file(&stage.path, &stage.file)?;
-        stage.file.set_len(0)?;
+        Self::set_append_file_len(&stage.file, &stage.path, 0)?;
         let record = format!("{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}\n");
         #[cfg(test)]
         if PANE_SEQUENCE_JOURNAL_FAULT.with(std::cell::Cell::get)
@@ -1972,7 +1996,7 @@ impl PaneFile {
             // batch can leave complete records as well as a partial record.
             // Remove exactly that uncommitted suffix before retrying so the
             // next append cannot duplicate rows or join onto a partial record.
-            self.file.set_len(self.file_len)?;
+            Self::set_append_file_len(&self.file, &self.log_path, self.file_len)?;
             ordered_durability_sync(&self.file)?;
             self.file.seek(SeekFrom::Start(self.file_len))?;
             self.trailing_partial = false;
@@ -2263,14 +2287,14 @@ impl PaneFile {
         self.line_offsets.truncate(keep);
         self.file_len = new_len;
         self.trailing_partial = true;
-        self.file.set_len(new_len)?;
+        Self::set_append_file_len(&self.file, &self.log_path, new_len)?;
         ordered_durability_sync(&self.file)?;
         self.trailing_partial = false;
         Ok(true)
     }
 
     fn clear(&mut self) -> Result<(), MmapStoreError> {
-        self.file.set_len(0)?;
+        Self::set_append_file_len(&self.file, &self.log_path, 0)?;
         self.file.flush()?;
         ordered_durability_sync_data(&self.file)?;
         self.file_len = 0;
@@ -2280,7 +2304,7 @@ impl PaneFile {
         self.line_offsets.clear();
         self.pruned_offsets.clear();
         self.base_seq_journal_needs_checkpoint = true;
-        self.base_seq_file.set_len(0)?;
+        Self::set_append_file_len(&self.base_seq_file, &Self::base_seq_path(&self.log_path), 0)?;
         self.base_seq_file.flush()?;
         ordered_durability_sync_data(&self.base_seq_file)?;
         self.base_seq_journal_len = 0;
@@ -4680,7 +4704,7 @@ mod tests {
         store.append_line(7, "a").unwrap();
         store.append_line(7, "bbb").unwrap();
         let pane = store.panes.get(&7).unwrap();
-        pane.file.set_len(pane.file_len - 1).unwrap();
+        PaneFile::set_append_file_len(&pane.file, &pane.log_path, pane.file_len - 1).unwrap();
         assert_eq!(store.lines_range(7, 0..2, 2, 100).unwrap(), ["a"]);
         assert_eq!(store.line_at(7, 1).unwrap(), None);
 
@@ -4942,7 +4966,7 @@ mod tests {
             }
         }
         let pane = store.panes.get(&7).unwrap();
-        pane.file.set_len(pane.file_len - 3).unwrap();
+        PaneFile::set_append_file_len(&pane.file, &pane.log_path, pane.file_len - 3).unwrap();
         let torn = through(true, 0..64, u64::MAX);
         assert_eq!(torn, through(false, 0..64, u64::MAX));
         assert!(torn.starts_with("Ok("), "{torn}");
@@ -5578,13 +5602,13 @@ mod tests {
         let mut store = file_only_store(dir.path());
         store.append_line(1, "zero").unwrap();
         store.append_line(1, "one").unwrap();
-        store
-            .panes
-            .get_mut(&1)
-            .unwrap()
-            .base_seq_file
-            .set_len(PANE_BASE_SEQ_JOURNAL_MAX_BYTES)
-            .unwrap();
+        let pane = store.panes.get(&1).unwrap();
+        PaneFile::set_append_file_len(
+            &pane.base_seq_file,
+            &PaneFile::base_seq_path(&pane.log_path),
+            PANE_BASE_SEQ_JOURNAL_MAX_BYTES,
+        )
+        .unwrap();
 
         let error = store
             .prune_before(1, 1)
@@ -6615,6 +6639,29 @@ mod tests {
 
         let err = store.tail_lines(999, 10).unwrap_err();
         assert!(matches!(err, MmapStoreError::UnknownPane(999)));
+    }
+
+    #[test]
+    fn append_handle_cuts_keep_appends_at_the_new_end() {
+        // Windows refuses set_len on an append handle (os error 5), which
+        // failed every fresh pane open there; the cut goes through
+        // set_append_file_len on every platform.
+        let dir = temp_dir();
+        let path = dir.path().join("cut.log");
+        let (mut file, created) = PaneFile::open_append_file(&path).unwrap();
+        assert!(created);
+        file.write_all(b"row one\nrow two\n").unwrap();
+        PaneFile::set_append_file_len(&file, &path, 8).unwrap();
+        file.write_all(b"row three\n").unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 18);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "row one\nrow three\n"
+        );
+        PaneFile::set_append_file_len(&file, &path, 0).unwrap();
+        file.write_all(b"fresh\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
     }
 
     // --- Storage mode ---
