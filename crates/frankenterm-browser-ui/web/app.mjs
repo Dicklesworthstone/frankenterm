@@ -3,7 +3,7 @@
 // This page owns all network I/O and DOM events. The WASM FleetViewer owns
 // state and renders frames; FrankenTermWeb paints their patches. The viewer is
 // read-only: nothing here writes to a pane.
-import { createPaneOutput, decodeFrame, mountPaneOutput } from "./pane-output.mjs";
+import { createPaneOutput, decodeFrame, mountPaneOutput, mountPinnedOutputs } from "./pane-output.mjs";
 import { mountHistorySearch } from "./history-panel.mjs";
 
 const REFRESH_MS = 15_000;
@@ -1025,9 +1025,17 @@ export function mountFleetApp({
     }, REFRESH_MS);
   }
 
+  const pinnedOutputs = mountPinnedOutputs({
+    document: doc, apiRoot,
+    createOutput: () => createPaneOutput({
+      apiRoot, EventSourceImpl, setTimer, clearTimer, maxChars: 128 * 1024, maxChunks: 1024,
+    }),
+  });
   const inspector = mountPaneOutput({
     document: doc, apiRoot,
     output: createPaneOutput({ apiRoot, EventSourceImpl, setTimer, clearTimer }),
+    onPin: pinnedOutputs.pin,
+    onOpen: pinnedOutputs.showAll,
     restoreFocus: () => {
       if (active) (viewer ? (textView() ? screenText : canvas) : element("pane-output-id")).focus();
     },
@@ -1222,6 +1230,7 @@ export function mountFleetApp({
       } catch (_) { failModel(); }
     }
     inspector.render();
+    pinnedOutputs.render();
     attention.render();
     scheduleFrame();
   }
@@ -1230,6 +1239,7 @@ export function mountFleetApp({
     active = true;
     activityGeneration += 1;
     inspector.restore();
+    pinnedOutputs.restore();
     updateMode();
     resize();
     startFleet();
@@ -1243,6 +1253,7 @@ export function mountFleetApp({
     if (notifications?.isRequesting()) notifications.disable("Enable notifications again after returning to this tab.");
     stopFleet({ keepNotifications });
     inspector.suspend();
+    pinnedOutputs.suspend();
     historySearch.suspend();
     if (frameHandle !== null) cancelFrame(frameHandle);
     frameHandle = null;
@@ -1257,6 +1268,7 @@ export function mountFleetApp({
     notifications.dispose();
     suspend();
     inspector.close();
+    pinnedOutputs.dispose();
     historySearch.close();
     resizeObserver?.disconnect?.();
     clearTextSelection();
@@ -1269,7 +1281,7 @@ export function mountFleetApp({
     screenText.textContent = "";
     selectionLine.textContent = "";
     element("pane-output-id").value = "";
-    for (const id of [...navigation.keys(), "pane-output-open", "pane-output-submit",
+    for (const id of [...navigation.keys(), "pane-output-open", "pane-output-submit", "pane-output-pin",
       "pane-output-id", "history-search-open", "fleet-text-toggle", "fleet-notifications-toggle"]) element(id).disabled = true;
     doc.documentElement.dataset.viewerReady = "locked";
   }

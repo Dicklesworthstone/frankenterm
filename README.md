@@ -1117,6 +1117,20 @@ Treat these values as opaque tokens. Their versioned form is `event-v1:<epoch>:a
 
 `ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `1`/`2` switch views, `j`/`k` move, `r` refetches, and `Tab` leaves the viewer for the page's buttons. It never writes to a pane.
 
+Open a pane's captured output and choose **Pin pane output** to keep it visible
+while inspecting other agents. Up to three pinned views can accompany the main
+inspector, giving four independent captured-output views. Each pin has its own
+pause/resume, follow, retained-history replay, scroll position, and text selection;
+**Focus pane** expands one pin and Escape returns to the comparison. Pinning a
+verified history result preserves that exact historical capture instead of
+attaching it to a current pane. Live pins begin with new output and can explicitly
+load retained history. Each pin retains at most 128 Ki UTF-16 code units and 1,024
+chunks, with visible gap and truncation notices. Pins stay in this browser tab's
+memory, suspend their streams when the page is hidden, and clear on sign-out.
+The three-pin limit leaves room for HTTP requests alongside the fleet feed and
+main inspector. These are captured-text views; native terminal input and geometry
+remain outside this preview.
+
 ```bash
 RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
 ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:9999/ui/

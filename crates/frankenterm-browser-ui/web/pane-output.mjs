@@ -541,6 +541,21 @@ export function createPaneOutput({
   };
 }
 
+function outputNotices(state, holdingSelection) {
+  const notices = [];
+  if (holdingSelection) notices.push("Output is paused to keep selected text stable. Clear the selection to show any newer received text; Resume continues the stream.");
+  if (state.discardedChars) notices.push(state.capture !== null
+    ? "This captured segment exceeds the view limit; only its bounded suffix is shown."
+    : "Older text was discarded from this bounded view.");
+  if (state.gapNotifications) notices.push(`${state.gapNotifications} capture-gap or bus-lag notifications; continuity is not guaranteed.`);
+  if (state.sequenceDiscontinuities) notices.push(`${state.sequenceDiscontinuities} stored capture sequence discontinuities detected; output between retained segments may be missing. Load retained history to recover what remains.`);
+  if (state.sequenceRestarted) notices.push("Capture sequence restarted or moved backwards; this view may span different capture histories.");
+  if (state.retainedPrefixMissing) notices.push("Retained history starts after the beginning of capture; earlier output is unavailable in this view.");
+  if (state.unanchored) notices.push("Reconnected before a received cursor existed; earlier output may be missing. Load retained history to recover what remains.");
+  if (state.error) notices.push(state.error);
+  return notices;
+}
+
 // Bind native, accessible controls to the same controller exercised by tests.
 // The selected fleet row is sampled only on an explicit Open action. No pane
 // title or capture content is interpreted as markup, a link, or a VT command.
@@ -549,6 +564,8 @@ export function mountPaneOutput({
   apiRoot,
   getSelectedPane,
   restoreFocus,
+  onPin = () => {},
+  onOpen = () => {},
   output = createPaneOutput({ apiRoot }),
 } = {}) {
   const element = (id) => {
@@ -566,6 +583,7 @@ export function mountPaneOutput({
   const pause = element("pane-output-pause");
   const historyButton = element("pane-output-history");
   const closeButton = element("pane-output-close");
+  const pinButton = element("pane-output-pin");
   const openButton = element("pane-output-open");
   const paneInput = element("pane-output-id");
   const paneForm = element("pane-output-form");
@@ -618,21 +636,13 @@ export function mountPaneOutput({
       : "Replace this view by replaying retained history from the beginning; large histories may take time.";
     if (historyButton.title !== historyTitle) historyButton.title = historyTitle;
     historyButton.disabled = historical && (state.status !== "historical" || state.suspended);
+    pinButton.disabled = !opened || state.suspended || (historical && state.status !== "historical");
+    setText(pinButton, historical ? "Pin this capture" : "Pin pane output");
     follow.disabled = historical;
     pause.disabled = historical || state.terminal;
     setText(pause, state.paused ? "Resume" : "Pause");
     pause.setAttribute("aria-pressed", String(state.paused));
-    const notices = [];
-    if (holdingSelection) notices.push("Output is paused to keep selected text stable. Clear the selection to show any newer received text; Resume continues the stream.");
-    if (state.discardedChars) notices.push(historical
-      ? "This captured segment exceeds the view limit; only its bounded suffix is shown."
-      : "Older text was discarded from this bounded view.");
-    if (state.gapNotifications) notices.push(`${state.gapNotifications} capture-gap or bus-lag notifications; continuity is not guaranteed.`);
-    if (state.sequenceDiscontinuities) notices.push(`${state.sequenceDiscontinuities} stored capture sequence discontinuities detected; output between retained segments may be missing. Load retained history to recover what remains.`);
-    if (state.sequenceRestarted) notices.push("Capture sequence restarted or moved backwards; this view may span different capture histories.");
-    if (state.retainedPrefixMissing) notices.push("Retained history starts after the beginning of capture; earlier output is unavailable in this view.");
-    if (state.unanchored) notices.push("Reconnected before a received cursor existed; earlier output may be missing. Load retained history to recover what remains.");
-    if (state.error) notices.push(state.error);
+    const notices = outputNotices(state, holdingSelection);
     setText(warnings, notices.join(" "));
     warnings.hidden = notices.length === 0;
     if (!holdingSelection && transcript.value !== state.text) {
@@ -651,6 +661,7 @@ export function mountPaneOutput({
   }
 
   function presentSelection(message, followLive) {
+    onOpen();
     transcript.setSelectionRange(0, 0);
     paneInput.value = output.snapshot().paneId;
     hint.textContent = message;
@@ -766,6 +777,11 @@ export function mountPaneOutput({
     } else if (state.paneId !== null) show(state.paneId, true);
   });
   closeButton.addEventListener("click", close);
+  pinButton.addEventListener("click", () => {
+    const state = output.snapshot();
+    if (state.paneId === null || state.suspended || (state.capture !== null && state.status !== "historical")) return;
+    onPin({ paneId: state.paneId, capture: state.capture });
+  });
   follow.addEventListener("change", () => {
     if (follow.checked) {
       transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
@@ -798,5 +814,266 @@ export function mountPaneOutput({
     render, openSelected, openCapture, close,
     suspend() { output.suspend(); render(); },
     restore() { output.restore(); render(); },
+  };
+}
+
+// A small, session-owned watchboard for comparing captured output. Each tile
+// uses the same epoch-fenced SSE owner as the inspector. Pins are deliberately
+// memory-only: a numeric capture pane ID is not a durable live-pane identity.
+// Three pins plus the inspector and fleet feed own at most five SSE connections,
+// leaving an HTTP/1 origin connection for session checks and ordinary reads.
+// Each pin retains at most 128 Ki UTF-16 units; no preferences or data persist.
+export function mountPinnedOutputs({
+  document: doc = globalThis.document,
+  apiRoot,
+  createOutput = () => createPaneOutput({ apiRoot, maxChars: 128 * 1024, maxChunks: 1024 }),
+} = {}) {
+  const workspace = doc.getElementById("workspace");
+  const board = doc.getElementById("pinned-output");
+  const title = doc.getElementById("pinned-output-title");
+  const status = doc.getElementById("pinned-output-status");
+  const grid = doc.getElementById("pinned-output-grid");
+  const clear = doc.getElementById("pinned-output-clear");
+  const pinButton = doc.getElementById("pane-output-pin");
+  if ([workspace, board, title, status, grid, clear, pinButton].some((node) => !node)) {
+    throw new Error("missing pinned output controls");
+  }
+  const cards = new Map();
+  const limit = 3;
+  let suspended = true;
+  let disposed = false;
+  let focused = null;
+  let nextId = 0;
+  const text = (node, value) => { if (node.textContent !== value) node.textContent = value; };
+  const make = (tag, className, value) => {
+    const node = doc.createElement(tag);
+    if (className) node.className = className;
+    if (value !== undefined) node.textContent = value;
+    if (tag === "button") node.type = "button";
+    return node;
+  };
+  const restoreControlFocus = () => {
+    // The inspector may have been closed while its pins keep running. Never
+    // return focus to a control inside that now-hidden panel.
+    const target = doc.getElementById("pane-output").hidden
+      ? doc.getElementById("pane-output-id") : pinButton;
+    target.focus();
+  };
+  function layout() {
+    board.hidden = cards.size === 0;
+    workspace.dataset.pinsOpen = String(cards.size > 0);
+    workspace.dataset.pinnedFocus = String(focused !== null);
+    text(title, `Pinned output (${cards.size}/${limit})`);
+    clear.disabled = cards.size === 0 || suspended || disposed;
+    for (const [key, card] of cards) {
+      card.panel.hidden = focused !== null && focused !== key;
+      text(card.focus, focused === key ? "Show all panes" : "Focus pane");
+      card.focus.setAttribute("aria-pressed", String(focused === key));
+    }
+  }
+  function remove(key) {
+    const card = cards.get(key);
+    if (!card) return;
+    card.output.close();
+    card.transcript.value = "";
+    card.panel.remove();
+    cards.delete(key);
+    if (focused === key) focused = null;
+    text(status, cards.size ? "Removed the pinned view. Other captures keep their own position." : "");
+    layout();
+    if (!suspended && !disposed) {
+      const next = cards.values().next().value;
+      if (next) next.focus.focus();
+      else restoreControlFocus();
+    }
+  }
+  function clearAll() {
+    for (const card of cards.values()) {
+      card.output.close();
+      card.transcript.value = "";
+      card.panel.remove();
+    }
+    cards.clear();
+    focused = null;
+    text(status, "");
+    layout();
+  }
+  clear.addEventListener("click", () => {
+    if (suspended || disposed) return;
+    clearAll();
+    restoreControlFocus();
+  });
+
+  function pin({ paneId, capture = null } = {}) {
+    if (suspended || disposed) return false;
+    const pane = unsigned(paneId, U64_MAX);
+    if (pane === null || (capture !== null && capture?.paneId !== pane)) {
+      text(status, "Choose a valid captured pane before pinning.");
+      return false;
+    }
+    const key = capture === null ? `pane:${pane}` : `capture:${capture.captureCursor}`;
+    const existing = cards.get(key);
+    if (existing) {
+      focused = null;
+      layout();
+      text(status, "That view is already pinned. Its capture history and position were preserved.");
+      existing.transcript.focus();
+      return true;
+    }
+    if (cards.size >= limit) {
+      text(status, "Three views are already pinned. Remove one before adding another.");
+      clear.focus();
+      return false;
+    }
+    const output = createOutput();
+    try {
+      if (capture === null) output.select(pane);
+      else output.selectCapture(capture);
+    } catch (_) {
+      output.close();
+      text(status, "The capture could not be pinned. Open the pane or search for that capture again.");
+      return false;
+    }
+    const panel = make("section", "pinned-output-card");
+    const controls = make("div", "output-toolbar");
+    const heading = make("h3", "", capture === null ? `Pane ${pane}` : `Pane ${pane} · segment ${capture.segmentId}`);
+    heading.id = `pinned-output-heading-${++nextId}`;
+    panel.setAttribute("aria-labelledby", heading.id);
+    const focus = make("button", "", "Focus pane");
+    const removeButton = make("button", "", "Remove");
+    removeButton.setAttribute("aria-label", `Remove pinned output for pane ${pane}`);
+    controls.append(heading, focus, removeButton);
+    const actions = make("div", "output-toolbar");
+    const pause = make("button", "", "Pause");
+    const history = make("button", "", "Load retained history");
+    const followLabel = make("label", "", "");
+    const follow = make("input");
+    follow.type = "checkbox";
+    follow.checked = capture === null;
+    followLabel.append(follow, make("span", "", " Follow output"));
+    actions.append(pause, history, followLabel);
+    const stateLine = make("p", "pinned-output-state");
+    stateLine.setAttribute("role", "status");
+    const warnings = make("p", "pinned-output-warnings");
+    warnings.setAttribute("role", "status");
+    const transcript = make("textarea", "pinned-output-text");
+    transcript.readOnly = true;
+    transcript.spellcheck = false;
+    transcript.wrap = "off";
+    transcript.setAttribute("aria-label", capture === null
+      ? `Pinned captured output for pane ${pane}, read-only`
+      : `Pinned captured segment ${capture.segmentId} for pane ${pane}, read-only`);
+    panel.append(controls, stateLine, actions, warnings, transcript);
+    let heldSelection = false;
+    const current = () => !disposed && cards.get(key)?.output === output;
+    function render(force = false) {
+      if (!current()) return;
+      let state = output.takeUpdate() ?? (force ? output.snapshot() : null);
+      if (!state) return;
+      const historical = state.capture !== null;
+      const holdingSelection = !historical && transcript.selectionStart !== transcript.selectionEnd;
+      heldSelection = holdingSelection;
+      if (holdingSelection) {
+        output.pause();
+        state = output.takeUpdate() ?? state;
+        follow.checked = false;
+      }
+      text(stateLine, historical ? `${state.status} · one historical capture · read-only`
+        : `${state.status} · read-only · ${state.history ? "following retained history" : "new output since pinning"}`);
+      text(pause, state.paused ? "Resume" : "Pause");
+      pause.setAttribute("aria-pressed", String(state.paused));
+      pause.disabled = historical || state.terminal || suspended;
+      history.disabled = historical || suspended;
+      history.hidden = historical;
+      follow.disabled = historical || suspended;
+      focus.disabled = removeButton.disabled = suspended;
+      const notices = outputNotices(state, holdingSelection);
+      text(warnings, notices.join(" "));
+      warnings.hidden = notices.length === 0;
+      if (!holdingSelection && transcript.value !== state.text) {
+        const scrollTop = transcript.scrollTop;
+        transcript.value = state.text;
+        if (follow.checked) transcript.scrollTop = transcript.scrollHeight;
+        else transcript.scrollTop = scrollTop;
+      }
+    }
+    cards.set(key, { output, panel, transcript, focus, render });
+    grid.append(panel);
+    focused = null;
+    focus.addEventListener("click", () => {
+      if (!current() || suspended) return;
+      focused = focused === key ? null : key;
+      layout();
+      focus.focus();
+    });
+    removeButton.addEventListener("click", () => { if (current() && !suspended) remove(key); });
+    pause.addEventListener("click", () => {
+      if (!current() || suspended) return;
+      if (output.snapshot().paused) {
+        transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
+        output.resume();
+      } else output.pause();
+      render();
+    });
+    history.addEventListener("click", () => {
+      if (!current() || suspended || capture !== null) return;
+      transcript.setSelectionRange(0, 0);
+      output.select(pane, { retainedHistory: true });
+      follow.checked = true;
+      render();
+    });
+    follow.addEventListener("change", () => {
+      if (!current() || suspended || !follow.checked) return;
+      transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);
+      render(true);
+      transcript.scrollTop = transcript.scrollHeight;
+    });
+    const selectionChanged = () => {
+      if (current() && (heldSelection || transcript.selectionStart !== transcript.selectionEnd)) render(true);
+    };
+    for (const type of ["select", "selectionchange", "pointerup", "keyup"]) {
+      transcript.addEventListener(type, selectionChanged);
+    }
+    transcript.addEventListener("scroll", () => {
+      if (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight > 8) follow.checked = false;
+    });
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && focused === key && current()) {
+        event.preventDefault();
+        focused = null;
+        layout();
+        focus.focus();
+      }
+    });
+    layout();
+    render();
+    text(status, capture === null
+      ? "Pinned a separate view of new captured output. Load retained history on a tile to include earlier capture."
+      : "Pinned the exact historical capture. This tile does not follow a current pane.");
+    transcript.focus();
+    return true;
+  }
+  layout();
+  return {
+    pin,
+    showAll() { if (!disposed) { focused = null; layout(); } },
+    render() { if (!suspended && !disposed) for (const card of cards.values()) card.render(); },
+    suspend() {
+      if (suspended || disposed) return;
+      suspended = true;
+      for (const card of cards.values()) { card.output.suspend(); card.render(true); }
+      layout();
+    },
+    restore() {
+      if (!suspended || disposed) return;
+      suspended = false;
+      for (const card of cards.values()) { card.output.restore(); card.render(true); }
+      layout();
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = suspended = true;
+      clearAll();
+    },
   };
 }

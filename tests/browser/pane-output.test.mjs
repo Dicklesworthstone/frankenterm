@@ -837,7 +837,7 @@ test("invalid bounds are rejected before a source can be opened", () => {
 const CONTROL_IDS = [
   "workspace", "pane-output", "pane-output-title", "pane-output-status", "pane-output-warnings",
   "pane-output-text", "pane-output-follow", "pane-output-pause", "pane-output-history",
-  "pane-output-close", "pane-output-open", "pane-output-id", "pane-output-form", "pane-output-submit",
+  "pane-output-close", "pane-output-pin", "pane-output-open", "pane-output-id", "pane-output-form", "pane-output-submit",
   "pane-output-hint", "pane-output-search", "pane-output-find-form", "pane-output-previous",
   "pane-output-find-status", "terminal",
 ];

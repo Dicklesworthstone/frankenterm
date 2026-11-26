@@ -36,6 +36,10 @@ class Node extends Events {
   set innerHTML(_) { throw new Error("captured data must stay native text"); }
   setAttribute(key, value) { this.attrs[key] = value; }
   append(...children) { for (const child of children) child.parent = this; this.children.push(...children); }
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = null;
+  }
   replaceChildren(...children) { this.children = []; this.append(...children); }
   contains(node) { return node === this || this.children.some((child) => child.contains(node)); }
   focus() { if (!this.hidden && !this.disabled) this.doc.activeElement = this; }
@@ -792,4 +796,254 @@ test("attention evicts a selected item without acting on its replacement", async
   verification.resolve(true); await flush();
   assert.equal(f.requests.length, initialRequests);
   assert.equal(f.get("pane-output-id").value, "");
+});
+
+function pinnedTile(f, index = 0) {
+  const panel = f.get("pinned-output-grid").children[index];
+  const [controls, state, actions, warnings, transcript] = panel.children;
+  return { panel, state, warnings, transcript,
+    focus: controls.children[1], remove: controls.children[2],
+    pause: actions.children[0], history: actions.children[1], follow: actions.children[2].children[0] };
+}
+
+function readyPinned(source, after = "0") {
+  const pane = source.url.searchParams.get("pane_id");
+  const cursor = deltaCursor(after, pane);
+  source.emit("ready", {
+    data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"ready","data":{"pane_id":${pane},"resume_after_id":${after},"cursor":${JSON.stringify(cursor)}}}`,
+    lastEventId: cursor,
+  });
+}
+
+function pinnedDelta(source, id, content, sequence = id) {
+  const pane = source.url.searchParams.get("pane_id");
+  source.emit("delta", {
+    data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":${pane},"segment_id":${id},"seq":${sequence},"content":${JSON.stringify(content)}}}`,
+    lastEventId: deltaCursor(id, pane),
+  });
+}
+
+test("three pins compare exact independent panes while reserving an HTTP connection for session checks", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  const pinned = [];
+  for (const pane of ["7", "8", "18446744073709551615"]) {
+    f.openPane(pane);
+    f.get("pane-output-pin").emit("click");
+    const source = f.sources.at(-1);
+    pinned.push(source);
+    assert.equal(source.url.searchParams.get("pane_id"), pane);
+    assert.equal(source.url.pathname, "/prefix/stream/deltas");
+    assert.equal(source.url.searchParams.has("since_id"), false);
+    readyPinned(source);
+    pinnedDelta(source, "9007199254740993", `<pane ${pane}>`, "0");
+  }
+  f.frame();
+  assert.equal(f.get("pinned-output-title").textContent, "Pinned output (3/3)");
+  assert.equal(f.get("workspace").dataset.pinsOpen, "true");
+  assert.equal(f.get("pinned-output").hidden, false);
+  for (const [index, pane] of ["7", "8", "18446744073709551615"].entries()) {
+    assert.equal(pinnedTile(f, index).transcript.value, `<pane ${pane}>`);
+    assert.equal(pinnedTile(f, index).transcript.readOnly, true);
+  }
+  const beforeDuplicate = f.sources.length;
+  f.get("pane-output-pin").emit("click");
+  assert.equal(f.sources.length, beforeDuplicate, "duplicate pin preserves its cursor and creates no subscription");
+  assert.match(f.get("pinned-output-status").textContent, /already pinned/);
+  f.openPane("9");
+  const beforeCap = f.sources.length;
+  f.get("pane-output-pin").emit("click");
+  assert.equal(f.sources.length, beforeCap, "pin cap is checked before EventSource construction");
+  assert.match(f.get("pinned-output-status").textContent, /Three views/);
+  assert.equal(f.sources.filter((source) => !source.closed).length, 5,
+    "three pins + one inspector + one fleet feed leave a browser HTTP/1 connection for ordinary requests");
+  pinnedDelta(pinned[0], "9007199254740994", " first-only", "1"); f.frame();
+  assert.equal(pinnedTile(f).transcript.value, "<pane 7> first-only");
+  assert.equal(pinnedTile(f, 1).transcript.value, "<pane 8>");
+  assert.equal(f.get("pane-output-id").value, "9", "later navigation cannot retarget pinned output");
+});
+
+test("pin pause, history replay, copy stability and Unicode bounds are independent", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  f.openPane("7"); f.get("pane-output-pin").emit("click");
+  const first = f.sources.at(-1); readyPinned(first); pinnedDelta(first, "1", "first diagnostic");
+  f.openPane("8"); f.get("pane-output-pin").emit("click");
+  const second = f.sources.at(-1); readyPinned(second); pinnedDelta(second, "2", "second diagnostic");
+  f.frame();
+  const a = pinnedTile(f), b = pinnedTile(f, 1);
+  a.transcript.setSelectionRange(0, 5);
+  // An already-admitted chunk may evict the selected prefix before the UI
+  // sees the native selection event. The old displayed text must stay put.
+  pinnedDelta(first, "3", "😀".repeat(80_000));
+  f.frame();
+  assert.equal(first.closed, true);
+  assert.equal(a.transcript.value, "first diagnostic");
+  assert.match(a.warnings.textContent, /selected text stable/);
+  assert.equal(a.pause.textContent, "Resume");
+  assert.equal(second.closed, false);
+  pinnedDelta(second, "4", " continues"); f.frame();
+  assert.equal(b.transcript.value, "second diagnostic continues");
+  a.transcript.setSelectionRange(5, 5); a.transcript.emit("pointerup");
+  assert.equal(a.transcript.value.length, 128 * 1024);
+  assert.ok(a.transcript.value.startsWith("😀") && a.transcript.value.endsWith("😀"));
+  assert.match(a.warnings.textContent, /discarded/);
+  const beforeResume = f.sources.length;
+  a.pause.emit("click");
+  assert.equal(f.sources.length, beforeResume + 1);
+  const resumed = f.sources.at(-1);
+  assert.equal(resumed.url.searchParams.get("cursor"), deltaCursor("3"));
+  assert.equal(resumed.url.searchParams.get("pane_id"), "7");
+  readyPinned(resumed, "3");
+  a.history.emit("click");
+  assert.equal(resumed.closed, true);
+  assert.equal(f.sources.at(-1).url.searchParams.get("since_id"), "0");
+  assert.equal(f.sources.at(-1).url.searchParams.get("pane_id"), "7");
+  assert.equal(a.transcript.value, "");
+  assert.equal(b.transcript.value, "second diagnostic continues");
+});
+
+test("removing a pin retires its retry owner and stale callbacks cannot affect a replacement", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  f.openPane("7"); f.get("pane-output-pin").emit("click");
+  const source = f.sources.at(-1); readyPinned(source); pinnedDelta(source, "1", "private diagnostic"); f.frame();
+  source.readyState = 2; source.emit("error");
+  const pending = [...f.timers.values()].filter((timer) => timer.delay === 1_000);
+  assert.equal(pending.length, 1);
+  const retired = pinnedTile(f);
+  retired.remove.emit("click");
+  assert.equal(retired.transcript.value, "");
+  assert.equal(f.get("pinned-output-grid").children.length, 0);
+  assert.equal(f.get("workspace").dataset.pinsOpen, "false");
+  f.get("pane-output-pin").emit("click");
+  const replacement = f.sources.at(-1); readyPinned(replacement); pinnedDelta(replacement, "2", "replacement");
+  const sourceCount = f.sources.length;
+  pending[0].fn();
+  pinnedDelta(source, "3", "late secret");
+  retired.pause.emit("click"); retired.history.emit("click"); retired.focus.emit("click"); retired.remove.emit("click");
+  f.frame();
+  assert.equal(f.sources.length, sourceCount);
+  assert.equal(pinnedTile(f).transcript.value, "replacement");
+  assert.equal(replacement.closed, false);
+  assert.equal(f.get("pinned-output-grid").children.length, 1);
+});
+
+test("hidden pages suspend every pin and session retirement erases all pinned data", async (t) => {
+  const f = fixture(t, { notifications: true });
+  await f.app.ready; await flush();
+  notificationReady(f.fleetSources()[0]);
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  const sources = [];
+  for (const pane of ["7", "8"]) {
+    f.openPane(pane); f.get("pane-output-pin").emit("click");
+    const source = f.sources.at(-1); sources.push(source);
+    readyPinned(source); pinnedDelta(source, pane, `private ${pane}`);
+  }
+  f.frame();
+  const tiles = [pinnedTile(f), pinnedTile(f, 1)];
+  tiles[0].pause.emit("click");
+  f.visibility("hidden");
+  assert.ok(sources.every((source) => source.closed));
+  assert.equal(f.fleetSources()[0].closed, false, "only opted-in detections stay active in background");
+  const hiddenCount = f.sources.length;
+  f.get("pane-output-pin").emit("click");
+  tiles[1].pause.emit("click"); tiles[1].history.emit("click");
+  assert.equal(f.sources.length, hiddenCount);
+  f.visibility("visible");
+  const restored = f.sources.slice(hiddenCount).filter((source) => source.url.pathname.endsWith("/stream/deltas"));
+  assert.equal(restored.length, 2, "one live pin plus inspector resume; explicitly paused pin stays paused");
+  assert.ok(restored.some((source) => source.url.searchParams.get("cursor") === deltaCursor("8", "8")));
+  assert.equal(tiles[0].pause.textContent, "Resume");
+  pinnedDelta(sources[1], "9", "retired"); f.frame();
+  assert.equal(tiles[1].transcript.value, "private 8");
+  f.app.dispose();
+  assert.equal(f.get("pinned-output-grid").children.length, 0);
+  assert.ok(tiles.every((tile) => tile.transcript.value === ""));
+  assert.ok(f.sources.every((source) => source.closed));
+  await flush(); // The aborted fleet snapshot settles its deadline in finally.
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.get("pane-output-pin").disabled, true);
+  f.app.resume(); tiles[1].pause.emit("click"); f.get("pane-output-pin").emit("click");
+  assert.equal(f.sources.length, hiddenCount + restored.length);
+});
+
+test("pin focus is a local layout and new inspection restores the full workspace", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  for (const pane of ["7", "8"]) { f.openPane(pane); f.get("pane-output-pin").emit("click"); }
+  const a = pinnedTile(f), b = pinnedTile(f, 1);
+  const connections = f.sources.length;
+  const requests = f.requests.length;
+  const inputs = f.viewers[0].inputs.length;
+  a.focus.emit("click");
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "true");
+  assert.equal(a.panel.hidden, false); assert.equal(b.panel.hidden, true);
+  assert.equal(a.focus.textContent, "Show all panes");
+  assert.equal(a.panel.emit("keydown", { key: "Escape" }).prevented, true);
+  assert.equal(b.panel.hidden, false);
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "false");
+  assert.equal(f.sources.length, connections);
+  assert.equal(f.requests.length, requests);
+  assert.equal(f.viewers[0].inputs.length, inputs, "focusing capture tiles never sends terminal/model input");
+  a.focus.emit("click"); f.openPane("9");
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "false");
+  b.focus.emit("click"); b.remove.emit("click");
+  assert.equal(a.panel.hidden, false);
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "false");
+  f.get("pinned-output-clear").emit("click");
+  assert.equal(f.get("pinned-output").hidden, true);
+  assert.equal(f.sources.filter((source) => !source.closed).length, 2, "fleet and inspector retain ownership");
+});
+
+test("removing the last pin returns keyboard focus to a visible control after closing the inspector", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  for (const action of ["remove", "clear"]) {
+    f.openPane("7"); f.get("pane-output-pin").emit("click");
+    const tile = pinnedTile(f);
+    f.get("pane-output-close").emit("click");
+    assert.equal(f.get("pane-output").hidden, true);
+    if (action === "remove") tile.remove.emit("click");
+    else f.get("pinned-output-clear").emit("click");
+    assert.equal(f.get("pinned-output-grid").children.length, 0);
+    assert.equal(f.doc.activeElement, f.get("pane-output-id"));
+  }
+});
+
+test("historical pins read the exact capture once and cannot turn into live pane subscriptions", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  f.get("history-search-open").emit("click");
+  f.get("history-query").value = "needle";
+  f.get("history-search-form").requestSubmit(); await flush();
+  f.get("history-results").children[0].children[2].emit("click");
+  const original = f.sources.at(-1);
+  const beforeLoaded = f.sources.length;
+  f.get("pane-output-pin").emit("click");
+  assert.equal(f.sources.length, beforeLoaded, "unreceived historical captures are not pinnable");
+  readyPinned(original, "2");
+  const frame = { schema: "ft.stream.v1", stream: "deltas", kind: "delta",
+    data: { pane_id: 7, segment_id: 3, seq: 0, captured_at: 1000, content_len: 6, content: "needle" } };
+  original.message("delta", frame, deltaCursor("3")); f.frame();
+  assert.equal(f.get("pane-output-pin").textContent, "Pin this capture");
+  f.get("pane-output-pin").emit("click");
+  const pinned = f.sources.at(-1);
+  assert.equal(pinned.url.searchParams.get("cursor"), deltaCursor("2"));
+  assert.equal(pinned.url.searchParams.has("since_id"), false);
+  readyPinned(pinned, "2"); pinned.message("delta", frame, deltaCursor("3")); f.frame();
+  const tile = pinnedTile(f);
+  assert.equal(tile.transcript.value, "needle");
+  assert.match(tile.state.textContent, /historical.*one historical capture/);
+  assert.equal(tile.pause.disabled, true); assert.equal(tile.history.hidden, true);
+  assert.equal(pinned.closed, true);
+  const count = f.sources.length;
+  tile.pause.emit("click"); tile.history.emit("click");
+  pinnedDelta(pinned, "4", "later private capture"); f.frame();
+  assert.equal(f.sources.length, count);
+  assert.equal(tile.transcript.value, "needle");
+  f.openPane("8"); f.get("pane-output-close").emit("click");
+  assert.equal(tile.transcript.value, "needle");
+  f.visibility("hidden"); f.visibility("visible");
+  assert.equal(f.sources.filter((source) => !source.closed && source.url.pathname.endsWith("/stream/deltas")).length, 0);
 });
