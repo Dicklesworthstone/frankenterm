@@ -40,7 +40,8 @@
 //! - **Descriptor-Relative & Capability-Audited I/O**: Directory handles ([`cap_std::fs::Dir`]) with
 //!   symlink-following disabled (`FollowSymlinks::No` / `O_NOFOLLOW`) bind leaf operations to opened directories.
 //!   Advisory locks coordinate participating publishers; arbitrary same-user directory replacement is outside this contract.
-//! - **Fsync Ordering**: File payloads are flushed (`sync_all`) before atomic rename, followed by directory sync.
+//! - **Fsync Ordering**: File payloads are flushed (`sync_all`) before atomic rename, followed by directory sync
+//!   (skipped on Windows, where a standard user cannot open a drive root writable to flush it).
 
 #![forbid(unsafe_code)]
 
@@ -795,6 +796,12 @@ fn open_directory_hierarchy_nofollow(path: &Path, create: bool) -> Result<Dir, P
 
 /// Persist directory entry changes, including a rename whose earlier caller
 /// lost its reply or received an error from the final directory sync.
+///
+/// Skipped on Windows: `FlushFileBuffers` needs a writable handle, which a
+/// standard user cannot open on a drive root such as `C:\` ("Access is
+/// denied"), and opening a store syncs every ancestor, so every open failed
+/// there. NTFS journals directory entries itself, and `mmap_store` and the
+/// snapshot engine's checkpoint artifacts skip the flush the same way.
 fn sync_directory(directory: &Dir, path: &Path) -> Result<(), PublicationError> {
     #[cfg(test)]
     if DIRECTORY_SYNC_FAILURE.with(|failure| {
@@ -811,10 +818,18 @@ fn sync_directory(directory: &Dir, path: &Path) -> Result<(), PublicationError> 
             std::io::Error::other("injected directory sync failure"),
         ));
     }
-    directory
-        .open(".")
-        .and_then(|file| file.sync_all())
-        .map_err(|error| PublicationError::io(path, error))
+    #[cfg(not(windows))]
+    {
+        directory
+            .open(".")
+            .and_then(|file| file.sync_all())
+            .map_err(|error| PublicationError::io(path, error))
+    }
+    #[cfg(windows)]
+    {
+        let _ = (directory, path);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -823,9 +838,35 @@ thread_local! {
     static DIRECTORY_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Flush an adopted file, which `path` names inside `parent`, and its entry.
+/// Windows flushes only through a writable handle ("Access is denied" on the
+/// read handle adoption uses), so there the file is reopened for writing,
+/// without create or truncate, through `parent`.
 fn sync_adopted_file(file: &File, parent: &Dir, path: &Path) -> Result<(), PublicationError> {
-    file.sync_all()
-        .map_err(|error| PublicationError::io(path, error))?;
+    #[cfg(not(windows))]
+    {
+        file.sync_all()
+            .map_err(|error| PublicationError::io(path, error))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = file;
+        let name = path.file_name().ok_or_else(|| {
+            PublicationError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "adopted file path has no file name",
+                ),
+            )
+        })?;
+        let mut options = OpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        parent
+            .open_with(name, &options)
+            .and_then(|writer| writer.sync_all())
+            .map_err(|error| PublicationError::io(path, error))?;
+    }
     sync_directory(parent, path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
@@ -1486,7 +1527,12 @@ impl SnapshotPublicationStore {
                 file.write_all(&expected)
                     .and_then(|()| file.sync_all())
                     .map_err(|error| PublicationError::io(&stage_path, error))?;
-                Self::publish_object_noreplace(&self.root_dir, &stage_name, STORE_QUOTA_NAME)?;
+                Self::publish_object_noreplace(
+                    &self.root_dir,
+                    &self.root_path,
+                    &stage_name,
+                    STORE_QUOTA_NAME,
+                )?;
                 sync_directory(&self.root_dir, &self.root_path)
             }
             Err(error) => Err(PublicationError::io(&path, error)),
@@ -1646,6 +1692,7 @@ impl SnapshotPublicationStore {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn publish_object_noreplace(
         objects_dir: &Dir,
+        _objects_path: &Path,
         stage_name: &str,
         target_name: &str,
     ) -> Result<(), PublicationError> {
@@ -1679,9 +1726,39 @@ impl SnapshotPublicationStore {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    /// Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, through
+    /// `tempfile`'s `persist_noclobber`, is the atomic no-replace rename. It
+    /// goes by path because there is no handle-relative rename here; same-user
+    /// directory replacement is outside this store's contract. One name before
+    /// and after, as on Unix. A failed rename leaves the stage in place.
+    #[cfg(windows)]
     fn publish_object_noreplace(
         _objects_dir: &Dir,
+        objects_path: &Path,
+        stage_name: &str,
+        target_name: &str,
+    ) -> Result<(), PublicationError> {
+        let stage = tempfile::TempPath::try_from_path(objects_path.join(stage_name))
+            .map_err(|error| PublicationError::io(target_name, error))?;
+        match stage.persist_noclobber(objects_path.join(target_name)) {
+            Ok(()) => Ok(()),
+            Err(mut failure) => {
+                failure.path.disable_cleanup(true);
+                if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Err(PublicationError::AlreadyExists {
+                        path: PathBuf::from(target_name),
+                    })
+                } else {
+                    Err(PublicationError::io(target_name, failure.error))
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    fn publish_object_noreplace(
+        _objects_dir: &Dir,
+        _objects_path: &Path,
         _stage_name: &str,
         target_name: &str,
     ) -> Result<(), PublicationError> {
@@ -2134,10 +2211,16 @@ impl SnapshotPublicationStore {
         drop(stage_file);
 
         // Atomic no-clobber publication + exact-existing adoption
-        match Self::publish_object_noreplace(&self.objects_dir, &stage_name, &target_name) {
+        let objects_path = self.root_path.join(OBJECTS_DIR_NAME);
+        match Self::publish_object_noreplace(
+            &self.objects_dir,
+            &objects_path,
+            &stage_name,
+            &target_name,
+        ) {
             Ok(()) => {
                 // Fsync parent objects directory
-                sync_directory(&self.objects_dir, &self.root_path.join(OBJECTS_DIR_NAME))?;
+                sync_directory(&self.objects_dir, &objects_path)?;
 
                 Ok(ObjectPublicationReceipt {
                     object_id: object.object_id.clone(),

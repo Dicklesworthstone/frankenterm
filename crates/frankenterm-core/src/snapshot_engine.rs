@@ -13077,6 +13077,7 @@ fn acquire_checkpoint_artifact_publication_lock(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_checkpoint_artifact_noreplace(
     parent: &cap_std::fs::Dir,
+    _parent_path: &Path,
     staging: &Path,
     target: &Path,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
@@ -13100,16 +13101,43 @@ fn publish_checkpoint_artifact_noreplace(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, through
+/// `tempfile`'s `persist_noclobber`, is the atomic no-replace rename. It goes
+/// by path (`parent_path` names `parent`), since there is no handle-relative
+/// rename here. A failed rename leaves the stage in place, as on Unix.
+#[cfg(windows)]
 fn publish_checkpoint_artifact_noreplace(
     _parent: &cap_std::fs::Dir,
+    parent_path: &Path,
+    staging: &Path,
+    target: &Path,
+) -> Result<(), CheckpointScrollbackArtifactError> {
+    let stage = tempfile::TempPath::try_from_path(parent_path.join(staging))
+        .map_err(CheckpointScrollbackArtifactError::Io)?;
+    match stage.persist_noclobber(parent_path.join(target)) {
+        Ok(()) => Ok(()),
+        Err(mut failure) => {
+            failure.path.disable_cleanup(true);
+            if failure.error.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(CheckpointScrollbackArtifactError::AlreadyExists)
+            } else {
+                Err(CheckpointScrollbackArtifactError::Io(failure.error))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn publish_checkpoint_artifact_noreplace(
+    _parent: &cap_std::fs::Dir,
+    _parent_path: &Path,
     _staging: &Path,
     _target: &Path,
 ) -> Result<(), CheckpointScrollbackArtifactError> {
     checkpoint_artifact_noreplace_unsupported()
 }
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 fn checkpoint_artifact_noreplace_unsupported() -> Result<(), CheckpointScrollbackArtifactError> {
     Err(CheckpointScrollbackArtifactError::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -13305,6 +13333,7 @@ fn enroll_recovery_key_with_hook(
         receipt_file.sync_all()?;
         publish_checkpoint_artifact_noreplace(
             &directory,
+            &parent_path.join(&leaf),
             Path::new(RECOVERY_ENROLLMENT_RECEIPT_STAGE),
             Path::new(RECOVERY_ENROLLMENT_RECEIPT),
         )?;
@@ -13920,7 +13949,7 @@ fn publish_checkpoint_artifact_bytes_with_fault(
     let staging_name = checkpoint_artifact_staging_name(&leaf);
     let staging = Path::new(&staging_name);
     let mut file = open_or_resume_checkpoint_artifact_staging(&parent, staging, bytes, fault)?;
-    match publish_checkpoint_artifact_noreplace(&parent, staging, &leaf) {
+    match publish_checkpoint_artifact_noreplace(&parent, &parent_path, staging, &leaf) {
         Ok(()) => {}
         Err(CheckpointScrollbackArtifactError::AlreadyExists) => {
             if checkpoint_artifact_existing_target_matches(&parent, &leaf, bytes)? {
