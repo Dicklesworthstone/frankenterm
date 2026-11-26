@@ -10159,26 +10159,6 @@ impl StorageHandle {
         .await
     }
 
-    /// Greatest currently retained segment ID in the requested pane scope,
-    /// or zero when it is empty. A fresh tail subscriber captures this after
-    /// subscribing and then scans by ID, without using wall-clock timestamps
-    /// as an arrival boundary. This is not a retention or database-epoch proof.
-    pub async fn get_segment_high_water_id_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        pane_id: Option<u64>,
-    ) -> Result<i64> {
-        Self::checkpoint_storage_operation(cx, "get_segment_high_water_id")?;
-        let db_path = Arc::clone(&self.db_path);
-
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_backend(db_path.as_str(), |backend| {
-                query_segment_high_water_id_backend(backend, pane_id)
-            })
-        })
-        .await
-    }
-
     /// Read output-stream identity, its durable allocation high-water mark,
     /// and the retained tail in the requested pane scope in one statement.
     /// The global high-water mark is validation authority, not a pane cursor.
@@ -36520,33 +36500,6 @@ fn query_segments_stream_page_backend(
     Ok(SegmentStreamPage { segments, snapshot })
 }
 
-fn query_segment_high_water_id_backend(
-    backend: &dyn StorageBackend,
-    pane_id: Option<u64>,
-) -> Result<i64> {
-    let (sql, params) = match pane_id {
-        Some(pane_id) => (
-            "SELECT COALESCE(MAX(id), 0) FROM output_segments WHERE pane_id = ?1",
-            vec![ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?)],
-        ),
-        None => (
-            "SELECT COALESCE(MAX(id), 0) FROM output_segments",
-            Vec::new(),
-        ),
-    };
-    let row = backend
-        .query_row_typed(sql, &params)
-        .map_err(|err| storage_backend_error("Query segment high-water ID", err))?
-        .ok_or_else(|| StorageError::Database("Missing segment high-water ID".to_string()))?;
-    let high_water_id = RowReader::new(&row)
-        .i64(0)
-        .map_err(|err| storage_backend_error("Read segment high-water ID", err))?;
-    if high_water_id < 0 {
-        return Err(StorageError::Database("Invalid segment high-water ID".to_string()).into());
-    }
-    Ok(high_water_id)
-}
-
 fn build_segment_scan_backend_where(
     query: &SegmentScanQuery,
     time_column: &str,
@@ -39907,33 +39860,6 @@ fn seed_segment_embedding_backend(
         ],
     )
     .unwrap();
-}
-
-#[test]
-fn segment_high_water_id_is_scoped_and_independent_of_capture_time() {
-    let backend = memory_backend();
-    assert_eq!(query_segment_high_water_id_backend(&backend, None).unwrap(), 0);
-    assert_eq!(query_segment_high_water_id_backend(&backend, Some(7)).unwrap(), 0);
-    seed_pane_backend(&backend, 7, 1_000);
-    seed_pane_backend(&backend, 8, 1_000);
-    let first = seed_segment_backend(&backend, 7, 0, "before clock rollback", i64::MAX);
-    let second = seed_segment_backend(&backend, 7, 1, "after clock rollback", i64::MIN);
-    let other_pane = seed_segment_backend(&backend, 8, 0, "other pane", 0);
-    assert!(first < second && second < other_pane);
-    assert_eq!(
-        query_segment_high_water_id_backend(&backend, Some(7)).unwrap(),
-        second
-    );
-    assert_eq!(
-        query_segment_high_water_id_backend(&backend, Some(8)).unwrap(),
-        other_pane
-    );
-    assert_eq!(
-        query_segment_high_water_id_backend(&backend, None).unwrap(),
-        other_pane
-    );
-    assert_eq!(query_segment_high_water_id_backend(&backend, Some(9)).unwrap(), 0);
-    assert!(query_segment_high_water_id_backend(&backend, Some(u64::MAX)).is_err());
 }
 
 #[test]
