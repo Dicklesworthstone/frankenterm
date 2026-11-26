@@ -842,11 +842,13 @@ SEE ALSO:
         command: WorkflowCommands,
     },
 
-    /// Mission control commands (plan/run/status/explain/pause/resume/abort)
+    /// Mission planning, bounded pane execution, and lifecycle controls
     #[command(after_help = r#"EXAMPLES:
     ft mission plan                    Validate mission contract and compute hash
-    ft mission run                     Advance mission into active execution state
-    ft mission status                  Show mission lifecycle + assignment summary
+    ft mission run                     Record a run request in the mission lifecycle
+    ft mission status -f json          Read lifecycle, assignments and exact revision token
+    ft mission dispatch <id> --expected-token '<token>' --dry-run
+    ft mission drive --expected-token '<token>' --max-assignments 10 --dry-run
     ft mission explain                 Show legal lifecycle transitions and contracts
     ft mission pause --reason overload  Pause active mission dispatch
     ft mission resume                  Resume blocked/retry-pending mission state
@@ -854,7 +856,10 @@ SEE ALSO:
 
 NOTES:
     Mission state defaults to .ft/mission/active.json inside the workspace.
-    Use --mission-file to operate on an explicit mission artifact."#)]
+    Use --mission-file to operate on an explicit mission artifact.
+    Remove --dry-run to execute the selected, policy-gated pane actions.
+    Drive stops before the next action when its admission budget expires;
+    an action already running may finish after that deadline."#)]
     Mission {
         #[command(subcommand)]
         command: MissionCommands,
@@ -6452,6 +6457,33 @@ enum MissionCommands {
         mission_file: Option<PathBuf>,
 
         /// Check assignment eligibility without publishing a transaction or executing it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Drive a bounded prefix of explicit pane assignments in stored order
+    Drive {
+        /// Exact revision_token JSON from mission status; concurrent changes stop the drive
+        #[arg(long)]
+        expected_token: String,
+
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Maximum assignments admitted by this invocation (1-100)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=100))]
+        max_assignments: u32,
+
+        /// Stop admitting actions after this many ms; an in-flight action may finish later
+        #[arg(long, default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
+        admission_budget_ms: u64,
+
+        /// Preview the selected prefix and blockers without publishing or executing actions
         #[arg(long)]
         dry_run: bool,
 
@@ -83407,6 +83439,18 @@ async fn run_mission_assignment_dispatch(
     let assignment_id = AssignmentId(assignment_id.to_string());
     let expected = compile_assignment_dispatch(mutation.mission(), &assignment_id)
         .map_err(mission_assignment_dispatch_error)?;
+    if mutation.mission().revision == u64::MAX {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_VALIDATION,
+            error_code: "mission.dispatch.revision_exhausted",
+            message: "The mission revision cannot represent the action's success checkpoint."
+                .to_string(),
+            hint: Some(
+                "No transaction was published. Inspect mission status before continuing."
+                    .to_string(),
+            ),
+        });
+    }
     let action = mission_assignment_action_summary(&expected)?;
     let mut data = serde_json::json!({
         "command": "dispatch",
@@ -83506,6 +83550,469 @@ async fn run_mission_assignment_dispatch(
         "  Success confirms the pane action; inspect agent output for task completion.".to_string(),
     ];
     Ok((data, plain_lines))
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Clone, Copy)]
+struct MissionDriveRequest<'a> {
+    mission_path: &'a Path,
+    expected_token: &'a str,
+    max_assignments: u32,
+    admission_budget_ms: u64,
+    dry_run: bool,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug, serde::Serialize)]
+struct MissionDriveActionReceipt {
+    assignment_id: frankenterm_core::plan::AssignmentId,
+    tx_id: String,
+    contract_file: String,
+    replayed: bool,
+    /// Revisions remain decimal strings throughout the operator surface.
+    revision: String,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug, serde::Serialize)]
+struct MissionDriveSelectedAction {
+    assignment_id: frankenterm_core::plan::AssignmentId,
+    tx_id: frankenterm_core::plan::TxId,
+    action: serde_json::Value,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug, serde::Serialize)]
+struct MissionDriveProgress {
+    command: &'static str,
+    mission_file: String,
+    execution_scope: &'static str,
+    dry_run: bool,
+    status: &'static str,
+    plan: frankenterm_core::mission_dispatch::MissionDrivePlan,
+    selected_actions: Vec<MissionDriveSelectedAction>,
+    committed_actions: Vec<MissionDriveActionReceipt>,
+    attempted_assignments: usize,
+    /// Last token confirmed by this invocation, not a claim about concurrent state.
+    last_confirmed_token: frankenterm_core::tx_execution::MissionRevisionToken,
+    stopped_assignment: Option<frankenterm_core::plan::AssignmentId>,
+    admission_budget_ms: u64,
+    elapsed_ms: u64,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug)]
+struct MissionDriveCommandOutput {
+    progress: MissionDriveProgress,
+    error: Option<MissionCommandError>,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn mission_drive_receipt_error() -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code: "mission.drive.receipt_invalid",
+        message: "The assignment response did not prove the expected revision transition."
+            .to_string(),
+        hint: Some(
+            "No further assignment was admitted. Inspect mission status and the retained transaction before retrying; the last attempt may already have committed."
+                .to_string(),
+        ),
+    }
+}
+
+/// Accept only the exact revision successor produced by our own dispatch.
+#[cfg(feature = "subprocess-bridge")]
+fn mission_drive_accept_dispatch(
+    data: serde_json::Value,
+    assignment_id: &frankenterm_core::plan::AssignmentId,
+    previous: &frankenterm_core::tx_execution::MissionRevisionToken,
+) -> Result<
+    (
+        MissionDriveActionReceipt,
+        frankenterm_core::tx_execution::MissionRevisionToken,
+    ),
+    MissionCommandError,
+> {
+    #[derive(serde::Deserialize)]
+    struct Mutation {
+        previous: frankenterm_core::tx_execution::MissionRevisionToken,
+        current: frankenterm_core::tx_execution::MissionRevisionToken,
+        changed: bool,
+        durability: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Dispatch {
+        status: String,
+        assignment_id: frankenterm_core::plan::AssignmentId,
+        tx_id: String,
+        contract_file: String,
+        replayed: bool,
+        mutation: Mutation,
+    }
+    let dispatch: Dispatch =
+        serde_json::from_value(data).map_err(|_| mission_drive_receipt_error())?;
+    let current = &dispatch.mutation.current;
+    if dispatch.status != "action_committed"
+        || dispatch.assignment_id != *assignment_id
+        || dispatch.tx_id.is_empty()
+        || dispatch.contract_file.is_empty()
+        || dispatch.mutation.previous != *previous
+        || !dispatch.mutation.changed
+        || dispatch.mutation.durability != "file_and_directory_synced"
+        || current.mission_id != previous.mission_id
+        || current.generation != previous.generation
+        || Some(current.revision) != previous.revision.checked_add(1)
+        || current.content_sha256 == previous.content_sha256
+        || current.content_sha256.len() != 64
+        || !current
+            .content_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(mission_drive_receipt_error());
+    }
+    let receipt = MissionDriveActionReceipt {
+        assignment_id: dispatch.assignment_id,
+        tx_id: dispatch.tx_id,
+        contract_file: dispatch.contract_file,
+        replayed: dispatch.replayed,
+        revision: current.revision.to_string(),
+    };
+    Ok((receipt, dispatch.mutation.current))
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn mission_drive_elapsed_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "subprocess-bridge")]
+async fn run_mission_drive(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
+    request: MissionDriveRequest<'_>,
+) -> Result<MissionDriveCommandOutput, MissionCommandError> {
+    let started = Instant::now();
+    run_mission_drive_with_boundary(
+        layout,
+        config,
+        config_path,
+        request,
+        |_, _| {},
+        || started.elapsed(),
+    )
+    .await
+}
+
+/// The same driver is used by production and boundary-race tests. The observer
+/// does not replace dispatch; each action still traverses the real durable path.
+#[cfg(feature = "subprocess-bridge")]
+async fn run_mission_drive_with_boundary<Before, Elapsed>(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
+    request: MissionDriveRequest<'_>,
+    mut before_assignment: Before,
+    mut elapsed: Elapsed,
+) -> Result<MissionDriveCommandOutput, MissionCommandError>
+where
+    Before: FnMut(usize, &frankenterm_core::tx_execution::MissionRevisionToken),
+    Elapsed: FnMut() -> Duration,
+{
+    use frankenterm_core::mission_dispatch::{MissionDriveStop, compile_mission_drive};
+
+    if !(1..=3_600_000).contains(&request.admission_budget_ms) {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.drive.invalid_admission_budget",
+            message: "Admission budget must be between 1 and 3600000 milliseconds.".to_string(),
+            hint: None,
+        });
+    }
+    let mutation =
+        acquire_mission_mutation(layout, request.mission_path, Some(request.expected_token))?;
+    let plan =
+        compile_mission_drive(mutation.mission(), request.max_assignments).map_err(|error| {
+            MissionCommandError {
+                exit_code: MISSION_EXIT_VALIDATION,
+                error_code: error.code(),
+                message: error.to_string(),
+                hint: Some(
+                    "Inspect 'ft mission status -f json' before driving assignments.".to_string(),
+                ),
+            }
+        })?;
+    let selected_actions = plan
+        .assignment_ids
+        .iter()
+        .map(|assignment_id| {
+            let contract = frankenterm_core::mission_dispatch::compile_assignment_dispatch(
+                mutation.mission(),
+                assignment_id,
+            )
+            .map_err(mission_assignment_dispatch_error)?;
+            let action = mission_assignment_action_summary(&contract)?;
+            Ok(MissionDriveSelectedAction {
+                assignment_id: assignment_id.clone(),
+                tx_id: contract.intent.tx_id,
+                action,
+            })
+        })
+        .collect::<Result<Vec<_>, MissionCommandError>>()?;
+    let initial_token =
+        frankenterm_core::tx_execution::MissionRevisionToken::from_mission(mutation.mission())
+            .map_err(mission_store_error)?;
+    if initial_token
+        .revision
+        .checked_add(plan.assignment_ids.len() as u64)
+        .is_none()
+    {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_VALIDATION,
+            error_code: "mission.drive.revision_exhausted",
+            message: "The mission revision cannot represent all selected action checkpoints."
+                .to_string(),
+            hint: Some(
+                "No assignment was dispatched. Inspect mission status before continuing."
+                    .to_string(),
+            ),
+        });
+    }
+    mutation.verify_current().map_err(mission_store_error)?;
+    // Release the initial snapshot lock. Every action reacquires it with only
+    // the token we own, allowing an accepted pause/abort to fence later work.
+    drop(mutation);
+    let mut progress = MissionDriveProgress {
+        command: "drive",
+        mission_file: request.mission_path.display().to_string(),
+        execution_scope: "bounded_assignment_actions",
+        dry_run: request.dry_run,
+        status: "preview_ready",
+        plan,
+        selected_actions,
+        committed_actions: Vec::new(),
+        attempted_assignments: 0,
+        last_confirmed_token: initial_token,
+        stopped_assignment: None,
+        admission_budget_ms: request.admission_budget_ms,
+        elapsed_ms: mission_drive_elapsed_ms(elapsed()),
+    };
+    if let MissionDriveStop::Blocked {
+        assignment_id,
+        error_code,
+    } = &progress.plan.stop
+    {
+        progress.stopped_assignment = Some(assignment_id.clone());
+        progress.status = "planning_blocked";
+        let error = MissionCommandError {
+            exit_code: MISSION_EXIT_VALIDATION,
+            error_code: "mission.drive.blocked",
+            message: format!(
+                "Drive preflight refused assignment {}: {}. No assignment was dispatched.",
+                assignment_id.0, error_code
+            ),
+            hint: Some(
+                "Resolve the reported blocker, inspect mission status, and preview again with its exact revision token."
+                    .to_string(),
+            ),
+        };
+        return Ok(MissionDriveCommandOutput {
+            progress,
+            error: Some(error),
+        });
+    }
+    if request.dry_run {
+        return Ok(MissionDriveCommandOutput {
+            progress,
+            error: None,
+        });
+    }
+
+    let selected = progress.plan.assignment_ids.clone();
+    let budget = Duration::from_millis(request.admission_budget_ms);
+    for (index, assignment_id) in selected.into_iter().enumerate() {
+        before_assignment(index, &progress.last_confirmed_token);
+        let observed_elapsed = elapsed();
+        progress.elapsed_ms = mission_drive_elapsed_ms(observed_elapsed);
+        if observed_elapsed >= budget {
+            progress.status = "admission_budget_reached";
+            progress.stopped_assignment = Some(assignment_id);
+            return Ok(MissionDriveCommandOutput {
+                progress,
+                error: Some(MissionCommandError {
+                    exit_code: MISSION_EXIT_VALIDATION,
+                    error_code: "mission.drive.admission_budget_exhausted",
+                    message: "The drive stopped before admitting its next assignment because its time budget expired."
+                        .to_string(),
+                    hint: Some(
+                        "Committed actions remain saved. Inspect mission status and resume with a fresh exact token; an action already running is not interrupted by this budget."
+                            .to_string(),
+                    ),
+                }),
+            });
+        }
+        let token = match serde_json::to_string(&progress.last_confirmed_token) {
+            Ok(token) => token,
+            Err(_) => {
+                progress.status = "dispatch_stopped";
+                progress.stopped_assignment = Some(assignment_id);
+                return Ok(MissionDriveCommandOutput {
+                    progress,
+                    error: Some(mission_drive_receipt_error()),
+                });
+            }
+        };
+        progress.attempted_assignments += 1;
+        let dispatched = run_mission_assignment_dispatch(
+            layout,
+            config,
+            config_path,
+            request.mission_path,
+            &assignment_id.0,
+            &token,
+            false,
+        )
+        .await
+        .and_then(|(data, _)| {
+            mission_drive_accept_dispatch(data, &assignment_id, &progress.last_confirmed_token)
+        });
+        progress.elapsed_ms = mission_drive_elapsed_ms(elapsed());
+        match dispatched {
+            Ok((receipt, current)) => {
+                progress.committed_actions.push(receipt);
+                progress.last_confirmed_token = current;
+            }
+            Err(error) => {
+                progress.status = "dispatch_stopped";
+                progress.stopped_assignment = Some(assignment_id);
+                return Ok(MissionDriveCommandOutput {
+                    progress,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+    progress.status = if progress.plan.remaining_assignments == 0 {
+        "queue_drained"
+    } else {
+        "assignment_limit_reached"
+    };
+    progress.elapsed_ms = mission_drive_elapsed_ms(elapsed());
+    Ok(MissionDriveCommandOutput {
+        progress,
+        error: None,
+    })
+}
+
+/// Errors retain all confirmed progress instead of discarding it in the usual
+/// mission error envelope. This response owns no mission or transaction locks.
+#[cfg(feature = "subprocess-bridge")]
+fn mission_drive_output_envelope(output: &MissionDriveCommandOutput) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "ok": output.error.is_none(),
+        "data": output.progress,
+    });
+    envelope["data"]["committed_count"] =
+        serde_json::json!(output.progress.committed_actions.len());
+    envelope["data"]["remaining_unconfirmed"] = serde_json::json!(
+        output
+            .progress
+            .plan
+            .unresolved_assignments
+            .saturating_sub(output.progress.committed_actions.len())
+    );
+    if let Some(error) = &output.error {
+        envelope["error"] = serde_json::json!(error.message);
+        envelope["error_code"] = serde_json::json!(error.error_code);
+        envelope["exit_code"] = serde_json::json!(error.exit_code);
+        envelope["hint"] = serde_json::json!(error.hint);
+    }
+    envelope
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn emit_mission_drive_output(
+    format: MissionCommandOutputFormat,
+    output: MissionDriveCommandOutput,
+) -> anyhow::Result<()> {
+    match format {
+        MissionCommandOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&mission_drive_output_envelope(&output))?
+            );
+        }
+        MissionCommandOutputFormat::Plain => {
+            let progress = &output.progress;
+            println!("Mission drive: {}", progress.status);
+            println!("  File: {}", progress.mission_file);
+            println!(
+                "  Selected: {}; committed: {}; attempted: {}",
+                progress.plan.assignment_ids.len(),
+                progress.committed_actions.len(),
+                progress.attempted_assignments
+            );
+            println!(
+                "  Remaining unconfirmed from initial queue: {}",
+                progress
+                    .plan
+                    .unresolved_assignments
+                    .saturating_sub(progress.committed_actions.len())
+            );
+            println!(
+                "  Admission budget: {}ms; elapsed: {}ms",
+                progress.admission_budget_ms, progress.elapsed_ms
+            );
+            for receipt in &progress.committed_actions {
+                println!(
+                    "  Committed {} at revision {}{}",
+                    receipt.assignment_id,
+                    receipt.revision,
+                    if receipt.replayed {
+                        " (durable replay)"
+                    } else {
+                        ""
+                    }
+                );
+                println!("    Transaction: {}", receipt.contract_file);
+            }
+            if let Some(assignment_id) = &progress.stopped_assignment {
+                println!("  Stopped before further work at assignment: {assignment_id}");
+            }
+            if progress.dry_run {
+                for selected in &progress.selected_actions {
+                    println!(
+                        "  Selected {}: {}; pane: {}",
+                        selected.assignment_id,
+                        selected.action["kind"].as_str().unwrap_or("unknown"),
+                        selected.action["pane_id"]
+                    );
+                }
+                println!(
+                    "  Preview only; live policy, approval and target checks run at dispatch."
+                );
+            } else {
+                println!(
+                    "  Saved outcomes confirm pane actions, not completion of the agent's task."
+                );
+            }
+            println!("  The last confirmed token may be stale after concurrent control changes.");
+            if let Some(error) = &output.error {
+                eprintln!("Error: {}", error.message);
+                eprintln!("Code: {}", error.error_code);
+                if let Some(hint) = &error.hint {
+                    eprintln!("Hint: {hint}");
+                }
+            }
+        }
+    }
+    if let Some(error) = output.error {
+        // All per-action guards were dropped before producing this value.
+        std::process::exit(error.exit_code);
+    }
+    Ok(())
 }
 
 async fn handle_mission_command(
@@ -84009,6 +84516,60 @@ async fn handle_mission_command(
                 }
             }
             emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Drive {
+            expected_token,
+            mission_file,
+            max_assignments,
+            admission_budget_ms,
+            dry_run,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            #[cfg(feature = "subprocess-bridge")]
+            {
+                let mission_path = resolve_mission_file_path(layout, mission_file);
+                let output = run_mission_drive(
+                    layout,
+                    config,
+                    config_path,
+                    MissionDriveRequest {
+                        mission_path: &mission_path,
+                        expected_token: &expected_token,
+                        max_assignments,
+                        admission_budget_ms,
+                        dry_run,
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| emit_mission_error(output_format, error));
+                emit_mission_drive_output(output_format, output)?;
+            }
+            #[cfg(not(feature = "subprocess-bridge"))]
+            {
+                let _ = (
+                    expected_token,
+                    mission_file,
+                    max_assignments,
+                    admission_budget_ms,
+                    dry_run,
+                    config,
+                    config_path,
+                );
+                emit_mission_error(
+                    output_format,
+                    MissionCommandError {
+                        exit_code: MISSION_EXIT_VALIDATION,
+                        error_code: "mission.drive.feature_unavailable",
+                        message: "Mission driving is unavailable in this build.".to_string(),
+                        hint: Some(
+                            "Use a default build or enable the subprocess-bridge feature."
+                                .to_string(),
+                        ),
+                    },
+                );
+            }
         }
 
         MissionCommands::Dispatch {
@@ -108013,6 +108574,729 @@ mod tests {
         )
         .expect("write mission fixture");
         (dir, layout, path)
+    }
+
+    #[test]
+    fn mission_drive_cli_requires_token_and_bounds_admission() {
+        for args in [
+            vec!["ft", "mission", "drive"],
+            vec!["ft", "mission", "drive", "--dry-run"],
+            vec![
+                "ft",
+                "mission",
+                "drive",
+                "--expected-token",
+                "{}",
+                "--max-assignments",
+                "0",
+            ],
+            vec![
+                "ft",
+                "mission",
+                "drive",
+                "--expected-token",
+                "{}",
+                "--max-assignments",
+                "101",
+            ],
+            vec![
+                "ft",
+                "mission",
+                "drive",
+                "--expected-token",
+                "{}",
+                "--admission-budget-ms",
+                "0",
+            ],
+            vec![
+                "ft",
+                "mission",
+                "drive",
+                "--expected-token",
+                "{}",
+                "--admission-budget-ms",
+                "3600001",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "drive",
+            "--expected-token",
+            "{}",
+            "--dry-run",
+            "-f",
+            "json",
+        ])
+        .expect("bounded drive arguments");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Drive {
+                        expected_token,
+                        max_assignments,
+                        admission_budget_ms,
+                        dry_run,
+                        format,
+                        ..
+                    },
+            }) => {
+                assert_eq!(expected_token, "{}");
+                assert_eq!(max_assignments, 10);
+                assert_eq!(admission_budget_ms, 300_000);
+                assert!(dry_run);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected mission drive"),
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn mission_drive_fixture(
+        count: usize,
+    ) -> (
+        tempfile::TempDir,
+        frankenterm_core::config::WorkspaceLayout,
+        PathBuf,
+        String,
+    ) {
+        use frankenterm_core::plan::{
+            ApprovalState, AssignmentId, CandidateActionId, MissionLifecycleState, StepAction,
+        };
+
+        let (dir, layout, path) = mission_lifecycle_fixture();
+        let mut mission = sample_cli_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        // Exercise exact decimal token handoff above JavaScript's integer range.
+        mission.revision = 9_007_199_254_740_993;
+        let candidate = mission.candidates[0].clone();
+        let assignment = mission.assignments[0].clone();
+        mission.candidates = Vec::new();
+        mission.assignments = Vec::new();
+        for index in 0..count {
+            let mut candidate = candidate.clone();
+            candidate.candidate_id = CandidateActionId(format!("candidate:drive-{index}"));
+            candidate.action = StepAction::SendText {
+                pane_id: 7 + u64::try_from(index).expect("small fixture index"),
+                text: format!("private-drive-payload-{index}"),
+                paste_mode: Some(false),
+            };
+            let mut assignment = assignment.clone();
+            assignment.assignment_id = AssignmentId(format!("assignment:drive-{index}"));
+            assignment.candidate_id = candidate.candidate_id.clone();
+            assignment.approval_state = ApprovalState::NotRequired;
+            assignment.outcome = None;
+            mission.candidates.push(candidate);
+            mission.assignments.push(assignment);
+        }
+        mission.validate().expect("valid drive fixture");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&mission).expect("mission JSON"),
+        )
+        .expect("write drive fixture");
+        let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+            .expect("exact drive token");
+        (
+            dir,
+            layout,
+            path,
+            serde_json::to_string(&token).expect("token JSON"),
+        )
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn seed_mission_drive_commits(
+        layout: &frankenterm_core::config::WorkspaceLayout,
+        path: &Path,
+        token: &str,
+        assignment_ids: &[&str],
+    ) {
+        let mutation = acquire_mission_mutation(layout, path, Some(token))
+            .expect("lock mission for durable recovery fixtures");
+        for assignment_id in assignment_ids {
+            let assignment_id = frankenterm_core::plan::AssignmentId((*assignment_id).to_string());
+            let (contract_lock, mut contract) = mutation
+                .publish_assignment_dispatch(&assignment_id)
+                .expect("publish real durable assignment slot");
+            // Seed the actual durable engine/ledger. This proves the driver's
+            // recovery and checkpoint wiring, not live pane delivery.
+            execute_tx_run_with_executor(
+                frankenterm_core::tx_execution::SyntheticStepExecutor,
+                contract_lock.authoritative_path(),
+                Some(&contract_lock),
+                &mut contract,
+                frankenterm_core::plan::MissionKillSwitchLevel::Off,
+                false,
+                None,
+                false,
+                mission_now_ms(),
+            )
+            .expect("persist durable unit-executor success");
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_preview_is_bounded_payload_free_and_has_no_execution_effects() {
+        run_async_test(async {
+            let (_dir, layout, path, token) = mission_drive_fixture(2);
+            let before = std::fs::read(&path).expect("original mission");
+            let output = run_mission_drive(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 1,
+                    admission_budget_ms: 300_000,
+                    dry_run: true,
+                },
+            )
+            .await
+            .expect("compile-only bounded preview");
+            assert!(output.error.is_none());
+            let envelope = mission_drive_output_envelope(&output);
+            assert_eq!(envelope["data"]["status"], "preview_ready");
+            assert_eq!(
+                envelope["data"]["plan"]["assignment_ids"],
+                serde_json::json!(["assignment:drive-0"])
+            );
+            assert_eq!(envelope["data"]["plan"]["stop"]["kind"], "assignment_limit");
+            assert_eq!(
+                envelope["data"]["selected_actions"][0]["assignment_id"],
+                "assignment:drive-0"
+            );
+            assert_eq!(
+                envelope["data"]["selected_actions"][0]["action"]["kind"],
+                "send_text"
+            );
+            assert_eq!(
+                envelope["data"]["selected_actions"][0]["action"]["pane_id"],
+                7
+            );
+            assert_eq!(envelope["data"]["remaining_unconfirmed"], 2);
+            assert_eq!(envelope["data"]["committed_count"], 0);
+            assert!(!envelope.to_string().contains("private-drive-payload"));
+            assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
+            assert!(!layout.ft_dir.join("mission-dispatch").exists());
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_preflight_blocker_refuses_the_entire_selected_prefix() {
+        run_async_test(async {
+            let (_dir, layout, path, _) = mission_drive_fixture(2);
+            let mut mission = load_mission_from_path(&path).expect("mission");
+            mission.assignments[1].approval_state =
+                frankenterm_core::plan::ApprovalState::Pending {
+                    requested_by: "operator".to_string(),
+                    requested_at_ms: mission.assignments[1].created_at_ms,
+                };
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&mission).expect("mission JSON"),
+            )
+            .expect("pending approval fixture");
+            let token =
+                frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+                    .expect("exact blocked token");
+            let token = serde_json::to_string(&token).expect("token JSON");
+            let before = std::fs::read(&path).expect("blocked mission");
+            let output = run_mission_drive(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect("blocked admission retains a reviewable plan");
+            assert_eq!(
+                output.error.as_ref().expect("preflight refusal").error_code,
+                "mission.drive.blocked"
+            );
+            assert_eq!(output.progress.plan.assignment_ids.len(), 1);
+            assert_eq!(output.progress.selected_actions.len(), 1);
+            assert_eq!(output.progress.attempted_assignments, 0);
+            let envelope = mission_drive_output_envelope(&output);
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["data"]["committed_count"], 0);
+            assert_eq!(envelope["data"]["remaining_unconfirmed"], 2);
+            assert_eq!(envelope["data"]["stopped_assignment"], "assignment:drive-1");
+            assert_eq!(
+                std::fs::read(&path).expect("unchanged blocked mission"),
+                before
+            );
+            assert!(!layout.ft_dir.join("mission-dispatch").exists());
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_reconciles_durable_actions_with_exact_checkpoint_handoff() {
+        run_async_test(async {
+            use frankenterm_core::plan::{MissionLifecycleState, Outcome};
+            let (_dir, layout, path, token) = mission_drive_fixture(2);
+            seed_mission_drive_commits(
+                &layout,
+                &path,
+                &token,
+                &["assignment:drive-0", "assignment:drive-1"],
+            );
+            let config = frankenterm_core::config::Config::default();
+            let output = run_mission_drive(
+                &layout,
+                &config,
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect("drive through the production durable recovery path");
+            assert!(output.error.is_none());
+            assert_eq!(output.progress.status, "queue_drained");
+            assert_eq!(output.progress.committed_actions.len(), 2);
+            assert!(
+                output
+                    .progress
+                    .committed_actions
+                    .iter()
+                    .all(|receipt| receipt.replayed)
+            );
+            assert_eq!(
+                output.progress.committed_actions[0].revision,
+                "9007199254740994"
+            );
+            assert_eq!(
+                output.progress.committed_actions[1].revision,
+                "9007199254740995"
+            );
+            assert_eq!(
+                output.progress.last_confirmed_token.revision,
+                9_007_199_254_740_995
+            );
+            let persisted = load_mission_from_path(&path).expect("checkpointed mission");
+            assert_eq!(persisted.lifecycle_state, MissionLifecycleState::Running);
+            assert!(persisted.assignments.iter().all(|assignment| matches!(
+                &assignment.outcome,
+                Some(Outcome::Success { reason_code, .. }) if reason_code == "mission.assignment_action_committed"
+            )));
+            assert!(
+                !layout.db_path.exists(),
+                "durable recovery must not construct a live runtime"
+            );
+            let after = std::fs::read(&path).expect("completed action checkpoints");
+            let token =
+                serde_json::to_string(&output.progress.last_confirmed_token).expect("next token");
+            let empty = run_mission_drive(
+                &layout,
+                &config,
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect("settled queue is an unchanged no-op");
+            assert!(empty.error.is_none());
+            assert_eq!(empty.progress.status, "queue_drained");
+            assert!(empty.progress.committed_actions.is_empty());
+            assert_eq!(
+                empty.progress.last_confirmed_token,
+                output.progress.last_confirmed_token
+            );
+            assert_eq!(std::fs::read(&path).expect("unchanged empty queue"), after);
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_pause_between_actions_fences_the_next_dispatch() {
+        run_async_test(async {
+            let (_dir, layout, path, token) = mission_drive_fixture(2);
+            seed_mission_drive_commits(
+                &layout,
+                &path,
+                &token,
+                &["assignment:drive-0", "assignment:drive-1"],
+            );
+            let output = run_mission_drive_with_boundary(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+                |index, owned_token| {
+                    if index == 1 {
+                        let token = serde_json::to_string(owned_token).expect("owned token");
+                        run_mission_lifecycle(
+                            &layout,
+                            &path,
+                            MissionLifecycleVerb::Pause,
+                            Some(&token),
+                            Some("between actions"),
+                            "competing-operator",
+                        )
+                        .expect("the first action released its mission lock");
+                    }
+                },
+                || Duration::ZERO,
+            )
+            .await
+            .expect("partial progress is returned on a competing pause");
+            assert_eq!(
+                output.error.as_ref().expect("token conflict").error_code,
+                frankenterm_core::tx_execution::MissionStoreError::Conflict.code()
+            );
+            assert_eq!(output.progress.committed_actions.len(), 1);
+            assert_eq!(
+                output.progress.last_confirmed_token.revision,
+                9_007_199_254_740_994
+            );
+            let persisted = load_mission_from_path(&path).expect("paused mission");
+            assert_eq!(
+                persisted.lifecycle_state,
+                frankenterm_core::plan::MissionLifecycleState::Paused
+            );
+            assert_eq!(persisted.revision, 9_007_199_254_740_995);
+            assert!(persisted.assignments[0].outcome.is_some());
+            assert!(persisted.assignments[1].outcome.is_none());
+            let envelope = mission_drive_output_envelope(&output);
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["data"]["committed_count"], 1);
+            assert_eq!(envelope["data"]["remaining_unconfirmed"], 1);
+            assert_eq!(
+                envelope["data"]["last_confirmed_token"]["revision"],
+                "9007199254740994"
+            );
+            assert_ne!(envelope["exit_code"], 0);
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_budget_stops_admission_without_losing_prior_success() {
+        run_async_test(async {
+            let (_dir, layout, path, token) = mission_drive_fixture(2);
+            seed_mission_drive_commits(
+                &layout,
+                &path,
+                &token,
+                &["assignment:drive-0", "assignment:drive-1"],
+            );
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let output = run_mission_drive_with_boundary(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 1,
+                    dry_run: false,
+                },
+                |index, _| {
+                    if index == 1 {
+                        elapsed.set(Duration::from_millis(1));
+                    }
+                },
+                || elapsed.get(),
+            )
+            .await
+            .expect("bounded drive returns committed prefix");
+            assert_eq!(output.progress.status, "admission_budget_reached");
+            assert_eq!(output.progress.attempted_assignments, 1);
+            assert_eq!(output.progress.committed_actions.len(), 1);
+            assert_eq!(
+                output
+                    .error
+                    .as_ref()
+                    .expect("admission deadline")
+                    .error_code,
+                "mission.drive.admission_budget_exhausted"
+            );
+            let persisted = load_mission_from_path(&path).expect("partially driven mission");
+            assert!(persisted.assignments[0].outcome.is_some());
+            assert!(persisted.assignments[1].outcome.is_none());
+            assert_eq!(
+                mission_drive_output_envelope(&output)["data"]["remaining_unconfirmed"],
+                1
+            );
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_transaction_conflict_preserves_partial_error_report() {
+        run_async_test(async {
+            let (_dir, layout, path, token) = mission_drive_fixture(2);
+            seed_mission_drive_commits(&layout, &path, &token, &["assignment:drive-0"]);
+            let output = run_mission_drive_with_boundary(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+                |index, owned_token| {
+                    if index == 1 {
+                        let token = serde_json::to_string(owned_token).expect("owned token");
+                        let mutation = acquire_mission_mutation(&layout, &path, Some(&token))
+                            .expect("lock released between actions");
+                        let id =
+                            frankenterm_core::plan::AssignmentId("assignment:drive-1".to_string());
+                        let (contract_lock, mut contract) = mutation
+                            .publish_assignment_dispatch(&id)
+                            .expect("publish conflicting fixture");
+                        if let frankenterm_core::plan::StepAction::SendText { text, .. } =
+                            &mut contract.plan.steps[0].action
+                        {
+                            *text = "different retained action".to_string();
+                        } else {
+                            panic!("fixture must be send_text");
+                        }
+                        frankenterm_core::tx_execution::save_tx_contract_atomic(
+                            &contract_lock,
+                            contract_lock.authoritative_path(),
+                            &contract,
+                        )
+                        .expect("persist a valid but differently bound transaction");
+                    }
+                },
+                || Duration::ZERO,
+            )
+            .await
+            .expect("failed second publication retains first action progress");
+            let envelope = mission_drive_output_envelope(&output);
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(
+                envelope["error_code"],
+                frankenterm_core::tx_execution::MissionStoreError::Conflict.code()
+            );
+            assert_ne!(envelope["exit_code"], 0);
+            assert_eq!(envelope["data"]["status"], "dispatch_stopped");
+            assert_eq!(envelope["data"]["committed_count"], 1);
+            assert_eq!(envelope["data"]["attempted_assignments"], 2);
+            assert_eq!(envelope["data"]["remaining_unconfirmed"], 1);
+            assert_eq!(envelope["data"]["stopped_assignment"], "assignment:drive-1");
+            assert_eq!(
+                envelope["data"]["last_confirmed_token"]["revision"],
+                "9007199254740994"
+            );
+            let persisted = load_mission_from_path(&path).expect("first checkpoint persists");
+            assert!(persisted.assignments[0].outcome.is_some());
+            assert!(persisted.assignments[1].outcome.is_none());
+            assert!(
+                !layout.db_path.exists(),
+                "binding refusal precedes runtime construction"
+            );
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_drive_revision_capacity_refuses_before_any_transaction() {
+        run_async_test(async {
+            let (_dir, layout, path, _) = mission_drive_fixture(2);
+            let mut mission = load_mission_from_path(&path).expect("mission");
+            mission.revision = u64::MAX - 1;
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&mission).expect("mission JSON"),
+            )
+            .expect("exhausted revision fixture");
+            let token =
+                frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+                    .expect("exact token");
+            let token = serde_json::to_string(&token).expect("token JSON");
+            let before = std::fs::read(&path).expect("before drive");
+            let error = run_mission_drive(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                MissionDriveRequest {
+                    mission_path: &path,
+                    expected_token: &token,
+                    max_assignments: 2,
+                    admission_budget_ms: 300_000,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect_err("all selected checkpoints must be representable before effects");
+            assert_eq!(error.error_code, "mission.drive.revision_exhausted");
+            assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
+            assert!(!layout.ft_dir.join("mission-dispatch").exists());
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[cfg(feature = "subprocess-bridge")]
+    #[test]
+    fn mission_drive_accepts_only_its_own_synced_decimal_revision_successor() {
+        use frankenterm_core::tx_execution::MissionRevisionToken;
+
+        let previous = MissionRevisionToken {
+            mission_id: "mission:receipt".to_string(),
+            generation: "generation:receipt".to_string(),
+            revision: 9_007_199_254_740_993,
+            content_sha256: "a".repeat(64),
+        };
+        let mut current = previous.clone();
+        current.revision += 1;
+        current.content_sha256 = "b".repeat(64);
+        let id = frankenterm_core::plan::AssignmentId("assignment:receipt".to_string());
+        let valid = serde_json::json!({
+            "status": "action_committed",
+            "assignment_id": id,
+            "tx_id": "mission-tx:receipt",
+            "contract_file": "/workspace/.ft/mission-dispatch/receipt.json",
+            "replayed": true,
+            "mutation": {
+                "previous": previous,
+                "current": current,
+                "changed": true,
+                "durability": "file_and_directory_synced"
+            }
+        });
+        let (receipt, token) = mission_drive_accept_dispatch(valid.clone(), &id, &previous)
+            .expect("exact owned revision successor");
+        assert_eq!(receipt.revision, "9007199254740994");
+        assert_eq!(token, current);
+        for (pointer, replacement) in [
+            ("/status", serde_json::json!("pending")),
+            ("/assignment_id", serde_json::json!("assignment:other")),
+            (
+                "/mutation/previous/content_sha256",
+                serde_json::json!("c".repeat(64)),
+            ),
+            (
+                "/mutation/current/generation",
+                serde_json::json!("other-generation"),
+            ),
+            (
+                "/mutation/current/revision",
+                serde_json::json!("9007199254740995"),
+            ),
+            (
+                "/mutation/current/revision",
+                serde_json::json!(9_007_199_254_740_994_u64),
+            ),
+            (
+                "/mutation/current/content_sha256",
+                serde_json::json!("a".repeat(64)),
+            ),
+            ("/mutation/changed", serde_json::json!(false)),
+            ("/mutation/durability", serde_json::json!("unsynced")),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).expect("receipt field") = replacement;
+            assert_eq!(
+                mission_drive_accept_dispatch(invalid, &id, &previous)
+                    .expect_err("unproven transition must stop admission")
+                    .error_code,
+                "mission.drive.receipt_invalid",
+                "{pointer}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_exhausted_revision_refuses_before_publication() {
+        run_async_test(async {
+            let (_dir, layout, path, _) = mission_drive_fixture(1);
+            let mut mission = load_mission_from_path(&path).expect("mission");
+            mission.revision = u64::MAX;
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&mission).expect("mission JSON"),
+            )
+            .expect("exhausted revision fixture");
+            let token =
+                frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+                    .expect("exact token");
+            let token = serde_json::to_string(&token).expect("token JSON");
+            let before = std::fs::read(&path).expect("before dispatch");
+            for dry_run in [true, false] {
+                let error = run_mission_assignment_dispatch(
+                    &layout,
+                    &frankenterm_core::config::Config::default(),
+                    None,
+                    &path,
+                    "assignment:drive-0",
+                    &token,
+                    dry_run,
+                )
+                .await
+                .expect_err("an unpersistable success must be refused before a pane action");
+                assert_eq!(error.error_code, "mission.dispatch.revision_exhausted");
+                assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
+                assert!(!layout.ft_dir.join("mission-dispatch").exists());
+                assert!(!layout.db_path.exists());
+            }
+        });
     }
 
     #[test]

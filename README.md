@@ -612,7 +612,7 @@ ft tx run --contract-file refactor-tx.json      # prepare + commit deterministic
 ft tx show --include-contract                   # see the receipt + per-step audit
 ```
 
-The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. `ft mission dispatch` can execute a selected assignment through this transaction engine; see [Dispatch one assignment](#dispatch-one-assignment). Automated multi-assignment scheduling and cancellation of running agent tasks remain separate work (`ft-majms`, `ft-xxfwy.48`), so the full coordinated-refactor scenario remains a product goal.
+The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. `ft mission dispatch` executes a selected assignment, and `ft mission drive` advances a bounded sequence of stored assignments through this transaction engine; see [Drive a stored assignment queue](#drive-a-stored-assignment-queue). Autonomous planning and cancellation of running agent tasks remain separate work (`ft-majms`, `ft-xxfwy.48`), so the full coordinated-refactor scenario remains a product goal.
 
 ### Scenario 3 — Reconstruct what an agent did six hours ago
 
@@ -1010,6 +1010,7 @@ The runner enforces the allowlist before any lock, audit row, or engine state is
 ft mission plan                                # validate mission contract + compute hash
 ft mission run                                 # advance lifecycle into execution
 ft mission dispatch a1 --expected-token "$mission_token"  # execute one selected pane action
+ft mission drive --expected-token "$mission_token" --max-assignments 10  # drive a stored queue
 ft mission status                              # lifecycle + assignment summary
 ft mission explain                             # legal lifecycle transitions
 ft mission pause                               # canonical lifecycle transitions
@@ -1906,7 +1907,7 @@ ft mission objective-plan --objective "<operator goal as free text>" \
 3. Builds a read-only plan, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
 4. Prints a deterministic plan artifact (golden-fixture-comparable). Nothing is persisted; keep the output if you need a record.
 
-The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. To execute an existing mission contract (`.ft/mission/active.json` by default), use `ft mission run` to advance its lifecycle, then `ft mission dispatch <assignment-id> --expected-token '<revision_token JSON>'` to execute one explicitly selected pane action through the policy-gated transaction engine. The objective-plan artifact is not automatically converted into a mission contract. See [Dispatch one assignment](#dispatch-one-assignment) for revision-token handling and the supported action scope. Autonomous multi-assignment scheduling and live agent-task cancellation remain separate work (`ft-majms`, `ft-xxfwy.48`).
+The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. To execute an existing mission contract (`.ft/mission/active.json` by default), use `ft mission run` to advance its lifecycle, then `ft mission dispatch <assignment-id> --expected-token '<revision_token JSON>'` for one explicit pane action or `ft mission drive --expected-token '<revision_token JSON>'` for a bounded sequence of stored assignments. Both use the policy-gated transaction engine. The objective-plan artifact is not automatically converted into a mission contract. See [Dispatch one assignment](#dispatch-one-assignment) and [Drive a stored assignment queue](#drive-a-stored-assignment-queue) for revision-token handling and action scope. Autonomous planning and live agent-task cancellation remain separate work (`ft-majms`, `ft-xxfwy.48`).
 
 ---
 
@@ -3833,6 +3834,34 @@ The preview reports the pane, action kind and input byte count without echoing t
 Each assignment incarnation owns one stable transaction under `.ft/mission-dispatch/`. If an action finishes but saving the mission outcome is interrupted, a later dispatch can recover its verified durable success without sending it again. Changing the action or assignee cannot allocate a fresh retry slot for the same assignment. Inspect a failed or indeterminate transaction with `ft tx show --contract-file <path> --include-contract`; the existing executor refuses to restart terminal failed transactions automatically.
 
 Assignment success confirms the selected pane action, such as delivery of input or satisfaction of a wait. It does not certify completion of the agent's coding task or the whole mission. Builds without `subprocess-bridge` return `mission.dispatch.feature_unavailable`.
+
+### Drive a stored assignment queue
+
+In default Linux and macOS builds, `ft mission drive` executes the next bounded batch of unresolved assignments in their stored array order. It uses the same real execution, stable transaction slots and durable recovery as single-assignment dispatch. The mission must already be running or executing.
+
+```bash
+mission_file=".ft/mission/active.json"
+mission_token=$(ft mission status --mission-file "$mission_file" -f json |
+  jq -c '.data.revision_token')
+
+# Inspect the complete selected batch before any transaction or runtime is opened.
+ft mission drive --mission-file "$mission_file" \
+  --expected-token "$mission_token" --max-assignments 10 \
+  --admission-budget-ms 300000 --dry-run -f json
+
+# Execute the reviewed batch against that exact revision.
+ft mission drive --mission-file "$mission_file" \
+  --expected-token "$mission_token" --max-assignments 10 \
+  --admission-budget-ms 300000 -f json
+```
+
+The default batch contains at most 10 actions; `--max-assignments` accepts 1–100. Existing successful assignments are skipped. Any failed or cancelled assignment blocks the drive. All selected actions are checked before the first dispatch: an approval barrier, unsupported reservation/action, missing or conflicting target, or wait longer than 300,000 ms refuses the entire batch. Preview describes actions without echoing pane input or pattern content; live policy and target checks still run separately for each action.
+
+Each confirmed action saves its mission outcome before the next starts. The driver continues using only the exact revision returned by its own successful save. A concurrent pause, abort, edit or other dispatcher invalidates the next admission instead of being overwritten. Locks are released between actions; a control request during an action can report `mission.mutation_in_progress` and must be retried.
+
+The admission budget defaults to 300,000 ms and accepts 1–3,600,000 ms. It is checked before starting each action; an admitted action can finish after the budget expires. A runtime refusal, ambiguous result or save failure stops further actions, returns a nonzero exit status, and retains confirmed progress in the JSON response. `last_confirmed_token` identifies the last revision this invocation confirmed; read fresh mission status after a stop because that token may no longer be current. Repeated drives skip saved successes and recover durable transaction successes left by a crash without resending them.
+
+Reaching the assignment limit leaves later work for another explicitly authorized drive. Draining the queue leaves the mission lifecycle unchanged: action delivery and wait satisfaction do not certify completion of the agents' broader tasks. This command drives an authored queue; autonomous assignment generation and in-flight agent-task cancellation remain separate capabilities.
 
 ### Tx contract (`.ft/mission/tx-active.json`)
 
