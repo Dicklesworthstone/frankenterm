@@ -276,7 +276,29 @@ pub fn count_open_fds() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(not(unix))]
+/// Windows has no descriptor table. Its per-process handle count (files,
+/// sockets, pipes, events, threads) is the resource a process exhausts, so it
+/// stands in for open FDs. Returns 0 when the count cannot be read.
+#[cfg(windows)]
+pub fn count_open_fds() -> u64 {
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        return 0;
+    };
+    let Ok(mut system) = sysinfo::System::new() else {
+        return 0;
+    };
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        false,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(pid)
+        .and_then(sysinfo::Process::open_files)
+        .map_or(0, |handles| handles as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn count_open_fds() -> u64 {
     0
 }
