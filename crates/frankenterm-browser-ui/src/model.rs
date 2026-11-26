@@ -304,7 +304,10 @@ impl FleetModel {
             View::Events => {
                 let event = self.events.get(index)?;
                 let uuid = event.pane_uuid.as_deref().filter(|uuid| !uuid.is_empty())?;
-                let pane = self.panes.iter().find(|pane| pane.pane_id == event.pane_id)?;
+                let pane = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == event.pane_id)?;
                 (pane.pane_uuid.as_deref() == Some(uuid)).then_some(uuid)
             }
         }
@@ -359,9 +362,7 @@ impl FleetModel {
                 pane_id,
                 pane_uuid,
             }) => self.events.iter().position(|event| {
-                event.id == Some(id)
-                    && event.pane_id == pane_id
-                    && event.pane_uuid == pane_uuid
+                event.id == Some(id) && event.pane_id == pane_id && event.pane_uuid == pane_uuid
             }),
             Some(SelectionAnchor::UnstoredDetection(selected)) => {
                 self.events.iter().position(|event| event == &selected)

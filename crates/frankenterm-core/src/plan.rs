@@ -1456,7 +1456,9 @@ pub enum MissionAssignmentApprovalError {
     ApprovalNotPending,
     #[error("the approval actor must be a nonempty printable identifier of at most 128 bytes")]
     InvalidActor,
-    #[error("the approval reason must be 1-128 ASCII letters, digits, dots, underscores, colons or hyphens")]
+    #[error(
+        "the approval reason must be 1-128 ASCII letters, digits, dots, underscores, colons or hyphens"
+    )]
     InvalidReasonCode,
     #[error("the approval timestamp predates the mission or assignment")]
     InvalidTimestamp,
@@ -2663,7 +2665,9 @@ impl Mission {
             return Err(MissionAssignmentApprovalError::AssignmentSettled);
         }
         let requested_at_ms = match &assignment.approval_state {
-            ApprovalState::Pending { requested_at_ms, .. } => *requested_at_ms,
+            ApprovalState::Pending {
+                requested_at_ms, ..
+            } => *requested_at_ms,
             _ => return Err(MissionAssignmentApprovalError::ApprovalNotPending),
         };
         let candidate = self
@@ -2689,8 +2693,8 @@ impl Mission {
         // Use the same full serialized snapshot as MissionRevisionToken,
         // including vector order and all 64 revision bits. Canonical mission
         // scoring hashes sort assignments and are not mutation authority.
-        let snapshot = serde_json::to_vec(self)
-            .map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
+        let snapshot =
+            serde_json::to_vec(self).map_err(|_| MissionAssignmentApprovalError::InvalidMission)?;
         let content_sha256 = hex::encode(Sha256::digest(&snapshot));
         let decision_bytes = serde_json::to_vec(&(
             "frankenterm.mission.assignment-approval-decision.v1",
@@ -9336,8 +9340,14 @@ mod tests {
         assert!(draft.provenance.is_none());
         assert_eq!((draft.candidates.len(), draft.assignments.len()), (1, 1));
         let assignment = &draft.assignments[0];
-        assert_eq!(assignment.assignment_id, request.initial_assignment.assignment_id);
-        assert_eq!(assignment.candidate_id, request.initial_assignment.candidate_id);
+        assert_eq!(
+            assignment.assignment_id,
+            request.initial_assignment.assignment_id
+        );
+        assert_eq!(
+            assignment.candidate_id,
+            request.initial_assignment.candidate_id
+        );
         assert_eq!(assignment.assignee, request.initial_assignment.assignee);
         assert_eq!(assignment.created_at_ms, 1_000);
         assert_eq!(assignment.updated_at_ms, None);
@@ -9379,7 +9389,10 @@ mod tests {
         prior["candidates"].as_array_mut().unwrap().pop();
         prior["assignments"].as_array_mut().unwrap().pop();
         prior.as_object_mut().unwrap().remove("updated_at_ms");
-        assert_eq!(prior, before, "existing immutable bindings must remain exact");
+        assert_eq!(
+            prior, before,
+            "existing immutable bindings must remain exact"
+        );
     }
 
     #[test]
@@ -9414,7 +9427,11 @@ mod tests {
             let mut active = draft.clone();
             active.lifecycle_state = state;
             let before = serde_json::to_value(&active).unwrap();
-            assert!(active.append_assignment(&authored_assignment(1), 1_001).is_err());
+            assert!(
+                active
+                    .append_assignment(&authored_assignment(1), 1_001)
+                    .is_err()
+            );
             assert_eq!(serde_json::to_value(&active).unwrap(), before);
         }
     }
@@ -9432,7 +9449,9 @@ mod tests {
         let (reviewed, _) = draft.resolve_assignment_approval(&approval, 1_001).unwrap();
         assert_eq!(reviewed.lifecycle_state, MissionLifecycleState::Planned);
         assert_eq!(
-            reviewed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+            reviewed
+                .append_assignment(&authored_assignment(1), 1_002)
+                .unwrap_err(),
             MissionAuthoringError::ReviewedDraft,
             "an approval binds the prior full snapshot even before run"
         );
@@ -9451,7 +9470,9 @@ mod tests {
             let mut changed = draft.clone();
             changed.assignments[0].approval_state = state;
             assert_eq!(
-                changed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+                changed
+                    .append_assignment(&authored_assignment(1), 1_002)
+                    .unwrap_err(),
                 MissionAuthoringError::ReviewedDraft
             );
         }
@@ -9473,7 +9494,9 @@ mod tests {
         controlled.pause_resume_state.total_abort_count = 1;
         for changed in [settled, escalated, controlled] {
             assert_eq!(
-                changed.append_assignment(&authored_assignment(1), 1_002).unwrap_err(),
+                changed
+                    .append_assignment(&authored_assignment(1), 1_002)
+                    .unwrap_err(),
                 MissionAuthoringError::ReviewedDraft
             );
         }
@@ -9585,7 +9608,9 @@ mod tests {
                 .unwrap_err(),
             MissionAuthoringError::RevisionExhausted
         );
-        let future = draft.append_assignment(&authored_assignment(1), 2_000).unwrap();
+        let future = draft
+            .append_assignment(&authored_assignment(1), 2_000)
+            .unwrap();
         assert_eq!(
             future
                 .append_assignment(&authored_assignment(2), 1_999)
@@ -9638,7 +9663,10 @@ mod tests {
         ] {
             draft.apply_lifecycle_transition(transition, 1_001).unwrap();
         }
-        assert_eq!(draft.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            draft.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
         let (admitted, _) = draft
             .resolve_assignment_approval(
                 &MissionAssignmentApprovalRequest {
@@ -9698,7 +9726,9 @@ mod tests {
         mission
     }
 
-    fn approval_request(decision: MissionAssignmentApprovalDecision) -> MissionAssignmentApprovalRequest {
+    fn approval_request(
+        decision: MissionAssignmentApprovalDecision,
+    ) -> MissionAssignmentApprovalRequest {
         MissionAssignmentApprovalRequest {
             assignment_id: AssignmentId("assignment:approval-0".to_string()),
             decision,
@@ -9715,9 +9745,18 @@ mod tests {
         let (resolved, receipt) = mission
             .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
             .expect("explicit pending approval");
-        assert_eq!(serde_json::to_value(&mission).expect("unchanged input"), before);
-        assert_eq!(resolved.revision, mission.revision, "only durable commit advances revision");
-        assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            serde_json::to_value(&mission).expect("unchanged input"),
+            before
+        );
+        assert_eq!(
+            resolved.revision, mission.revision,
+            "only durable commit advances revision"
+        );
+        assert_eq!(
+            resolved.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
         assert_eq!(receipt.blocking_approvals_remaining, 1);
         assert_eq!(receipt.actor, request.actor);
         assert_eq!(receipt.reason_code, request.reason_code);
@@ -9731,10 +9770,18 @@ mod tests {
         let mut expected = before.clone();
         expected["assignments"][0]["approval_state"] =
             serde_json::to_value(&receipt.current_approval).expect("approval metadata");
-        expected["assignments"][0]["updated_at_ms"] = serde_json::json!(mission.created_at_ms + 1_000);
+        expected["assignments"][0]["updated_at_ms"] =
+            serde_json::json!(mission.created_at_ms + 1_000);
         expected["updated_at_ms"] = serde_json::json!(mission.created_at_ms + 1_000);
-        assert_eq!(serde_json::to_value(&resolved).expect("projected snapshot"), expected);
-        assert!(!serde_json::to_string(&receipt).expect("receipt").contains("private-approval-payload"));
+        assert_eq!(
+            serde_json::to_value(&resolved).expect("projected snapshot"),
+            expected
+        );
+        assert!(
+            !serde_json::to_string(&receipt)
+                .expect("receipt")
+                .contains("private-approval-payload")
+        );
 
         let second = MissionAssignmentApprovalRequest {
             assignment_id: AssignmentId("assignment:approval-1".to_string()),
@@ -9744,11 +9791,19 @@ mod tests {
             .resolve_assignment_approval(&second, mission.created_at_ms + 1_001)
             .expect("final pending approval");
         assert_eq!(ready.lifecycle_state, MissionLifecycleState::Executing);
-        assert_eq!(receipt.lifecycle_from, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            receipt.lifecycle_from,
+            MissionLifecycleState::AwaitingApproval
+        );
         assert_eq!(receipt.lifecycle_to, MissionLifecycleState::Executing);
         assert_eq!(receipt.blocking_approvals_remaining, 0);
         assert!(ready.assignment_approvals_satisfied());
-        assert!(ready.assignments.iter().all(|assignment| assignment.outcome.is_none()));
+        assert!(
+            ready
+                .assignments
+                .iter()
+                .all(|assignment| assignment.outcome.is_none())
+        );
     }
 
     #[test]
@@ -9758,7 +9813,10 @@ mod tests {
         let (denied, receipt) = mission
             .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
             .expect("explicit denial");
-        assert_eq!(denied.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            denied.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
         assert_eq!(receipt.blocking_approvals_remaining, 2);
         assert!(matches!(
             &denied.assignments[0].approval_state,
@@ -9786,7 +9844,10 @@ mod tests {
                     mission.created_at_ms + 1_000,
                 )
                 .expect("resolve the one pending target");
-            assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+            assert_eq!(
+                resolved.lifecycle_state,
+                MissionLifecycleState::AwaitingApproval
+            );
             assert_eq!(receipt.blocking_approvals_remaining, 1);
             assert!(!resolved.assignment_approvals_satisfied());
         }
@@ -9807,11 +9868,22 @@ mod tests {
             .expect("resolve approval while retaining operator pause");
         assert_eq!(resolved.lifecycle_state, MissionLifecycleState::Paused);
         assert_eq!(receipt.lifecycle_to, MissionLifecycleState::Paused);
-        assert_eq!(serde_json::to_value(&resolved.pause_resume_state).expect("checkpoint"), checkpoint);
+        assert_eq!(
+            serde_json::to_value(&resolved.pause_resume_state).expect("checkpoint"),
+            checkpoint
+        );
         resolved
-            .resume_mission("operator", "review_done", mission.created_at_ms + 1_100, None)
+            .resume_mission(
+                "operator",
+                "review_done",
+                mission.created_at_ms + 1_100,
+                None,
+            )
             .expect("explicit resume restores awaiting approval");
-        assert_eq!(resolved.lifecycle_state, MissionLifecycleState::AwaitingApproval);
+        assert_eq!(
+            resolved.lifecycle_state,
+            MissionLifecycleState::AwaitingApproval
+        );
         assert!(resolved.assignment_approvals_satisfied());
 
         for state in [
@@ -9860,7 +9932,8 @@ mod tests {
             locked.assignments[0].approval_state = previous;
             let before = serde_json::to_value(&locked).expect("before");
             assert_eq!(
-                locked.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+                locked
+                    .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
                     .expect_err("existing decision is not silently overwritten"),
                 MissionAssignmentApprovalError::ApprovalNotPending
             );
@@ -9872,13 +9945,15 @@ mod tests {
             completed_at_ms: mission.created_at_ms + 800,
         });
         assert_eq!(
-            settled.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            settled
+                .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
                 .expect_err("settled action cannot be reapproved"),
             MissionAssignmentApprovalError::AssignmentSettled
         );
         settled.lifecycle_state = MissionLifecycleState::Completed;
         assert_eq!(
-            settled.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            settled
+                .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
                 .expect_err("terminal mission cannot reopen admission"),
             MissionAssignmentApprovalError::TerminalMission
         );
@@ -9888,18 +9963,37 @@ mod tests {
     fn mission_approval_refuses_invalid_metadata_time_identity_and_revision() {
         let mission = pending_approval_mission(1);
         let request = approval_request(MissionAssignmentApprovalDecision::Approve);
-        for actor in ["".to_string(), " operator".to_string(), "actor\nspoof".to_string(), "x".repeat(129)] {
-            let invalid = MissionAssignmentApprovalRequest { actor, ..request.clone() };
+        for actor in [
+            "".to_string(),
+            " operator".to_string(),
+            "actor\nspoof".to_string(),
+            "x".repeat(129),
+        ] {
+            let invalid = MissionAssignmentApprovalRequest {
+                actor,
+                ..request.clone()
+            };
             assert_eq!(
-                mission.resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
+                mission
+                    .resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
                     .expect_err("invalid actor"),
                 MissionAssignmentApprovalError::InvalidActor
             );
         }
-        for reason_code in ["".to_string(), "contains spaces".to_string(), "path/secret".to_string(), "é".to_string(), "x".repeat(129)] {
-            let invalid = MissionAssignmentApprovalRequest { reason_code, ..request.clone() };
+        for reason_code in [
+            "".to_string(),
+            "contains spaces".to_string(),
+            "path/secret".to_string(),
+            "é".to_string(),
+            "x".repeat(129),
+        ] {
+            let invalid = MissionAssignmentApprovalRequest {
+                reason_code,
+                ..request.clone()
+            };
             assert_eq!(
-                mission.resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
+                mission
+                    .resolve_assignment_approval(&invalid, mission.created_at_ms + 1_000)
                     .expect_err("invalid reason code"),
                 MissionAssignmentApprovalError::InvalidReasonCode
             );
@@ -9910,14 +10004,16 @@ mod tests {
             requested_at_ms: mission.created_at_ms + 2_000,
         };
         assert_eq!(
-            future_request.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            future_request
+                .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
                 .expect_err("decision cannot predate request"),
             MissionAssignmentApprovalError::InvalidTimestamp
         );
         let mut exhausted = mission.clone();
         exhausted.revision = u64::MAX;
         assert_eq!(
-            exhausted.resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
+            exhausted
+                .resolve_assignment_approval(&request, mission.created_at_ms + 1_000)
                 .expect_err("decision must be durably representable"),
             MissionAssignmentApprovalError::RevisionExhausted
         );
@@ -9926,7 +10022,8 @@ mod tests {
             ..request
         };
         assert_eq!(
-            mission.resolve_assignment_approval(&missing, mission.created_at_ms + 1_000)
+            mission
+                .resolve_assignment_approval(&missing, mission.created_at_ms + 1_000)
                 .expect_err("unknown target"),
             MissionAssignmentApprovalError::AssignmentNotFound
         );
@@ -9938,8 +10035,11 @@ mod tests {
         let request = approval_request(MissionAssignmentApprovalDecision::Approve);
         let now = mission.created_at_ms + 1_000;
         let digest = |mission: &Mission, request: &MissionAssignmentApprovalRequest, now| {
-            mission.resolve_assignment_approval(request, now)
-                .expect("valid decision").1.decision_digest
+            mission
+                .resolve_assignment_approval(request, now)
+                .expect("valid decision")
+                .1
+                .decision_digest
         };
         let expected = digest(&mission, &request, now);
         assert_eq!(expected, digest(&mission, &request, now));
@@ -9985,11 +10085,13 @@ mod tests {
         already_admitted.lifecycle_state = MissionLifecycleState::Executing;
         already_admitted.assignments[0].approval_state = ApprovalState::NotRequired;
         let before = crate::mission_dispatch::compile_assignment_dispatch(
-            &already_admitted, &request.assignment_id,
-        ).expect("same action without an assignment approval gate");
-        let after = crate::mission_dispatch::compile_assignment_dispatch(
-            &approved, &request.assignment_id,
-        ).expect("approved action");
+            &already_admitted,
+            &request.assignment_id,
+        )
+        .expect("same action without an assignment approval gate");
+        let after =
+            crate::mission_dispatch::compile_assignment_dispatch(&approved, &request.assignment_id)
+                .expect("approved action");
         assert_eq!(
             serde_json::to_value(before).expect("prior transaction"),
             serde_json::to_value(after).expect("approved transaction"),

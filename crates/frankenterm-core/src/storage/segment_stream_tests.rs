@@ -18,7 +18,14 @@ fn stream_backend() -> RusqliteBackend {
 
 fn append(backend: &dyn StorageBackend, pane_id: u64, seq: u64, at: i64) -> Segment {
     insert_output_segment_with_seq_backend(
-        backend, pane_id, seq, "stream fixture", None, None, at, "test-catalog",
+        backend,
+        pane_id,
+        seq,
+        "stream fixture",
+        None,
+        None,
+        at,
+        "test-catalog",
     )
     .expect("allocate segment")
 }
@@ -66,7 +73,10 @@ fn segment_ids_survive_highest_deletion_full_prune_and_reopen() {
             .execute("DELETE FROM output_segments WHERE id = ?1", [second.id])
             .expect("delete highest retained ID");
         let third = storage.append_segment(7, "third", None).await.unwrap();
-        assert!(third.id > second.id, "deleted IDs cannot be allocated again");
+        assert!(
+            third.id > second.id,
+            "deleted IDs cannot be allocated again"
+        );
 
         let cx = crate::cx::for_testing();
         let before = storage
@@ -137,7 +147,9 @@ fn segment_allocation_guards_abort_reuse_and_preserve_rollback() {
         assert!(connection.execute(sql, []).is_err(), "must reject {sql}");
     }
     assert_eq!(authority(&connection), (epoch, 50));
-    connection.execute("DELETE FROM output_segments", []).unwrap();
+    connection
+        .execute("DELETE FROM output_segments", [])
+        .unwrap();
     for sql in [
         "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at)
          VALUES (50, 7, 0, 'reusetoken', 10, 1)",
@@ -168,7 +180,14 @@ fn segment_allocator_exhaustion_fails_without_mutation() {
         .execute("UPDATE segment_stream_state SET max_segment_id = 9223372036854775807")
         .unwrap();
     let error = insert_output_segment_with_seq_backend(
-        &backend, 7, 0, "never stored", None, None, 1, "test-catalog",
+        &backend,
+        7,
+        0,
+        "never stored",
+        None,
+        None,
+        1,
+        "test-catalog",
     )
     .expect_err("exhaustion cannot wrap or reuse an ID");
     assert!(error.to_string().contains("exhausted"));
@@ -194,20 +213,24 @@ fn segment_pages_bind_empty_and_scoped_rows_to_one_authority() {
         },
     )
     .unwrap();
-    assert_eq!(page.segments.iter().map(|row| row.id).collect::<Vec<_>>(), [last.id]);
+    assert_eq!(
+        page.segments.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [last.id]
+    );
     assert_eq!(page.snapshot.max_segment_id, last.id);
     assert_eq!(page.snapshot.tail_segment_id, last.id);
     let scoped = query_segment_stream_snapshot_backend(&backend, Some(8)).unwrap();
     assert_eq!(scoped.max_segment_id, last.id);
     assert_eq!(scoped.tail_segment_id, other_pane.id);
 
-    for (pane_id, after_id, tail) in [
-        (Some(7), Some(last.id), last.id),
-        (Some(999), None, 0),
-    ] {
+    for (pane_id, after_id, tail) in [(Some(7), Some(last.id), last.id), (Some(999), None, 0)] {
         let empty = query_segments_stream_page_backend(
             &backend,
-            &SegmentScanQuery { pane_id, after_id, ..SegmentScanQuery::default() },
+            &SegmentScanQuery {
+                pane_id,
+                after_id,
+                ..SegmentScanQuery::default()
+            },
         )
         .unwrap();
         assert!(empty.segments.is_empty());
@@ -216,8 +239,14 @@ fn segment_pages_bind_empty_and_scoped_rows_to_one_authority() {
         assert_eq!(empty.snapshot.tail_segment_id, tail);
     }
     for query in [
-        SegmentScanQuery { after_id: Some(-1), ..SegmentScanQuery::default() },
-        SegmentScanQuery { limit: SEGMENT_STREAM_PAGE_MAX + 1, ..SegmentScanQuery::default() },
+        SegmentScanQuery {
+            after_id: Some(-1),
+            ..SegmentScanQuery::default()
+        },
+        SegmentScanQuery {
+            limit: SEGMENT_STREAM_PAGE_MAX + 1,
+            ..SegmentScanQuery::default()
+        },
     ] {
         assert!(query_segments_stream_page_backend(&backend, &query).is_err());
     }
@@ -229,7 +258,10 @@ fn segment_pages_bind_empty_and_scoped_rows_to_one_authority() {
         )
         .unwrap();
     assert!(plan.iter().any(|row| {
-        CellRowReader::new(row).string(3).unwrap().contains("idx_segments_pane_id")
+        CellRowReader::new(row)
+            .string(3)
+            .unwrap()
+            .contains("idx_segments_pane_id")
     }));
 }
 
@@ -262,7 +294,9 @@ fn segment_stream_v53_upgrade_seeds_once_and_reopen_does_not_repair_missing_auth
     assert_eq!(installed.1, 83);
     initialize_schema(&connection).expect("validate current authority");
     assert_eq!(authority(&connection), installed);
-    connection.execute("DELETE FROM output_segments", []).unwrap();
+    connection
+        .execute("DELETE FROM output_segments", [])
+        .unwrap();
     initialize_schema(&connection).expect("empty retention does not reset authority");
     assert_eq!(authority(&connection), installed);
     let backend = RusqliteBackend::new(connection).unwrap();
@@ -277,21 +311,37 @@ fn segment_stream_v53_upgrade_seeds_once_and_reopen_does_not_repair_missing_auth
         )
         .unwrap();
     connection
-        .execute_batch("DROP TRIGGER segment_stream_state_delete_guard; DELETE FROM segment_stream_state;")
+        .execute_batch(
+            "DROP TRIGGER segment_stream_state_delete_guard; DELETE FROM segment_stream_state;",
+        )
         .unwrap();
     connection.execute_batch(&guard_sql).unwrap();
-    assert!(initialize_schema(&connection).is_err(), "current schema cannot invent an epoch");
+    assert!(
+        initialize_schema(&connection).is_err(),
+        "current schema cannot invent an epoch"
+    );
     let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM segment_stream_state", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM segment_stream_state", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(count, 0);
     let backend = RusqliteBackend::new(connection).unwrap();
     assert!(query_segment_stream_snapshot_backend(&backend, None).is_err());
     assert!(query_segments_stream_page_backend(&backend, &SegmentScanQuery::default()).is_err());
-    assert!(insert_output_segment_with_seq_backend(
-        &backend, 7, 1, "must fail", None, None, 3, "test-catalog",
-    )
-    .is_err());
+    assert!(
+        insert_output_segment_with_seq_backend(
+            &backend,
+            7,
+            1,
+            "must fail",
+            None,
+            None,
+            3,
+            "test-catalog",
+        )
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -307,7 +357,9 @@ fn fresh_stream_read_observes_replacement_and_never_creates_a_missing_database()
         initialize_schema(&connection).unwrap();
         // No live writer is involved. DELETE mode avoids swapping unrelated
         // WAL sidecars while the old read pool deliberately holds its inode.
-        connection.execute_batch("PRAGMA journal_mode = DELETE").unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode = DELETE")
+            .unwrap();
         epochs.push(authority(&connection).0);
     }
     assert_ne!(epochs[0], epochs[1]);
@@ -319,11 +371,16 @@ fn fresh_stream_read_observes_replacement_and_never_creates_a_missing_database()
     .unwrap();
     assert_eq!(before.cursor_epoch, epochs[0]);
     std::fs::rename(&current, &displaced).unwrap();
-    assert!(with_provider_fresh_read_backend(&provider, &db_path, |backend| {
-        query_segment_stream_snapshot_backend(backend, None)
-    })
-    .is_err());
-    assert!(!current.exists(), "a read cannot create replacement authority");
+    assert!(
+        with_provider_fresh_read_backend(&provider, &db_path, |backend| {
+            query_segment_stream_snapshot_backend(backend, None)
+        })
+        .is_err()
+    );
+    assert!(
+        !current.exists(),
+        "a read cannot create replacement authority"
+    );
     std::fs::rename(&replacement, &current).unwrap();
     let after = with_provider_fresh_read_backend(&provider, &db_path, |backend| {
         query_segments_stream_page_backend(backend, &SegmentScanQuery::default())

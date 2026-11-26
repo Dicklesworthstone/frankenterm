@@ -2420,7 +2420,10 @@ where
     let mut staged = None;
     for _ in 0..64 {
         let nonce = TX_CONTRACT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temp_name = format!(".mission-create.{}.{nonce}.recovery.tmp", std::process::id());
+        let temp_name = format!(
+            ".mission-create.{}.{nonce}.recovery.tmp",
+            std::process::id()
+        );
         let mut options = CapOpenOptions::new();
         options
             .read(true)
@@ -4940,11 +4943,9 @@ pub fn recover_mission_assignment_dispatch(
     {
         return Err(MissionStoreError::Invalid);
     }
-    let bound = crate::mission_dispatch::compile_assignment_dispatch(
-        mission_guard.mission(),
-        &binding.1,
-    )
-    .map_err(|_| MissionStoreError::Invalid)?;
+    let bound =
+        crate::mission_dispatch::compile_assignment_dispatch(mission_guard.mission(), &binding.1)
+            .map_err(|_| MissionStoreError::Invalid)?;
     if !mission_dispatch_contract_matches(&bound, expected)?
         || !mission_dispatch_contract_matches(expected, contract)?
     {
@@ -9230,27 +9231,42 @@ mod tests {
         let (_directory, root) = canonical_tempdir();
         std::fs::create_dir(root.join("missions")).unwrap();
         let mission = mission_creation_fixture(&root);
-        let receipt = create_mission_contract(
-            &root,
-            Path::new("missions/draft.json"),
-            &mission,
-        ).unwrap();
+        let receipt =
+            create_mission_contract(&root, Path::new("missions/draft.json"), &mission).unwrap();
         let path = root.join("missions/draft.json");
         assert_eq!(receipt.path, path);
-        assert_eq!(receipt.current, MissionRevisionToken::from_mission(&mission).unwrap());
+        assert_eq!(
+            receipt.current,
+            MissionRevisionToken::from_mission(&mission).unwrap()
+        );
         assert_eq!(receipt.current.revision, 0);
         assert_eq!(receipt.durability, "file_and_directory_synced");
-        assert_eq!(receipt.owner_acknowledgement, "unavailable_no_mission_driver");
+        assert_eq!(
+            receipt.owner_acknowledgement,
+            "unavailable_no_mission_driver"
+        );
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert!(metadata.is_file());
         assert_eq!(metadata.nlink(), 1);
         assert_eq!(metadata.mode() & 0o077, 0);
-        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-        assert!(!root.join(".ft").exists(), "creation dispatches no work or sidecar mutations");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&mission).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(
+            !root.join(".ft").exists(),
+            "creation dispatches no work or sidecar mutations"
+        );
         let guard = MissionMutationGuard::acquire(&root, &path, Some(&receipt.current)).unwrap();
         assert_eq!(guard.mission().revision, 0);
-        assert_eq!(guard.mission().lifecycle_state, crate::plan::MissionLifecycleState::Planning);
+        assert_eq!(
+            guard.mission().lifecycle_state,
+            crate::plan::MissionLifecycleState::Planning
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -9276,12 +9292,16 @@ mod tests {
             let before = std::fs::symlink_metadata(&path).unwrap();
             let entries = std::fs::read_dir(&root).unwrap().count();
             assert_eq!(
-                create_mission_contract(&root, &path, &mission_creation_fixture(&root)).unwrap_err(),
+                create_mission_contract(&root, &path, &mission_creation_fixture(&root))
+                    .unwrap_err(),
                 MissionStoreError::Conflict,
                 "destination kind {kind}",
             );
             let after = std::fs::symlink_metadata(&path).unwrap();
-            assert_eq!((before.dev(), before.ino(), before.nlink()), (after.dev(), after.ino(), after.nlink()));
+            assert_eq!(
+                (before.dev(), before.ino(), before.nlink()),
+                (after.dev(), after.ino(), after.nlink())
+            );
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries);
             if kind == 0 {
                 assert_eq!(std::fs::read(&path).unwrap(), b"existing authority");
@@ -9311,23 +9331,46 @@ mod tests {
         });
         assert_eq!(result.unwrap_err(), MissionStoreError::Conflict);
         assert_eq!(std::fs::read(&path).unwrap(), winner_bytes);
-        assert_eq!(winning_receipt.unwrap().current, MissionRevisionToken::from_mission(&winner).unwrap());
+        assert_eq!(
+            winning_receipt.unwrap().current,
+            MissionRevisionToken::from_mission(&winner).unwrap()
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn mission_create_faults_distinguish_absent_from_published_contracts() {
         for (point, expected, published) in [
-            (TxContractSaveFaultPoint::BeforeWrite, MissionStoreError::Write, false),
-            (TxContractSaveFaultPoint::BeforeFileSync, MissionStoreError::Sync, false),
-            (TxContractSaveFaultPoint::BeforeAtomicReplace, MissionStoreError::Rename, false),
-            (TxContractSaveFaultPoint::ParentDirectorySync, MissionStoreError::Indeterminate, true),
+            (
+                TxContractSaveFaultPoint::BeforeWrite,
+                MissionStoreError::Write,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::BeforeFileSync,
+                MissionStoreError::Sync,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::BeforeAtomicReplace,
+                MissionStoreError::Rename,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::ParentDirectorySync,
+                MissionStoreError::Indeterminate,
+                true,
+            ),
         ] {
             let (_directory, root) = canonical_tempdir();
             let path = root.join("mission.json");
             let mission = mission_creation_fixture(&root);
             let result = create_mission_contract_impl(&root, &path, &mission, |at| {
-                if at == point { Err(std::io::Error::other("private injected error")) } else { Ok(()) }
+                if at == point {
+                    Err(std::io::Error::other("private injected error"))
+                } else {
+                    Ok(())
+                }
             });
             let error = result.unwrap_err();
             assert_eq!(error, expected);
@@ -9366,16 +9409,22 @@ mod tests {
                 }
                 Ok(())
             });
-            assert_eq!(result.unwrap_err(), if published {
-                MissionStoreError::Indeterminate
-            } else {
-                MissionStoreError::Conflict
-            });
+            assert_eq!(
+                result.unwrap_err(),
+                if published {
+                    MissionStoreError::Indeterminate
+                } else {
+                    MissionStoreError::Conflict
+                }
+            );
             assert!(!path.exists());
             let retained_path = retained.join("mission.json");
             assert_eq!(retained_path.exists(), published);
             if published {
-                assert_eq!(std::fs::read(&retained_path).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
+                assert_eq!(
+                    std::fs::read(&retained_path).unwrap(),
+                    serde_json::to_vec_pretty(&mission).unwrap()
+                );
             }
         }
     }
@@ -9398,9 +9447,16 @@ mod tests {
                     let replace = if published {
                         path.clone()
                     } else {
-                        std::fs::read_dir(&root).unwrap()
+                        std::fs::read_dir(&root)
+                            .unwrap()
                             .map(|entry| entry.unwrap().path())
-                            .find(|entry| entry.file_name().unwrap().to_string_lossy().starts_with(".mission-create."))
+                            .find(|entry| {
+                                entry
+                                    .file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .starts_with(".mission-create.")
+                            })
                             .unwrap()
                     };
                     std::fs::rename(&replace, &retained).unwrap();
@@ -9408,14 +9464,23 @@ mod tests {
                 }
                 Ok(())
             });
-            assert_eq!(result.unwrap_err(), if published {
-                MissionStoreError::Indeterminate
-            } else {
-                MissionStoreError::Authority
-            });
-            assert_eq!(std::fs::read(&retained).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
+            assert_eq!(
+                result.unwrap_err(),
+                if published {
+                    MissionStoreError::Indeterminate
+                } else {
+                    MissionStoreError::Authority
+                }
+            );
+            assert_eq!(
+                std::fs::read(&retained).unwrap(),
+                serde_json::to_vec_pretty(&mission).unwrap()
+            );
             if published {
-                assert_eq!(std::fs::read(&path).unwrap(), b"substituted namespace entry");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    b"substituted namespace entry"
+                );
             } else {
                 assert!(!path.exists());
             }
@@ -9429,7 +9494,13 @@ mod tests {
         let mission = mission_creation_fixture(&root);
         std::fs::create_dir(root.join("real")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
-        for path in ["./mission.json", "real/../mission.json", "missing/mission.json", "alias/mission.json", "real//mission.json"] {
+        for path in [
+            "./mission.json",
+            "real/../mission.json",
+            "missing/mission.json",
+            "alias/mission.json",
+            "real//mission.json",
+        ] {
             assert_eq!(
                 create_mission_contract(&root, Path::new(path), &mission).unwrap_err(),
                 MissionStoreError::Authority,
@@ -9438,9 +9509,20 @@ mod tests {
         }
         let mut foreign = mission.clone();
         foreign.workspace_id.push_str("/.");
-        assert_eq!(create_mission_contract(&root, Path::new("mission.json"), &foreign).unwrap_err(), MissionStoreError::Authority);
+        assert_eq!(
+            create_mission_contract(&root, Path::new("mission.json"), &foreign).unwrap_err(),
+            MissionStoreError::Authority
+        );
         std::os::unix::fs::symlink(&root, root.join("workspace-alias")).unwrap();
-        assert_eq!(create_mission_contract(&root.join("workspace-alias"), Path::new("mission.json"), &mission).unwrap_err(), MissionStoreError::Authority);
+        assert_eq!(
+            create_mission_contract(
+                &root.join("workspace-alias"),
+                Path::new("mission.json"),
+                &mission
+            )
+            .unwrap_err(),
+            MissionStoreError::Authority
+        );
         assert!(!root.join("mission.json").exists());
         assert!(!root.join("real/mission.json").exists());
         assert!(!root.join("missing").exists());
@@ -9458,25 +9540,46 @@ mod tests {
                 0 => mission.revision = 1,
                 1 => mission.lifecycle_state = crate::plan::MissionLifecycleState::Running,
                 2 => mission.updated_at_ms = Some(1_001),
-                3 => mission.assignments[0].approval_state = crate::plan::ApprovalState::NotRequired,
-                4 => mission.assignments[0].outcome = Some(crate::plan::Outcome::Success {
-                    reason_code: "claimed completion".into(), completed_at_ms: 1_001,
-                }),
+                3 => {
+                    mission.assignments[0].approval_state = crate::plan::ApprovalState::NotRequired
+                }
+                4 => {
+                    mission.assignments[0].outcome = Some(crate::plan::Outcome::Success {
+                        reason_code: "claimed completion".into(),
+                        completed_at_ms: 1_001,
+                    })
+                }
                 5 => mission.pause_resume_state.total_pause_count = 1,
-                _ => mission.assignments[0].reservation_intent = Some(crate::plan::ReservationIntent {
-                    reservation_id: crate::plan::ReservationIntentId("reservation:claimed".into()),
-                    requested_by: MissionActorRole::Operator,
-                    paths: vec!["src/lib.rs".into()], exclusive: true, reason: None,
-                    requested_at_ms: 1_000, expires_at_ms: None,
-                }),
+                _ => {
+                    mission.assignments[0].reservation_intent =
+                        Some(crate::plan::ReservationIntent {
+                            reservation_id: crate::plan::ReservationIntentId(
+                                "reservation:claimed".into(),
+                            ),
+                            requested_by: MissionActorRole::Operator,
+                            paths: vec!["src/lib.rs".into()],
+                            exclusive: true,
+                            reason: None,
+                            requested_at_ms: 1_000,
+                            expires_at_ms: None,
+                        })
+                }
             }
-            assert_eq!(create_mission_contract(&root, &path, &mission).unwrap_err(), MissionStoreError::Invalid);
+            assert_eq!(
+                create_mission_contract(&root, &path, &mission).unwrap_err(),
+                MissionStoreError::Invalid
+            );
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         }
         let mut oversized = mission_creation_fixture(&root);
-        let StepAction::SendText { text, .. } = &mut oversized.candidates[0].action else { unreachable!() };
+        let StepAction::SendText { text, .. } = &mut oversized.candidates[0].action else {
+            unreachable!()
+        };
         *text = "x".repeat(TX_CONTRACT_MAX_BYTES);
-        assert_eq!(create_mission_contract(&root, &path, &oversized).unwrap_err(), MissionStoreError::TooLarge);
+        assert_eq!(
+            create_mission_contract(&root, &path, &oversized).unwrap_err(),
+            MissionStoreError::TooLarge
+        );
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 
@@ -20362,14 +20465,16 @@ mod tests {
             let guard = acquire_tx_contract_lock(&root, &path).unwrap();
             let original = guard.read_authoritative_contract_bytes().unwrap();
 
-            assert!(!recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut contract,
-                6_000,
-            )
-            .unwrap());
+            assert!(
+                !recover_mission_assignment_dispatch(
+                    &mutation,
+                    &guard,
+                    &expected,
+                    &mut contract,
+                    6_000,
+                )
+                .unwrap()
+            );
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         }
     }
@@ -20397,14 +20502,16 @@ mod tests {
             let original = guard.read_authoritative_contract_bytes().unwrap();
             let mut contract = expected.clone();
 
-            assert!(!recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut contract,
-                6_000,
-            )
-            .unwrap());
+            assert!(
+                !recover_mission_assignment_dispatch(
+                    &mutation,
+                    &guard,
+                    &expected,
+                    &mut contract,
+                    6_000,
+                )
+                .unwrap()
+            );
             assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
             assert!(contract.receipts.is_empty());
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20437,13 +20544,7 @@ mod tests {
         let original = guard.read_authoritative_contract_bytes().unwrap();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut foreign,
-                6_000,
-            ),
+            recover_mission_assignment_dispatch(&mutation, &guard, &expected, &mut foreign, 6_000,),
             Err(MissionStoreError::Conflict)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20471,13 +20572,7 @@ mod tests {
         stale.lifecycle_state = MissionTxState::Prepared;
 
         assert_eq!(
-            recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut stale,
-                6_000,
-            ),
+            recover_mission_assignment_dispatch(&mutation, &guard, &expected, &mut stale, 6_000,),
             Err(MissionStoreError::Conflict)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20502,13 +20597,7 @@ mod tests {
         let original = guard.read_authoritative_contract_bytes().unwrap();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut contract,
-                6_000,
-            ),
+            recover_mission_assignment_dispatch(&mutation, &guard, &expected, &mut contract, 6_000,),
             Err(MissionStoreError::Invalid)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20534,18 +20623,14 @@ mod tests {
             .open_idempotency_store(IdempotencyPolicy::default())
             .unwrap();
         let key = test_commit_key(&expected, &expected.plan.steps[0].step_id.0);
-        let proof = other_store.acquire_durable_key_leases([key], 6_000).unwrap();
+        let proof = other_store
+            .acquire_durable_key_leases([key], 6_000)
+            .unwrap();
         let original = guard.read_authoritative_contract_bytes().unwrap();
         let mut contract = expected.clone();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut contract,
-                6_000,
-            ),
+            recover_mission_assignment_dispatch(&mutation, &guard, &expected, &mut contract, 6_000,),
             Err(MissionStoreError::InProgress)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20611,7 +20696,10 @@ mod tests {
             assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
             assert_eq!(std::fs::read(&mission_path).unwrap(), mission_before);
-            assert_eq!(durable_ledger_file_snapshot(&root.join(".ft")), ledger_before);
+            assert_eq!(
+                durable_ledger_file_snapshot(&root.join(".ft")),
+                ledger_before
+            );
         }
     }
 
@@ -20636,13 +20724,7 @@ mod tests {
         let mut contract = expected.clone();
 
         assert_eq!(
-            recover_mission_assignment_dispatch(
-                &mutation,
-                &guard,
-                &expected,
-                &mut contract,
-                6_000,
-            ),
+            recover_mission_assignment_dispatch(&mutation, &guard, &expected, &mut contract, 6_000,),
             Err(MissionStoreError::Authority)
         );
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -20670,8 +20752,7 @@ mod tests {
                 let other = stored_dispatch_mission_fixture(&other_path);
                 assert_ne!(other.generation, mutation.mission().generation);
             }
-            let other_mutation =
-                MissionMutationGuard::acquire(&root, &other_path, None).unwrap();
+            let other_mutation = MissionMutationGuard::acquire(&root, &other_path, None).unwrap();
             let path = root.join("mission-dispatch.json");
             write_authoritative_contract(&path, &expected);
             let guard = acquire_tx_contract_lock(&root, &path).unwrap();

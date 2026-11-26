@@ -3791,10 +3791,8 @@ mod web_tests {
                 "delta-v2:{}:pane:7:{}",
                 original_snapshot.cursor_epoch, old_segment.id
             );
-            let replacement_cursor = format!(
-                "delta-v2:{}:pane:7:0",
-                replacement_snapshot.cursor_epoch
-            );
+            let replacement_cursor =
+                format!("delta-v2:{}:pane:7:0", replacement_snapshot.cursor_epoch);
             let ahead_cursor = format!(
                 "delta-v2:{}:pane:7:{}",
                 replacement_snapshot.cursor_epoch,

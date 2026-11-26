@@ -2326,11 +2326,9 @@ mod tests {
     #[test]
     fn bounded_redaction_preserves_original_input_builtin_gate() {
         let marker = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let redactor = Redactor::with_custom_patterns_and_placeholder(
-            &["seed".to_string()],
-            Some(marker),
-        )
-        .unwrap();
+        let redactor =
+            Redactor::with_custom_patterns_and_placeholder(&["seed".to_string()], Some(marker))
+                .unwrap();
         // A configured marker is literal policy text; custom passes do not
         // cause the built-in catalog to run a second time over their output.
         assert_eq!(redactor.redact("seed"), marker);
@@ -2342,11 +2340,9 @@ mod tests {
 
     #[test]
     fn bounded_redaction_rejects_zero_width_and_intermediate_expansion() {
-        let zero_width = Redactor::with_custom_patterns_and_placeholder(
-            &["(?:)".to_string()],
-            Some("*"),
-        )
-        .unwrap();
+        let zero_width =
+            Redactor::with_custom_patterns_and_placeholder(&["(?:)".to_string()], Some("*"))
+                .unwrap();
         assert_eq!(zero_width.redact_bounded("xy", 4), None);
         assert_eq!(
             zero_width.redact_bounded("xy", 5),
@@ -2361,18 +2357,13 @@ mod tests {
         .unwrap();
         assert_eq!(sequential.redact("xxxx"), "LL");
         assert_eq!(sequential.redact_bounded("xxxx", 4), None);
-        assert_eq!(
-            sequential.redact_bounded("xxxx", 8),
-            Some("LL".to_string())
-        );
+        assert_eq!(sequential.redact_bounded("xxxx", 8), Some("LL".to_string()));
 
         // Count emitted prefixes, not a pessimistic running sum over the
         // unreplaced input: a later long match can offset an earlier growth.
-        let mixed = Redactor::with_custom_patterns_and_placeholder(
-            &[r"x|L{8}".to_string()],
-            Some("1234"),
-        )
-        .unwrap();
+        let mixed =
+            Redactor::with_custom_patterns_and_placeholder(&[r"x|L{8}".to_string()], Some("1234"))
+                .unwrap();
         assert_eq!(
             mixed.redact_bounded("xLLLLLLLL", 9),
             Some("12341234".to_string())
@@ -2382,19 +2373,16 @@ mod tests {
     #[test]
     fn bounded_redaction_borrows_large_markers_and_refuses_matching_growth() {
         let marker = "x".repeat(128 * 1024);
-        let custom = Redactor::with_custom_patterns_and_placeholder(
-            &["hidden".to_string()],
-            Some(&marker),
-        )
-        .unwrap();
+        let custom =
+            Redactor::with_custom_patterns_and_placeholder(&["hidden".to_string()], Some(&marker))
+                .unwrap();
         assert_eq!(
             custom.redact_bounded("ordinary", 8),
             Some("ordinary".to_string())
         );
         assert_eq!(custom.redact_bounded("hidden", 64), None);
 
-        let builtin =
-            Redactor::with_custom_patterns_and_placeholder(&[], Some(&marker)).unwrap();
+        let builtin = Redactor::with_custom_patterns_and_placeholder(&[], Some(&marker)).unwrap();
         assert_eq!(
             builtin.redact_bounded("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 64),
             None
@@ -2409,13 +2397,9 @@ mod tests {
         assert_eq!(default.redact_bounded("é", 2), Some("é".to_string()));
 
         let redactor =
-            Redactor::with_custom_patterns_and_placeholder(&["é".to_string()], Some("界"))
-                .unwrap();
+            Redactor::with_custom_patterns_and_placeholder(&["é".to_string()], Some("界")).unwrap();
         assert_eq!(redactor.redact_bounded("éé", 5), None);
-        assert_eq!(
-            redactor.redact_bounded("éé", 6),
-            Some("界界".to_string())
-        );
+        assert_eq!(redactor.redact_bounded("éé", 6), Some("界界".to_string()));
     }
 
     #[test]

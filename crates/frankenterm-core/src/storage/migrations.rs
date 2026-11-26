@@ -2477,19 +2477,26 @@ fn validate_segment_stream_schema(conn: &Connection) -> Result<()> {
         ("TRIGGER", "output_segments_monotonic_id_ai"),
         ("TRIGGER", "output_segments_id_update_guard"),
     ] {
-        let actual = load_schema_object_sql(conn, &kind.to_ascii_lowercase(), name)?
-            .ok_or_else(|| StorageError::Corruption {
-                details: format!("schema v53 is missing output-stream authority {name}"),
+        let actual =
+            load_schema_object_sql(conn, &kind.to_ascii_lowercase(), name)?.ok_or_else(|| {
+                StorageError::Corruption {
+                    details: format!("schema v53 is missing output-stream authority {name}"),
+                }
             })?;
         let declaration = format!("CREATE {kind} IF NOT EXISTS {name}");
-        let start = schema.find(&declaration).ok_or_else(|| StorageError::Corruption {
-            details: format!("schema v53 has no canonical definition for {name}"),
-        })?;
+        let start = schema
+            .find(&declaration)
+            .ok_or_else(|| StorageError::Corruption {
+                details: format!("schema v53 has no canonical definition for {name}"),
+            })?;
         let tail = &schema[start..];
         let terminator = if kind == "TRIGGER" { "\nEND;" } else { ";" };
-        let end = tail.find(terminator).ok_or_else(|| StorageError::Corruption {
-            details: format!("schema v53 has an unterminated definition for {name}"),
-        })? + terminator.len();
+        let end = tail
+            .find(terminator)
+            .ok_or_else(|| StorageError::Corruption {
+                details: format!("schema v53 has an unterminated definition for {name}"),
+            })?
+            + terminator.len();
         if compact_schema_sql(&actual) != compact_schema_sql(&tail[..end]) {
             return Err(StorageError::Corruption {
                 details: format!("schema v53 has non-canonical output-stream authority {name}"),

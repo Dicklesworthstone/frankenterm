@@ -74,7 +74,9 @@ fn search_captures_backend(
         return Ok(Vec::new());
     }
     if ranked.len() > limit
-        || ranked.iter().any(|(id, score)| *id <= 0 || !score.is_finite())
+        || ranked
+            .iter()
+            .any(|(id, score)| *id <= 0 || !score.is_finite())
     {
         return Err(StorageError::Database("invalid capture search rank page".to_string()).into());
     }
@@ -266,7 +268,10 @@ mod tests {
             assert_eq!(first.len(), 1);
             assert_eq!(second.len(), 1);
             assert_eq!(first[0].result.segment.id, second[0].result.segment.id);
-            assert_eq!(first[0].result.segment.pane_id, second[0].result.segment.pane_id);
+            assert_eq!(
+                first[0].result.segment.pane_id,
+                second[0].result.segment.pane_id
+            );
             assert_eq!(
                 first[0].result.segment.captured_at,
                 second[0].result.segment.captured_at
@@ -303,10 +308,9 @@ mod tests {
                 ..SearchOptions::default()
             };
             let hits = search_captures_backend(&backend, "needle", &options).unwrap();
-            let legacy = crate::storage::search_fts_with_snippets_backend(
-                &backend, "needle", &options,
-            )
-            .unwrap();
+            let legacy =
+                crate::storage::search_fts_with_snippets_backend(&backend, "needle", &options)
+                    .unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].result.segment.id, i64::MAX);
             assert_eq!(
@@ -317,7 +321,11 @@ mod tests {
                 pane_id: Some(8),
                 ..options
             };
-            assert!(search_captures_backend(&backend, "needle", &empty).unwrap().is_empty());
+            assert!(
+                search_captures_backend(&backend, "needle", &empty)
+                    .unwrap()
+                    .is_empty()
+            );
         }
         let oversized = SearchOptions {
             limit: Some(CAPTURE_SEARCH_MAX_RESULTS + 1),
@@ -342,7 +350,10 @@ mod tests {
             .execute("UPDATE output_segments SET zone_type = 'prompt'")
             .unwrap();
         let hydrated = hydrate_captures_backend(&backend, "needle", &options, &ranked).unwrap();
-        assert!(hydrated.is_empty(), "a ranked row that left the scope cannot become a hit");
+        assert!(
+            hydrated.is_empty(),
+            "a ranked row that left the scope cannot become a hit"
+        );
     }
 
     #[test]

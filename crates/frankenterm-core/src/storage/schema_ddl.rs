@@ -156,7 +156,8 @@ END;
 /// - Timestamps: epoch milliseconds (i64) for hot-path queries.
 /// - JSON columns: TEXT containing JSON (v0 simplicity).
 /// - All tables use INTEGER PRIMARY KEY for rowid aliasing.
-pub const SCHEMA_SQL: &str = concat!(r#"
+pub const SCHEMA_SQL: &str = concat!(
+    r#"
 -- Enable WAL mode for concurrent reads and single-writer semantics
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -2451,4 +2452,6 @@ SELECT a.*,
 FROM audit_actions a
 LEFT JOIN action_undo u ON u.audit_action_id = a.id
 LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
-"#, include_str!("segment_stream.sql"));
+"#,
+    include_str!("segment_stream.sql")
+);

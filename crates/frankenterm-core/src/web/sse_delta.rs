@@ -10,9 +10,8 @@ use super::super::extractors::{
 };
 use super::super::{STREAM_CHANNEL_BUFFER, WebRuntimeLimits};
 use super::{
-    SseByteStream, SseEvent, SseResponse, advance_stream_sequence, frame_to_sse,
-    make_stream_frame, parse_stream_max_hz, send_rate_limited_sse, send_replay_sse,
-    stream_min_interval,
+    SseByteStream, SseEvent, SseResponse, advance_stream_sequence, frame_to_sse, make_stream_frame,
+    parse_stream_max_hz, send_rate_limited_sse, send_replay_sse, stream_min_interval,
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
@@ -482,8 +481,7 @@ pub fn handle_stream_deltas(
                 pane_filter,
                 Some(state.after_id),
                 ready,
-            )
-            else {
+            ) else {
                 return;
             };
             // This is the first and only queued frame at admission, so the
@@ -762,12 +760,14 @@ mod tests {
                             assert_eq!(query.pane_id, Some(7));
                             assert_eq!(query.since, None);
                             queries.push(query.after_id);
-                            ready_page([2, 4, 9, 11, 20]
-                                .into_iter()
-                                .filter(|id| *id > query.after_id.unwrap_or(0))
-                                .take(query.limit)
-                                .map(segment)
-                                .collect())
+                            ready_page(
+                                [2, 4, 9, 11, 20]
+                                    .into_iter()
+                                    .filter(|id| *id > query.after_id.unwrap_or(0))
+                                    .take(query.limit)
+                                    .map(segment)
+                                    .collect(),
+                            )
                         },
                         &Redactor::new(),
                         &tx
@@ -832,7 +832,11 @@ mod tests {
     #[test]
     fn delta_changed_epoch_and_rollback_stop_before_empty_or_populated_pages() {
         run_async(|| async {
-            for reason in ["cursor_epoch_mismatch", "cursor_ahead_of_high_water", "high_water_regressed"] {
+            for reason in [
+                "cursor_epoch_mismatch",
+                "cursor_ahead_of_high_water",
+                "high_water_regressed",
+            ] {
                 for rows in [Vec::new(), vec![segment(11)]] {
                     let cx = crate::cx::for_request();
                     let mut state = state();
@@ -863,9 +867,13 @@ mod tests {
                     drop(tx);
                     let frames = drain(rx);
                     assert_eq!(frames.len(), 1);
-                    assert_eq!(frames[0].event_type.as_deref(), Some("cursor_discontinuity"));
+                    assert_eq!(
+                        frames[0].event_type.as_deref(),
+                        Some("cursor_discontinuity")
+                    );
                     assert_eq!(frames[0].id, None);
-                    let frame: serde_json::Value = serde_json::from_str(frames[0].data.as_deref().unwrap()).unwrap();
+                    let frame: serde_json::Value =
+                        serde_json::from_str(frames[0].data.as_deref().unwrap()).unwrap();
                     assert_eq!(frame["data"]["code"], "delta_cursor_discontinuity");
                     assert_eq!(frame["data"]["terminal"], true);
                     assert_eq!(frame["data"]["reason"], reason);
@@ -911,7 +919,8 @@ mod tests {
             assert_eq!(frame_segment_id(&frames[0]), 1);
             assert_eq!(frame_segment_id(&frames[1]), 2);
             assert_eq!(frames[2].id, None);
-            let frame: serde_json::Value = serde_json::from_str(frames[2].data.as_deref().unwrap()).unwrap();
+            let frame: serde_json::Value =
+                serde_json::from_str(frames[2].data.as_deref().unwrap()).unwrap();
             assert_eq!(frame["data"]["resume_cursor"], token(Some(7), 2));
             assert_eq!(frame["data"]["reason"], "cursor_epoch_mismatch");
         });
@@ -967,12 +976,7 @@ mod tests {
             drop(rx);
             assert!(
                 !closed
-                    .catch_up(
-                        &cx,
-                        |_| ready_page(vec![segment(1)]),
-                        &Redactor::new(),
-                        &tx
-                    )
+                    .catch_up(&cx, |_| ready_page(vec![segment(1)]), &Redactor::new(), &tx)
                     .await
             );
             assert_eq!(closed.after_id, 0);
@@ -982,12 +986,7 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             assert!(
                 !exhausted
-                    .catch_up(
-                        &cx,
-                        |_| ready_page(vec![segment(1)]),
-                        &Redactor::new(),
-                        &tx
-                    )
+                    .catch_up(&cx, |_| ready_page(vec![segment(1)]), &Redactor::new(), &tx)
                     .await
             );
             assert_eq!(exhausted.after_id, 0);
@@ -1016,11 +1015,13 @@ mod tests {
                         .catch_up(
                             &producer_cx,
                             |query| {
-                                ready_page((1..=65)
-                                    .filter(|id| *id > query.after_id.unwrap_or(0))
-                                    .take(query.limit)
-                                    .map(segment)
-                                    .collect())
+                                ready_page(
+                                    (1..=65)
+                                        .filter(|id| *id > query.after_id.unwrap_or(0))
+                                        .take(query.limit)
+                                        .map(segment)
+                                        .collect(),
+                                )
                             },
                             &Redactor::new(),
                             &tx
@@ -1148,13 +1149,13 @@ mod tests {
     #[test]
     fn delta_cursor_has_a_versioned_epoch_and_pane_scoped_wire_format() {
         assert_eq!(token(None, 9001), format!("delta-v2:{TEST_EPOCH}:all:9001"));
-        assert_eq!(token(Some(7), 9001), format!("delta-v2:{TEST_EPOCH}:pane:7:9001"));
+        assert_eq!(
+            token(Some(7), 9001),
+            format!("delta-v2:{TEST_EPOCH}:pane:7:9001")
+        );
         for pane in [None, Some(0), Some(7), Some(u64::MAX)] {
             for id in [0, 1, 9001, i64::MAX] {
-                assert_eq!(
-                    parse_delta_cursor(&token(pane, id), pane),
-                    Ok(cursor(id))
-                );
+                assert_eq!(parse_delta_cursor(&token(pane, id), pane), Ok(cursor(id)));
             }
         }
     }
@@ -1188,7 +1189,12 @@ mod tests {
         // The browser retains its original URL; a valid received header is
         // authoritative even if the bootstrap parameter is stale or invalid.
         assert_eq!(
-            parse_delta_resume(Some(header.as_bytes()), Some("invalid"), Some("invalid"), Some(7)),
+            parse_delta_resume(
+                Some(header.as_bytes()),
+                Some("invalid"),
+                Some("invalid"),
+                Some(7)
+            ),
             Ok(Some(DeltaResume::Cursor(cursor(95)))),
         );
     }
@@ -1218,7 +1224,12 @@ mod tests {
             "x".repeat(129),
         ] {
             assert_eq!(
-                parse_delta_resume(Some(value.as_bytes()), Some(&token(None, 1)), Some("0"), None),
+                parse_delta_resume(
+                    Some(value.as_bytes()),
+                    Some(&token(None, 1)),
+                    Some("0"),
+                    None
+                ),
                 Err(INVALID_CURSOR),
                 "{value}"
             );
@@ -1264,14 +1275,28 @@ mod tests {
 
     #[test]
     fn delta_ready_and_data_use_persisted_ids_and_other_frames_never_reset_them() {
-        let ready = delta_frame_to_sse("ready", 1, TEST_EPOCH, Some(7), Some(9000), json!({})).unwrap();
+        let ready =
+            delta_frame_to_sse("ready", 1, TEST_EPOCH, Some(7), Some(9000), json!({})).unwrap();
         assert_eq!(ready.id.as_deref(), Some(token(Some(7), 9000).as_str()));
-        let delta = delta_frame_to_sse("delta", 2, TEST_EPOCH, Some(7), Some(9001), json!({"seq": 2})).unwrap();
+        let delta = delta_frame_to_sse(
+            "delta",
+            2,
+            TEST_EPOCH,
+            Some(7),
+            Some(9001),
+            json!({"seq": 2}),
+        )
+        .unwrap();
         let bytes = String::from_utf8(delta.to_bytes()).unwrap();
-        assert!(bytes.lines().any(|line| line == format!("id: {}", token(Some(7), 9001))));
+        assert!(
+            bytes
+                .lines()
+                .any(|line| line == format!("id: {}", token(Some(7), 9001)))
+        );
         assert!(!bytes.lines().any(|line| line == "id: 2"));
         for kind in ["gap", "lag", "error", "cursor_discontinuity"] {
-            let control = delta_frame_to_sse(kind, 9002, TEST_EPOCH, Some(7), None, json!({})).unwrap();
+            let control =
+                delta_frame_to_sse(kind, 9002, TEST_EPOCH, Some(7), None, json!({})).unwrap();
             assert_eq!(control.id, None, "{kind}");
             let text = String::from_utf8(control.to_bytes()).unwrap();
             assert!(!text.lines().any(|line| line.starts_with("id:")), "{text}");
@@ -1300,12 +1325,14 @@ mod tests {
                             );
                             assert_eq!(query.pane_id, Some(7));
                             queries.push(query.after_id);
-                            ready_page([1, 4, 9, 11]
-                                .into_iter()
-                                .filter(|id| *id > query.after_id.unwrap())
-                                .take(query.limit)
-                                .map(segment)
-                                .collect())
+                            ready_page(
+                                [1, 4, 9, 11]
+                                    .into_iter()
+                                    .filter(|id| *id > query.after_id.unwrap())
+                                    .take(query.limit)
+                                    .map(segment)
+                                    .collect(),
+                            )
                         },
                         &Redactor::new(),
                         &tx
@@ -1356,15 +1383,17 @@ mod tests {
                             assert_eq!(query.after_id, Some(4));
                             assert_eq!(query.since, None);
                             assert_eq!(query.pane_id, Some(7));
-                            ready_page([1, 4, 9, 11]
-                                .into_iter()
-                                .filter(|id| *id > query.after_id.unwrap())
-                                .map(|id| {
-                                    let mut row = segment(id);
-                                    row.captured_at = if id == 9 { i64::MIN } else { 0 };
-                                    row
-                                })
-                                .collect())
+                            ready_page(
+                                [1, 4, 9, 11]
+                                    .into_iter()
+                                    .filter(|id| *id > query.after_id.unwrap())
+                                    .map(|id| {
+                                        let mut row = segment(id);
+                                        row.captured_at = if id == 9 { i64::MIN } else { 0 };
+                                        row
+                                    })
+                                    .collect(),
+                            )
                         },
                         &Redactor::new(),
                         &tx
@@ -1439,7 +1468,8 @@ mod tests {
             );
             drop(stream); // The unread frames 2 and 3 disappear with this body.
 
-            let resume = parse_delta_resume(Some(received_id.as_bytes()), None, None, Some(7)).unwrap();
+            let resume =
+                parse_delta_resume(Some(received_id.as_bytes()), None, None, Some(7)).unwrap();
             let Some(DeltaResume::Cursor(resume)) = resume else {
                 panic!("received cursor must stay epoch-bound");
             };
@@ -1453,10 +1483,12 @@ mod tests {
                         |query| {
                             assert_eq!(query.after_id, Some(1));
                             assert_eq!(query.since, None);
-                            ready_page((1..=4)
-                                .filter(|id| *id > query.after_id.unwrap())
-                                .map(segment)
-                                .collect())
+                            ready_page(
+                                (1..=4)
+                                    .filter(|id| *id > query.after_id.unwrap())
+                                    .map(segment)
+                                    .collect(),
+                            )
                         },
                         &Redactor::new(),
                         &tx

@@ -504,8 +504,8 @@ impl AuxiliaryRetentionTable {
 // private-helper deps from this module.
 pub use self::types::{
     CaptureSearchResult, EmbeddingStats, FtsIndexState, FtsPaneProgress, FtsSyncResult,
-    HybridSearchBundle,
-    HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult, SemanticSearchHit,
+    HybridSearchBundle, HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult,
+    SemanticSearchHit,
 };
 
 // br-ft-bbhwz: Gap + FtsSyncConfig (+ Default impl) moved to
@@ -36428,7 +36428,9 @@ fn query_segments_stream_page_backend(
         query.limit
     };
     if limit > SEGMENT_STREAM_PAGE_MAX || query.after_id.is_some_and(|after_id| after_id < 0) {
-        return Err(StorageError::Database("invalid segment stream page bounds".to_string()).into());
+        return Err(
+            StorageError::Database("invalid segment stream page bounds".to_string()).into(),
+        );
     }
     let (where_clause, mut params) = build_segment_scan_backend_where(query, "captured_at")?;
     params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
@@ -36468,13 +36470,14 @@ fn query_segments_stream_page_backend(
                 snapshot = Some(segment_stream_snapshot_from_cells(row, 8)?);
             }
             _ => {
-                return Err(StorageError::Database("invalid segment stream page".to_string()).into());
+                return Err(
+                    StorageError::Database("invalid segment stream page".to_string()).into(),
+                );
             }
         }
     }
-    let snapshot = snapshot.ok_or_else(|| {
-        StorageError::Database("missing segment stream authority".to_string())
-    })?;
+    let snapshot = snapshot
+        .ok_or_else(|| StorageError::Database("missing segment stream authority".to_string()))?;
     let mut previous_id = query.after_id.unwrap_or(0);
     if segments.len() > limit {
         return Err(StorageError::Database("oversized segment stream page".to_string()).into());
@@ -36483,11 +36486,15 @@ fn query_segments_stream_page_backend(
         if segment.id <= previous_id
             || segment.id > snapshot.max_segment_id
             || segment.id > snapshot.tail_segment_id
-            || query.pane_id.is_some_and(|pane_id| segment.pane_id != pane_id)
+            || query
+                .pane_id
+                .is_some_and(|pane_id| segment.pane_id != pane_id)
             || query.since.is_some_and(|since| segment.captured_at < since)
             || query.until.is_some_and(|until| segment.captured_at > until)
         {
-            return Err(StorageError::Database("inconsistent segment stream page".to_string()).into());
+            return Err(
+                StorageError::Database("inconsistent segment stream page".to_string()).into(),
+            );
         }
         previous_id = segment.id;
     }
