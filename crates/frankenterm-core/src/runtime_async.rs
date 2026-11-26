@@ -15714,6 +15714,9 @@ mod tests {
     // Process module tests
     // ========================================================================
 
+    // These std::process tests run Unix utilities (echo, false, env, cat),
+    // which Windows does not have, so they are cfg(unix).
+    #[cfg(unix)]
     #[test]
     fn process_command_echo() {
         let output = std::process::Command::new("echo")
@@ -15725,6 +15728,7 @@ mod tests {
         assert!(stdout.contains("hello"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_command_false_returns_non_zero() {
         let output = std::process::Command::new("false")
@@ -15733,6 +15737,7 @@ mod tests {
         assert!(!output.status.success());
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_command_with_env() {
         let output = std::process::Command::new("env")
@@ -15743,6 +15748,7 @@ mod tests {
         assert!(stdout.contains("TEST_RC_VAR=42"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_command_stdin_piped() {
         use std::process::Stdio;
@@ -15765,6 +15771,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_command_args_multiple() {
         let output = std::process::Command::new("echo")
