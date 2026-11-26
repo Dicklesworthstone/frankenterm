@@ -44833,9 +44833,14 @@ async fn bootstrap_recorder_backend_with_probe(
     })
     .await?;
     // ft-w1nas: roll the append log into sealed segments and keep a 2 GiB budget.
-    let storage = storage.with_append_log_retention(
-        frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT,
-    );
+    // ft-pod45o: keep the rusqlite recorder (the default off Unix) to the same.
+    let storage = storage
+        .with_append_log_retention(
+            frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT,
+        )
+        .with_rusqlite_retention(
+            frankenterm_core::recorder_storage::RusqliteRetention::WATCHER_DEFAULT,
+        );
 
     let health = storage.health_with_cx(cx).await;
     if let Some(reason) = recorder_startup_health_failure_reason(&health) {
@@ -101933,9 +101938,10 @@ fn disk_space_diagnostic_check_from(probe: &Path, space: Option<(u64, u64)>) -> 
 const RECORDER_STORAGE_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 /// `ft doctor` row for recorder disk usage. Every captured segment is also
-/// written to the recorder. The append log rolls within a budget (ft-w1nas);
-/// the rusqlite recorder has no retention, so its size only grows. Surface
-/// both before they fill a disk.
+/// written to the recorder. The append log rolls within a budget (ft-w1nas)
+/// and the rusqlite recorder is pruned to one (ft-pod45o), but a checkpointed
+/// consumer can hold space in either, and a rusqlite database created before
+/// its retention does not shrink. Surface both before they fill a disk.
 fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
     const FILES: [&str; 4] = [
         "events.log",
@@ -101980,8 +101986,8 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         .map(|(name, len)| format!("{name} {}", format_bytes_human(*len)))
         .collect::<Vec<_>>()
         .join(", ");
-    // Only the append log has retention; say so per backend whose files exist
-    // (the rusqlite recorder is the default off Unix).
+    // State the retention of each backend whose files exist (the rusqlite
+    // recorder is the default off Unix).
     let mut retention = Vec::new();
     if sealed_count > 0 || sizes.iter().any(|(name, _)| *name == "events.log") {
         retention.push(format!(
@@ -102000,7 +102006,13 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         .iter()
         .any(|(name, _)| name.starts_with("events.sqlite3"))
     {
-        retention.push("events.sqlite3 has no retention yet and only grows".to_string());
+        retention.push(format!(
+            "the watcher prunes events.sqlite3 to {} in use",
+            format_bytes_human(
+                frankenterm_core::recorder_storage::RusqliteRetention::WATCHER_DEFAULT
+                    .max_total_bytes
+            ),
+        ));
     }
     let detail = format!(
         "{} total ({listing}); {}",
@@ -102011,7 +102023,7 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         DiagnosticCheck::warning(
             "recorder storage",
             detail,
-            "Above the append-log budget: an events.sqlite3 recorder or a checkpointed consumer (which pauses rolling) is holding space; archive or remove .ft/recorder-log with the watcher stopped",
+            "Above the recorder budget: a checkpointed consumer is holding space (it pauses append-log rolling and keeps the events.sqlite3 events it has not acknowledged), or an events.sqlite3 from before retention has not shrunk (it reuses its freed pages); archive or remove .ft/recorder-log with the watcher stopped",
         )
     } else {
         DiagnosticCheck::ok_with_detail("recorder storage", detail)
@@ -109300,7 +109312,7 @@ mod tests {
         let detail = large.detail.unwrap_or_default();
         assert!(detail.contains("rolls events.log every"), "{detail}");
         assert!(
-            detail.contains("events.sqlite3 has no retention yet"),
+            detail.contains("prunes events.sqlite3 to 2.0 GiB in use"),
             "{detail}"
         );
 
@@ -109312,7 +109324,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             detail,
-            "1.0 KiB total (events.sqlite3 1.0 KiB); events.sqlite3 has no retention yet and only grows"
+            "1.0 KiB total (events.sqlite3 1.0 KiB); the watcher prunes events.sqlite3 to 2.0 GiB in use"
         );
         assert_eq!(format_bytes_human(1536), "1.5 KiB");
         assert_eq!(format_bytes_human(12), "12 B");

@@ -832,6 +832,34 @@ impl AppendLogRetention {
     };
 }
 
+/// Byte budget for the rusqlite recorder (ft-pod45o).
+///
+/// When a committed append leaves the database's pages in use above
+/// `max_total_bytes`, the oldest events are deleted, a bounded number per
+/// transaction, until the pages in use are a sixteenth below it; a large
+/// backlog continues after later appends. Two kinds of event are never deleted:
+/// those at or above the lowest consumer checkpoint, so a consumer keeps what it
+/// has not acknowledged, and those of the batch just appended, whose last event
+/// is the authority for the next ordinal and byte offset. Deletion is per event,
+/// so the oldest retained batch can be cut; every batch that loses an event also
+/// loses its idempotency receipt, so a retry of it appends again instead of
+/// failing receipt verification. Appends reuse free pages before they grow the
+/// file. A database this backend creates uses incremental auto-vacuum, so free
+/// pages beyond an eighth of the budget, as after a large backlog, also go back
+/// to the filesystem, a bounded number per append. An older database only
+/// reuses them, so it stops growing but does not shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RusqliteRetention {
+    pub max_total_bytes: u64,
+}
+
+impl RusqliteRetention {
+    /// Watcher default: the append log's 2 GiB total budget.
+    pub const WATCHER_DEFAULT: Self = Self {
+        max_total_bytes: AppendLogRetention::WATCHER_DEFAULT.max_total_bytes,
+    };
+}
+
 /// A sealed append-log segment: `<log name>.<segment id>.<first>-<end>`, with
 /// `end` the exclusive ordinal bound. The name alone restores ordinals after a
 /// crash anywhere in the roll sequence.
@@ -1008,6 +1036,15 @@ impl RecorderStorageInstance {
         match self {
             Self::AppendLog(storage) => Self::AppendLog(storage.with_retention(retention)),
             other @ Self::Rusqlite(_) => other,
+        }
+    }
+
+    /// Enable rusqlite retention; no effect on other backends (ft-pod45o).
+    #[must_use]
+    pub fn with_rusqlite_retention(self, retention: RusqliteRetention) -> Self {
+        match self {
+            Self::Rusqlite(storage) => Self::Rusqlite(storage.with_retention(retention)),
+            other @ Self::AppendLog(_) => other,
         }
     }
 }
@@ -2623,6 +2660,7 @@ impl RecorderStorage for AppendLogRecorderStorage {
 #[derive(Clone)]
 pub struct RusqliteRecorderStorage {
     config: RusqliteStorageConfig,
+    retention: Option<RusqliteRetention>,
     in_flight: Arc<AtomicUsize>,
     checkpoint_in_flight: Arc<AtomicUsize>,
     flush_in_flight: Arc<AtomicUsize>,
@@ -2645,6 +2683,7 @@ impl std::fmt::Debug for RusqliteRecorderStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RusqliteRecorderStorage")
             .field("db_path", &self.config.db_path)
+            .field("retention", &self.retention)
             .field("queue_capacity", &self.config.queue_capacity)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .field(
@@ -2740,6 +2779,7 @@ impl RusqliteRecorderStorage {
         initialize_rusqlite_schema(&conn)?;
         Ok(Self {
             config,
+            retention: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
             checkpoint_in_flight: Arc::new(AtomicUsize::new(0)),
             flush_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2755,6 +2795,13 @@ impl RusqliteRecorderStorage {
             })),
             read_in_flight: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Enable the byte budget (ft-pod45o); see [`RusqliteRetention`].
+    #[must_use]
+    pub fn with_retention(mut self, retention: RusqliteRetention) -> Self {
+        self.retention = Some(retention);
+        self
     }
 
     /// Return a reader over this storage's event stream.
@@ -3151,6 +3198,20 @@ impl RusqliteRecorderStorage {
         match result {
             Ok(response) => {
                 Self::clear_last_error(&mut inner);
+                if let Some(retention) = self.retention
+                    && !response.was_idempotent_replay
+                {
+                    // The batch is committed; a failed prune only postpones
+                    // retention and is retried after the next append.
+                    if let Err(err) = prune_rusqlite_recorder(
+                        &mut inner.conn,
+                        retention,
+                        response.first_offset.ordinal,
+                    ) {
+                        tracing::warn!(error = %err, "recorder rusqlite retention failed");
+                        Self::record_last_error(&mut inner, "rusqlite_retention", &err);
+                    }
+                }
                 Ok(response)
             }
             Err(err) => {
@@ -3990,6 +4051,156 @@ fn evict_rusqlite_receipts(
     Ok(())
 }
 
+/// Most events one retention transaction deletes, bounding its write lock.
+const RUSQLITE_RETENTION_ROUND_EVENTS: i64 = 16_384;
+/// Most retention transactions per append. A larger backlog, such as an older
+/// database first opened with a budget, shrinks over the following appends.
+const RUSQLITE_RETENTION_MAX_ROUNDS: usize = 8;
+/// Most free pages one append gives back to the filesystem; a larger free
+/// list shrinks over the following appends.
+const RUSQLITE_RETENTION_VACUUM_PAGES: u64 = 16_384;
+
+/// Page accounting of a recorder database's main schema.
+#[derive(Debug, Clone, Copy)]
+struct SqlitePageUsage {
+    page_size: u64,
+    page_count: u64,
+    free_pages: u64,
+}
+
+impl SqlitePageUsage {
+    fn read(conn: &Connection) -> std::result::Result<Self, RecorderStorageError> {
+        let pragma = |name: &str| -> std::result::Result<u64, RecorderStorageError> {
+            let value: i64 = conn
+                .query_row(&format!("PRAGMA main.{name}"), [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            Ok(u64::try_from(value).unwrap_or(0))
+        };
+        Ok(Self {
+            page_size: pragma("page_size")?,
+            page_count: pragma("page_count")?,
+            free_pages: pragma("freelist_count")?,
+        })
+    }
+
+    /// Bytes in the pages in use: every page but the free list.
+    fn used_bytes(self) -> u64 {
+        self.page_count
+            .saturating_sub(self.free_pages)
+            .saturating_mul(self.page_size)
+    }
+}
+
+/// Keep the database within `retention` (see [`RusqliteRetention`]): delete
+/// the oldest events while it is over budget, then give free pages beyond an
+/// eighth of the budget back to the filesystem. `keep_from` is the first
+/// ordinal of the batch just appended. Returns how many events were deleted.
+fn prune_rusqlite_recorder(
+    conn: &mut Connection,
+    retention: RusqliteRetention,
+    keep_from: u64,
+) -> std::result::Result<u64, RecorderStorageError> {
+    let mut usage = SqlitePageUsage::read(conn)?;
+    let deleted = if usage.used_bytes() > retention.max_total_bytes {
+        delete_oldest_rusqlite_events(conn, retention, keep_from, &mut usage)?
+    } else {
+        0
+    };
+    // Appends reuse free pages before they grow the file, so the pages one
+    // prune frees are needed again within the next sixteenth of the budget.
+    // Only a free list beyond that, as after a large backlog, is returned.
+    let keep_free = (retention.max_total_bytes / 8) / usage.page_size.max(1);
+    if usage.free_pages > keep_free {
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA main.auto_vacuum", [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        // 2 is INCREMENTAL. The pragma returns a row per freed page and frees
+        // one page per step, so step it to the end.
+        if auto_vacuum == 2 {
+            let pages = (usage.free_pages - keep_free).min(RUSQLITE_RETENTION_VACUUM_PAGES);
+            let mut statement = conn
+                .prepare(&format!("PRAGMA main.incremental_vacuum({pages})"))
+                .map_err(sqlite_error)?;
+            let mut rows = statement.query([]).map_err(sqlite_error)?;
+            while rows.next().map_err(sqlite_error)?.is_some() {}
+        }
+    }
+    Ok(deleted)
+}
+
+/// The deletion half of [`prune_rusqlite_recorder`]: delete the oldest events
+/// until the pages in use are a sixteenth below the budget, so the next
+/// deletion waits for that much new data instead of adding a transaction to
+/// every append. `usage` is updated after each transaction.
+fn delete_oldest_rusqlite_events(
+    conn: &mut Connection,
+    retention: RusqliteRetention,
+    keep_from: u64,
+    usage: &mut SqlitePageUsage,
+) -> std::result::Result<u64, RecorderStorageError> {
+    let target = retention.max_total_bytes - retention.max_total_bytes / 16;
+    let keep_from = u64_to_sql_i64(keep_from, "retention keep_from")?;
+    let mut deleted = 0_u64;
+    for _ in 0..RUSQLITE_RETENTION_MAX_ROUNDS {
+        let used = usage.used_bytes();
+        if used <= target {
+            break;
+        }
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        let (oldest, newest): (Option<i64>, Option<i64>) = transaction
+            .query_row(
+                "SELECT MIN(ordinal), MAX(ordinal) FROM recorder_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sqlite_error)?;
+        let (Some(oldest), Some(newest)) = (oldest, newest) else {
+            break;
+        };
+        // Ordinals are contiguous above the oldest retained event, so this is
+        // the event count without a table scan. Delete about the excess at the
+        // database's average bytes per event; later rounds correct the guess.
+        let events = u128::try_from(newest.saturating_sub(oldest).saturating_add(1)).unwrap_or(0);
+        let excess = u128::from(used - target);
+        let estimate = (excess * events).div_ceil(u128::from(used));
+        let round = i64::try_from(estimate)
+            .unwrap_or(i64::MAX)
+            .clamp(1, RUSQLITE_RETENTION_ROUND_EVENTS);
+        let lowest_checkpoint: Option<i64> = transaction
+            .query_row("SELECT MIN(ordinal) FROM recorder_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_error)?;
+        let mut cut = oldest.saturating_add(round).min(keep_from);
+        if let Some(lowest_checkpoint) = lowest_checkpoint {
+            cut = cut.min(lowest_checkpoint);
+        }
+        if cut <= oldest {
+            break;
+        }
+        transaction
+            .execute(
+                "DELETE FROM recorder_batches WHERE batch_id IN (
+                     SELECT DISTINCT batch_id FROM recorder_events WHERE ordinal < ?1
+                 )",
+                params![cut],
+            )
+            .map_err(sqlite_error)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM recorder_events WHERE ordinal < ?1",
+                params![cut],
+            )
+            .map_err(sqlite_error)?;
+        transaction.commit().map_err(sqlite_error)?;
+        deleted = deleted.saturating_add(removed as u64);
+        *usage = SqlitePageUsage::read(conn)?;
+    }
+    Ok(deleted)
+}
+
 /// Establish the writer policy before schema changes or append receipts.
 ///
 /// EXTRA adds directory synchronization for DELETE-journal commits and equals
@@ -4049,8 +4260,12 @@ fn configure_rusqlite_durability(
 }
 
 fn initialize_rusqlite_schema(conn: &Connection) -> std::result::Result<(), RecorderStorageError> {
+    // auto_vacuum takes effect only before the first table exists, so a new
+    // database gets incremental vacuum for retention (ft-pod45o). On an older
+    // database the setting waits for a VACUUM, which this backend never runs.
     conn.execute_batch(
         "
+        PRAGMA main.auto_vacuum = INCREMENTAL;
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS recorder_events (
             ordinal INTEGER PRIMARY KEY,
@@ -7708,6 +7923,222 @@ recorder_backend = "frankensqlite"
             let lag = storage.lag_metrics().await.unwrap();
             assert_eq!(lag.latest_offset.unwrap().ordinal, 2);
             assert_eq!(lag.consumers[0].offsets_behind, 1);
+        });
+    }
+
+    // ft-pod45o: batch `index` of `size` events, each about 1.3 KiB stored.
+    fn retention_batch(index: u64, size: u64) -> AppendRequest {
+        AppendRequest {
+            batch_id: format!("retention-{index}"),
+            events: (0..size)
+                .map(|n| {
+                    let sequence = index * size + n;
+                    sample_event(&format!("ret-{sequence}"), 1, sequence, &"x".repeat(1024))
+                })
+                .collect(),
+            required_durability: DurabilityLevel::Appended,
+            producer_ts_ms: index,
+        }
+    }
+
+    // (oldest ordinal, newest ordinal, event count) of a recorder database.
+    fn retention_event_range(conn: &Connection) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT MIN(ordinal), MAX(ordinal), COUNT(*) FROM recorder_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rusqlite_retention_deletes_the_oldest_events_and_returns_their_pages() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let mut config = recorder_test_config(dir.path()).rusqlite;
+            // Keep every receipt, so only retention removes them.
+            config.max_idempotency_entries = 4096;
+            let db_path = config.db_path.clone();
+            let budget = 256 * 1024;
+
+            // 800 events of about 1.3 KiB, recorded without a budget: a backlog
+            // over four times the budget below.
+            let storage = RusqliteRecorderStorage::open(config.clone()).unwrap();
+            for index in 0..200 {
+                storage
+                    .append_batch(retention_batch(index, 4))
+                    .await
+                    .unwrap();
+            }
+            drop(storage);
+            let backlog_len = std::fs::metadata(&db_path).unwrap().len();
+            assert!(backlog_len > 4 * budget, "{backlog_len} byte backlog");
+
+            let storage = RusqliteRecorderStorage::open(config)
+                .unwrap()
+                .with_retention(RusqliteRetention {
+                    max_total_bytes: budget,
+                });
+            let mut previous_last = 799;
+            for index in 200..250 {
+                let response = storage
+                    .append_batch(retention_batch(index, 4))
+                    .await
+                    .unwrap();
+                assert_eq!(response.first_offset.ordinal, previous_last + 1);
+                previous_last = response.last_offset.ordinal;
+            }
+            assert!(storage.health().await.last_error.is_none());
+
+            let conn = Connection::open(&db_path).unwrap();
+            let usage = SqlitePageUsage::read(&conn).unwrap();
+            assert!(usage.used_bytes() <= budget, "{usage:?}");
+            let (oldest, newest, count) = retention_event_range(&conn);
+            assert_eq!(newest, 999);
+            assert!(oldest > 0, "the oldest events were deleted");
+            assert_eq!(
+                count,
+                newest - oldest + 1,
+                "retained ordinals are contiguous"
+            );
+
+            // The database was created for incremental vacuum, so the backlog's
+            // pages went back to the filesystem. What stays free is at most an
+            // eighth of the budget, for the appends that follow to reuse.
+            let auto_vacuum: i64 = conn
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(auto_vacuum, 2);
+            assert!(
+                usage.free_pages * usage.page_size <= budget / 8,
+                "{usage:?}"
+            );
+            let file_len = std::fs::metadata(&db_path).unwrap().len();
+            assert_eq!(file_len, usage.page_count * usage.page_size);
+            assert!(file_len <= budget + budget / 16, "{file_len} byte file");
+
+            // Each remaining receipt covers a whole batch, so it still verifies
+            // and its retry replays.
+            let partial_receipts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM recorder_batches AS batch
+                     WHERE (SELECT COUNT(*) FROM recorder_events AS event
+                            WHERE event.batch_id = batch.batch_id) <> 4",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(partial_receipts, 0);
+            let replay = storage.append_batch(retention_batch(249, 4)).await.unwrap();
+            assert!(replay.was_idempotent_replay);
+            assert_eq!(replay.last_offset.ordinal, 999);
+            // A pruned batch has no receipt left, so its retry appends again
+            // rather than failing verification of a receipt whose events are
+            // gone.
+            let retry = storage.append_batch(retention_batch(0, 4)).await.unwrap();
+            assert!(!retry.was_idempotent_replay);
+            assert_eq!(retry.first_offset.ordinal, 1000);
+            assert!(storage.health().await.last_error.is_none());
+        });
+    }
+
+    #[test]
+    fn rusqlite_retention_keeps_events_a_consumer_has_not_acknowledged() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = recorder_test_config(dir.path()).rusqlite;
+            let db_path = config.db_path.clone();
+            let storage = RusqliteRecorderStorage::open(config)
+                .unwrap()
+                .with_retention(RusqliteRetention {
+                    max_total_bytes: 128 * 1024,
+                });
+            // 40 events fit the budget, so nothing is deleted before the
+            // checkpoint at ordinal 20.
+            let mut pinned = None;
+            for index in 0..10 {
+                let response = storage
+                    .append_batch(retention_batch(index, 4))
+                    .await
+                    .unwrap();
+                if index == 5 {
+                    pinned = Some(response.first_offset);
+                }
+            }
+            let pinned = pinned.unwrap();
+            assert_eq!(pinned.ordinal, 20);
+            let consumer = CheckpointConsumerId("retention-indexer".to_string());
+            let checkpoint = |upto_offset| RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset,
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: crate::recording::epoch_ms_now(),
+            };
+            storage
+                .commit_checkpoint(checkpoint(pinned.clone()))
+                .await
+                .unwrap();
+
+            let mut last = None;
+            for index in 10..110 {
+                last = Some(
+                    storage
+                        .append_batch(retention_batch(index, 4))
+                        .await
+                        .unwrap()
+                        .last_offset,
+                );
+            }
+            let conn = Connection::open(&db_path).unwrap();
+            let (oldest, newest, count) = retention_event_range(&conn);
+            assert_eq!(
+                oldest, 20,
+                "everything below the checkpoint went, nothing above"
+            );
+            assert_eq!(count, newest - oldest + 1);
+            assert!(SqlitePageUsage::read(&conn).unwrap().used_bytes() > 128 * 1024);
+
+            // Acknowledging releases the events, and the next append prunes.
+            storage
+                .commit_checkpoint(checkpoint(last.unwrap()))
+                .await
+                .unwrap();
+            storage.append_batch(retention_batch(110, 4)).await.unwrap();
+            let (oldest, _, _) = retention_event_range(&conn);
+            assert!(oldest > 20, "oldest retained ordinal {oldest}");
+        });
+    }
+
+    #[test]
+    fn rusqlite_retention_never_deletes_the_batch_just_appended() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let mut config = recorder_test_config(dir.path());
+            config.backend = RecorderBackendKind::Rusqlite;
+            let db_path = config.rusqlite.db_path.clone();
+            // Through the bootstrap instance, as the watcher enables it.
+            let storage = bootstrap_recorder_storage(config)
+                .unwrap()
+                .with_rusqlite_retention(RusqliteRetention { max_total_bytes: 1 });
+            let conn = Connection::open(&db_path).unwrap();
+            for index in 0..5 {
+                let response = storage
+                    .append_batch(retention_batch(index, 4))
+                    .await
+                    .unwrap();
+                let (oldest, newest, count) = retention_event_range(&conn);
+                assert_eq!(
+                    (oldest, newest, count),
+                    (
+                        i64::try_from(response.first_offset.ordinal).unwrap(),
+                        i64::try_from(response.last_offset.ordinal).unwrap(),
+                        4
+                    )
+                );
+            }
+            // The head still follows the newest event.
+            let reader = RusqliteEventReader::new(db_path);
+            assert_eq!(reader.head_offset().unwrap().ordinal, 20);
         });
     }
 
