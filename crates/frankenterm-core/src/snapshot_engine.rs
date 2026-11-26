@@ -9904,74 +9904,49 @@ fn save_checkpoint_sync_with_fault(
 /// Recompute the mutable session summary after checkpoint rows were removed.
 /// Clean state remains true only while its exact receipt row still exists,
 /// belongs to this session, and is still the deterministic latest checkpoint.
-fn reconcile_session_after_checkpoint_deletion(
+fn reconcile_checkpoint_summaries(
     tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    force_unclean: bool,
+    affected_query: &str,
+    params: impl rusqlite::Params,
+    expected: usize,
 ) -> std::result::Result<(), rusqlite::Error> {
     let updated = tx.execute(
-        "UPDATE mux_sessions AS session
-         SET last_checkpoint_at = (
-                 SELECT checkpoint.checkpoint_at
-                 FROM session_checkpoints AS checkpoint
-                 WHERE checkpoint.session_id = session.session_id
-                 ORDER BY checkpoint.id DESC
-                 LIMIT 1
-             ),
-             topology_json = COALESCE(
-                 (
-                     SELECT checkpoint.topology_json
-                     FROM session_checkpoints AS checkpoint
-                     WHERE checkpoint.session_id = session.session_id
-                       AND checkpoint.checkpoint_role = 'snapshot'
-                       AND checkpoint.topology_json IS NOT NULL
-                     ORDER BY checkpoint.id DESC
-                     LIMIT 1
-                 ),
-                 session.topology_json
-             ),
-             shutdown_clean = CASE
-                 WHEN ?2 = 0
-                  AND session.shutdown_clean = 1
-                  AND EXISTS (
-                      SELECT 1
-                      FROM session_checkpoints AS clean
-                      WHERE clean.id = session.clean_checkpoint_id
-                        AND clean.session_id = session.session_id
-                        AND clean.id = (
-                            SELECT latest.id
-                            FROM session_checkpoints AS latest
-                            WHERE latest.session_id = session.session_id
-                            ORDER BY latest.id DESC
-                            LIMIT 1
-                        )
+        &format!(
+            "WITH affected(session_id, force_unclean) AS ({affected_query}),
+                  latest AS MATERIALIZED (
+                      SELECT affected.*, (
+                          SELECT checkpoint.id FROM session_checkpoints AS checkpoint
+                          WHERE checkpoint.session_id = affected.session_id
+                          ORDER BY checkpoint.id DESC LIMIT 1
+                      ) AS latest_id
+                      FROM affected
                   )
-                 THEN 1
-                 ELSE 0
-             END,
-             clean_checkpoint_id = CASE
-                 WHEN ?2 = 0
-                  AND session.shutdown_clean = 1
-                  AND EXISTS (
-                      SELECT 1
-                      FROM session_checkpoints AS clean
-                      WHERE clean.id = session.clean_checkpoint_id
-                        AND clean.session_id = session.session_id
-                        AND clean.id = (
-                            SELECT latest.id
-                            FROM session_checkpoints AS latest
-                            WHERE latest.session_id = session.session_id
-                            ORDER BY latest.id DESC
-                            LIMIT 1
-                        )
-                  )
-                 THEN session.clean_checkpoint_id
-                 ELSE NULL
-             END
-         WHERE session.session_id = ?1",
-        rusqlite::params![session_id, force_unclean],
+             UPDATE mux_sessions AS session
+             SET last_checkpoint_at = checkpoint.checkpoint_at,
+                 topology_json = COALESCE((
+                     SELECT snapshot.topology_json FROM session_checkpoints AS snapshot
+                     WHERE snapshot.session_id = session.session_id
+                       AND snapshot.checkpoint_role = 'snapshot'
+                       AND snapshot.topology_json IS NOT NULL
+                     ORDER BY snapshot.id DESC LIMIT 1
+                 ), session.topology_json),
+                 shutdown_clean = CASE
+                     WHEN latest.force_unclean = 0 AND session.shutdown_clean = 1
+                      AND session.clean_checkpoint_id = latest.latest_id THEN 1
+                     ELSE 0 END,
+                 clean_checkpoint_id = CASE
+                     WHEN latest.force_unclean = 0 AND session.shutdown_clean = 1
+                      AND session.clean_checkpoint_id = latest.latest_id THEN latest.latest_id
+                     ELSE NULL END
+             FROM latest LEFT JOIN session_checkpoints AS checkpoint ON checkpoint.id = latest.latest_id
+             WHERE session.session_id = latest.session_id"
+        ),
+        params,
     )?;
-    require_exactly_one_changed_row(updated)
+    if updated != expected {
+        return Err(rusqlite::Error::StatementChangedRows(updated));
+    }
+    Ok(())
 }
 
 type CheckpointDeleteRow = (i64, String, i64, String, String, i64, i64, i64, i64, i64);
@@ -10146,7 +10121,12 @@ fn delete_checkpoint_authoritatively_sync(
         )?;
         require_exactly_one_changed_row(deleted)?;
         let force_unclean = was_latest_checkpoint != 0 || was_latest_snapshot != 0;
-        reconcile_session_after_checkpoint_deletion(tx, &session_id, force_unclean)?;
+        reconcile_checkpoint_summaries(
+            tx,
+            "SELECT ?1, ?2",
+            rusqlite::params![session_id, force_unclean],
+            1,
+        )?;
 
         Ok(Some(SnapshotDeleteResult {
             identity: SnapshotCheckpointIdentity {
@@ -10163,6 +10143,9 @@ fn delete_checkpoint_authoritatively_sync(
     })
 }
 
+/// Maximum checkpoint deletes or session-summary updates in one cleanup statement.
+const CHECKPOINT_CLEANUP_BATCH_SIZE: usize = 256;
+
 /// Remove checkpoints exceeding retention limits.
 /// Returns the number of checkpoints deleted.
 fn cleanup_authoritatively_sync(
@@ -10178,109 +10161,91 @@ fn cleanup_authoritatively_sync(
     // or turning a safe no-op policy into a permanent cleanup failure.
     let retention_count = i64::try_from(retention_count).unwrap_or(i64::MAX);
 
-    // Wrap both DELETEs in a transaction so a concurrent checkpoint insert
-    // between them cannot be incorrectly deleted by the second statement.
+    // Freeze the two retention decisions under one writer transaction. In
+    // particular, age-expired *unprotected* rows do not consume a count slot,
+    // even if a clock adjustment gave them a newer insertion ID.
     run_snapshot_authority_transaction(&conn, |tx| {
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
-
-        let affected_sql = format!(
-            "WITH ranked AS (
-                 SELECT id,
-                        session_id,
-                        checkpoint_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY session_id
-                            ORDER BY id DESC
-                        ) AS checkpoint_rank
-                 FROM session_checkpoints
-                 WHERE checkpoint_role = 'snapshot'
-             )
-             SELECT CASE
-                        WHEN typeof(session_id) = 'text'
-                         AND length(CAST(session_id AS BLOB))
-                             BETWEEN 1 AND {MAX_CHECKPOINT_SESSION_ID_BYTES}
-                        THEN session_id
-                    END,
-                    MAX(
-                        CASE
-                            WHEN checkpoint_rank = 1
-                             AND (checkpoint_at < ?1 OR checkpoint_rank > ?2)
-                            THEN 1
-                            ELSE 0
-                        END
-                    ) AS deletes_latest_snapshot
-             FROM ranked
-             WHERE (checkpoint_at < ?1 OR checkpoint_rank > ?2)
-               AND id NOT IN (
-                   SELECT source_checkpoint_id
-                   FROM restore_attempt_lifecycle
-                   WHERE CASE
-                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
-                           ELSE 1
-                         END = 1
-               )
-             GROUP BY session_id"
-        );
-        let mut affected_stmt = tx.prepare(&affected_sql)?;
-        let affected_sessions = affected_stmt
-            .query_map(rusqlite::params![cutoff_ms, retention_count], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(affected_stmt);
-
-        // Delete checkpoints older than retention_days
-        let deleted_by_age: usize = tx.execute(
-            "DELETE FROM session_checkpoints
-             WHERE checkpoint_role = 'snapshot'
-               AND checkpoint_at < ?1
-               AND id NOT IN (
-                   SELECT source_checkpoint_id
-                   FROM restore_attempt_lifecycle
-                   WHERE CASE
-                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
-                           ELSE 1
-                         END = 1
-               )",
-            [cutoff_ms],
+        tx.execute_batch(
+            "CREATE TEMP TABLE cleanup_candidates (
+                 checkpoint_id INTEGER NOT NULL,
+                 session_id TEXT NOT NULL,
+                 deletes_latest_snapshot INTEGER NOT NULL
+             );
+             CREATE TEMP TABLE cleanup_sessions (
+                 session_id TEXT NOT NULL,
+                 force_unclean INTEGER NOT NULL
+             );",
         )?;
-
-        // Keep only the latest retention_count checkpoints per session.
-        // The ranking must be partitioned by session_id; a global LIMIT would let
-        // one busy session evict another session's newest retained checkpoints.
-        let deleted_by_count: usize = tx.execute(
-            "DELETE FROM session_checkpoints
-             WHERE id IN (
-                 SELECT id
-                 FROM (
-                     SELECT id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY session_id
-                                ORDER BY id DESC
-                            ) AS checkpoint_rank
-                     FROM session_checkpoints
-                     WHERE checkpoint_role = 'snapshot'
+        let candidates = tx.execute(
+            &format!(
+                "WITH snapshots AS (
+                     SELECT id, session_id, checkpoint_at,
+                            id NOT IN (
+                                SELECT source_checkpoint_id FROM restore_attempt_lifecycle
+                                WHERE CASE WHEN typeof(status) = 'text' AND status = 'resolved'
+                                           THEN 0 ELSE 1 END = 1
+                            ) AS removable
+                     FROM session_checkpoints WHERE checkpoint_role = 'snapshot'
+                 ), ranked AS (
+                     SELECT *, ROW_NUMBER() OVER newest AS original_rank,
+                            SUM(CASE WHEN checkpoint_at < ?1 AND removable THEN 0 ELSE 1 END)
+                                OVER newest AS rank_after_age
+                     FROM snapshots
+                     WINDOW newest AS (PARTITION BY session_id ORDER BY id DESC
+                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                  )
-                 WHERE checkpoint_rank > ?1
-             )
-               AND id NOT IN (
-                   SELECT source_checkpoint_id
-                   FROM restore_attempt_lifecycle
-                   WHERE CASE
-                           WHEN typeof(status) = 'text' AND status = 'resolved' THEN 0
-                           ELSE 1
-                         END = 1
-               )",
-            [retention_count],
+                 INSERT INTO temp.cleanup_candidates
+                 SELECT id, CASE WHEN typeof(session_id) = 'text'
+                                  AND length(CAST(session_id AS BLOB))
+                                      BETWEEN 1 AND {MAX_CHECKPOINT_SESSION_ID_BYTES}
+                                 THEN session_id END,
+                        original_rank = 1
+                 FROM ranked
+                 WHERE removable AND (checkpoint_at < ?1 OR rank_after_age > ?2)"
+            ),
+            rusqlite::params![cutoff_ms, retention_count],
         )?;
-
-        for (session_id, force_unclean) in affected_sessions {
-            reconcile_session_after_checkpoint_deletion(tx, &session_id, force_unclean)?;
+        if candidates == 0 {
+            return Ok(0);
         }
 
-        deleted_by_age
-            .checked_add(deleted_by_count)
-            .ok_or_else(|| snapshot_integer_overflow("snapshot cleanup deletion count overflow"))
+        // The connection-private work lists can spill to SQLite temporary
+        // storage. Both have dense rowids starting at 1 and stay immutable.
+        let sessions = tx.execute(
+            "INSERT INTO temp.cleanup_sessions
+             SELECT session_id, MAX(deletes_latest_snapshot)
+             FROM temp.cleanup_candidates GROUP BY session_id",
+            [],
+        )?;
+        for start in (0..candidates).step_by(CHECKPOINT_CLEANUP_BATCH_SIZE) {
+            let end = start
+                .saturating_add(CHECKPOINT_CLEANUP_BATCH_SIZE)
+                .min(candidates);
+            let deleted = tx.execute(
+                "DELETE FROM session_checkpoints WHERE id IN (
+                     SELECT checkpoint_id FROM temp.cleanup_candidates
+                     WHERE rowid > ?1 AND rowid <= ?2
+                 )",
+                rusqlite::params![start, end],
+            )?;
+            if deleted != end - start {
+                return Err(rusqlite::Error::StatementChangedRows(deleted));
+            }
+        }
+        for start in (0..sessions).step_by(CHECKPOINT_CLEANUP_BATCH_SIZE) {
+            let end = start
+                .saturating_add(CHECKPOINT_CLEANUP_BATCH_SIZE)
+                .min(sessions);
+            reconcile_checkpoint_summaries(
+                tx,
+                "SELECT session_id, force_unclean FROM temp.cleanup_sessions
+                 WHERE rowid > ?1 AND rowid <= ?2",
+                rusqlite::params![start, end],
+                end - start,
+            )?;
+        }
+        Ok(candidates)
     })
 }
 
@@ -23375,6 +23340,62 @@ mod tests {
                     .load(Ordering::Acquire)
             );
         });
+    }
+
+    #[test]
+    fn cleanup_batches_preserve_age_then_count_order_and_exact_session_summaries() {
+        let (_tmp, db_path) = setup_test_db();
+        let count = CHECKPOINT_CLEANUP_BATCH_SIZE + 1;
+        let now = u64_to_sqlite_integer(epoch_ms()).unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        // Three snapshots per session. The last was inserted after the clock
+        // moved backwards, so pruning it by age cannot displace the middle
+        // snapshot from its one retained slot.
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (
+                 VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < ?1
+             )
+             INSERT INTO mux_sessions(session_id, created_at, topology_json, ft_version)
+             SELECT printf('batch-%04d', i), 100, '{}', 'test' FROM n",
+            [count],
+        )
+        .unwrap();
+        for (at, topology) in [
+            (now, r#"{"v":1}"#),
+            (now, r#"{"v":2}"#),
+            (1, r#"{"v":3}"#),
+        ] {
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes,
+                  checkpoint_role, topology_json)
+                 SELECT session_id, ?1, 'event', 'fixture', 0, 0, 'snapshot', ?2 FROM mux_sessions",
+                rusqlite::params![at, topology],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE mux_sessions SET shutdown_clean = 1, clean_checkpoint_id = (
+                 SELECT MAX(id) FROM session_checkpoints WHERE session_id = mux_sessions.session_id
+             )",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(cleanup_sync(db_path.as_str(), 1, 1).unwrap(), 2 * count);
+        let repaired: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_sessions AS s JOIN session_checkpoints AS c
+                   ON c.session_id = s.session_id
+                 WHERE c.topology_json = ?1 AND s.topology_json = c.topology_json
+                   AND s.last_checkpoint_at = c.checkpoint_at AND s.shutdown_clean = 0
+                   AND s.clean_checkpoint_id IS NULL",
+                [r#"{"v":2}"#],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired, count);
+        assert_eq!(cleanup_sync(db_path.as_str(), 1, 1).unwrap(), 0);
     }
 
     #[test]
