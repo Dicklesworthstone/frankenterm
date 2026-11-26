@@ -9169,7 +9169,6 @@ fn u64_to_sqlite_integer(value: u64) -> std::result::Result<i64, rusqlite::Error
     i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
-#[cfg(test)]
 fn usize_to_sqlite_integer(value: usize) -> std::result::Result<i64, rusqlite::Error> {
     i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
@@ -10237,7 +10236,10 @@ fn cleanup_authoritatively_sync(
                      SELECT checkpoint_id FROM temp.cleanup_candidates
                      WHERE rowid > ?1 AND rowid <= ?2
                  )",
-                rusqlite::params![start, end],
+                rusqlite::params![
+                    usize_to_sqlite_integer(start)?,
+                    usize_to_sqlite_integer(end)?
+                ],
             )?;
             if deleted != end - start {
                 return Err(rusqlite::Error::StatementChangedRows(deleted));
@@ -10251,7 +10253,10 @@ fn cleanup_authoritatively_sync(
                 tx,
                 "SELECT session_id, force_unclean FROM temp.cleanup_sessions
                  WHERE rowid > ?1 AND rowid <= ?2",
-                rusqlite::params![start, end],
+                rusqlite::params![
+                    usize_to_sqlite_integer(start)?,
+                    usize_to_sqlite_integer(end)?
+                ],
                 end - start,
             )?;
         }
@@ -23385,14 +23390,10 @@ mod tests {
              )
              INSERT INTO mux_sessions(session_id, created_at, topology_json, ft_version)
              SELECT printf('batch-%04d', i), 100, '{}', 'test' FROM n",
-            [count],
+            [usize_to_sqlite_integer(count).unwrap()],
         )
         .unwrap();
-        for (at, topology) in [
-            (now, r#"{"v":1}"#),
-            (now, r#"{"v":2}"#),
-            (1, r#"{"v":3}"#),
-        ] {
+        for (at, topology) in [(now, r#"{"v":1}"#), (now, r#"{"v":2}"#), (1, r#"{"v":3}"#)] {
             conn.execute(
                 "INSERT INTO session_checkpoints
                  (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes,
@@ -23411,7 +23412,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cleanup_sync(db_path.as_str(), 1, 1).unwrap(), 2 * count);
-        let repaired: usize = conn
+        let repaired: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM mux_sessions AS s JOIN session_checkpoints AS c
                    ON c.session_id = s.session_id
@@ -23422,7 +23423,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(repaired, count);
+        assert_eq!(repaired, usize_to_sqlite_integer(count).unwrap());
         assert_eq!(cleanup_sync(db_path.as_str(), 1, 1).unwrap(), 0);
     }
 
