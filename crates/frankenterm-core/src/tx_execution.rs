@@ -2226,6 +2226,293 @@ impl From<TxContractStoreError> for MissionStoreError {
     }
 }
 
+/// A complete draft was installed without replacing an existing pathname.
+/// This is durable storage evidence, not approval or owner acknowledgement.
+#[derive(Debug, Clone, Serialize)]
+pub struct MissionCreateReceipt {
+    pub path: PathBuf,
+    pub current: MissionRevisionToken,
+    pub durability: &'static str,
+    pub owner_acknowledgement: &'static str,
+}
+
+/// Publish a fresh planning mission through an existing, pinned directory.
+///
+/// The workspace and parent must have their exact canonical spelling. Existing
+/// destinations, including symlinks and hard links, are never replaced. A
+/// complete private staging file is synchronized before a no-replace rename;
+/// the containing directory is synchronized before a receipt is returned.
+/// Failed staging files are retained and never become mission authority.
+///
+/// `Indeterminate` means publication occurred but its durability or namespace
+/// could not be confirmed. It must be reconciled before retrying. This boundary
+/// never dispatches actions or creates a placeholder contract or parent folder.
+pub fn create_mission_contract(
+    workspace_root: &Path,
+    path: &Path,
+    mission: &Mission,
+) -> Result<MissionCreateReceipt, MissionStoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        create_mission_contract_impl(workspace_root, path, mission, |_| Ok(()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (workspace_root, path, mission);
+        Err(MissionStoreError::Authority)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_mission_contract_impl<F>(
+    workspace_root: &Path,
+    path: &Path,
+    mission: &Mission,
+    mut fault: F,
+) -> Result<MissionCreateReceipt, MissionStoreError>
+where
+    F: FnMut(TxContractSaveFaultPoint) -> std::io::Result<()>,
+{
+    use crate::plan::{ApprovalState, MissionLifecycleState, MissionPauseResumeState};
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    mission.validate().map_err(|_| MissionStoreError::Invalid)?;
+    if mission.mission_version != crate::plan::MISSION_SCHEMA_VERSION
+        || mission.mission_id.0.trim().is_empty()
+        || mission.revision != 0
+        || mission.lifecycle_state != MissionLifecycleState::Planning
+        || mission.updated_at_ms.is_some()
+        || mission.pause_resume_state != MissionPauseResumeState::default()
+        || mission.candidates.is_empty()
+        || mission.candidates.len() != mission.assignments.len()
+        || mission.candidates.iter().any(|candidate| {
+            candidate.candidate_id.0.trim().is_empty()
+                || candidate.created_at_ms != mission.created_at_ms
+        })
+    {
+        return Err(MissionStoreError::Invalid);
+    }
+    let mut assigned_candidates = HashSet::new();
+    for assignment in &mission.assignments {
+        if assignment.assignment_id.0.trim().is_empty()
+            || !assigned_candidates.insert(&assignment.candidate_id)
+            || assignment.created_at_ms != mission.created_at_ms
+            || assignment.updated_at_ms.is_some()
+            || assignment.reservation_intent.is_some()
+            || assignment.outcome.is_some()
+            || assignment.escalation.is_some()
+            || !matches!(
+                &assignment.approval_state,
+                ApprovalState::Pending { requested_by, requested_at_ms }
+                    if !requested_by.trim().is_empty()
+                        && *requested_at_ms == mission.created_at_ms
+            )
+        {
+            return Err(MissionStoreError::Invalid);
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(mission).map_err(|_| MissionStoreError::Invalid)?;
+    if bytes.len() > TX_CONTRACT_MAX_BYTES {
+        return Err(MissionStoreError::TooLarge);
+    }
+    let current = MissionRevisionToken::from_mission(mission)?;
+
+    let workspace_dir = CapDir::open_ambient_dir(workspace_root, cap_std::ambient_authority())
+        .map_err(|_| MissionStoreError::Authority)?;
+    let workspace_identity = cap_object_identity(
+        &workspace_dir
+            .dir_metadata()
+            .map_err(|_| MissionStoreError::Authority)?,
+    )?;
+    #[cfg(target_os = "macos")]
+    let workspace_display = native_tx_descriptor_path(&workspace_dir, workspace_root)?;
+    #[cfg(target_os = "linux")]
+    let workspace_display = workspace_root
+        .canonicalize()
+        .map_err(|_| MissionStoreError::Authority)?;
+    if workspace_root.as_os_str() != workspace_display.as_os_str()
+        || workspace_display.to_str() != Some(mission.workspace_id.as_str())
+    {
+        return Err(MissionStoreError::Authority);
+    }
+    let relative =
+        normalized_workspace_relative_contract_path(workspace_root, &workspace_display, path)
+            .map_err(|_| MissionStoreError::Authority)?;
+    let final_path = workspace_display.join(&relative);
+    let supplied_spelling = if path.is_absolute() {
+        &final_path
+    } else {
+        &relative
+    };
+    if path.as_os_str() != supplied_spelling.as_os_str() || final_path.to_str().is_none() {
+        return Err(MissionStoreError::Authority);
+    }
+    let name = relative.file_name().ok_or(MissionStoreError::Authority)?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent_display = if parent_relative.as_os_str().is_empty() {
+        workspace_display.clone()
+    } else {
+        workspace_display.join(parent_relative)
+    };
+    let open_parent = || -> Result<CapDir, MissionStoreError> {
+        let mut parent = workspace_dir
+            .try_clone()
+            .map_err(|_| MissionStoreError::Authority)?;
+        for component in parent_relative.components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(MissionStoreError::Authority);
+            };
+            parent = parent
+                .open_dir_nofollow(part)
+                .map_err(|_| MissionStoreError::Authority)?;
+        }
+        Ok(parent)
+    };
+    let parent_dir = open_parent()?;
+    let parent_identity = cap_object_identity(
+        &parent_dir
+            .dir_metadata()
+            .map_err(|_| MissionStoreError::Authority)?,
+    )?;
+    let parent_sync = open_directory_sync_file(&parent_dir, &parent_display)?;
+    let verify_namespace = || -> Result<(), MissionStoreError> {
+        let workspace_metadata = std::fs::symlink_metadata(&workspace_display)
+            .map_err(|_| MissionStoreError::Conflict)?;
+        if !workspace_metadata.is_dir()
+            || std_object_identity(&workspace_metadata)? != workspace_identity
+            || workspace_display
+                .canonicalize()
+                .map_err(|_| MissionStoreError::Conflict)?
+                .as_os_str()
+                != workspace_display.as_os_str()
+        {
+            return Err(MissionStoreError::Conflict);
+        }
+        let named_parent = open_parent()?;
+        if cap_object_identity(
+            &named_parent
+                .dir_metadata()
+                .map_err(|_| MissionStoreError::Conflict)?,
+        )? != parent_identity
+            || parent_display
+                .canonicalize()
+                .map_err(|_| MissionStoreError::Conflict)?
+                .as_os_str()
+                != parent_display.as_os_str()
+        {
+            return Err(MissionStoreError::Conflict);
+        }
+        #[cfg(target_os = "macos")]
+        if native_tx_descriptor_path(&workspace_dir, &workspace_display)? != workspace_display
+            || native_tx_descriptor_path(&parent_dir, &parent_display)? != parent_display
+        {
+            return Err(MissionStoreError::Conflict);
+        }
+        Ok(())
+    };
+    verify_namespace().map_err(|_| MissionStoreError::Authority)?;
+    match parent_dir.symlink_metadata(name) {
+        Ok(_) => return Err(MissionStoreError::Conflict),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(MissionStoreError::Authority),
+    }
+
+    let mut staged = None;
+    for _ in 0..64 {
+        let nonce = TX_CONTRACT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!(".mission-create.{}.{nonce}.recovery.tmp", std::process::id());
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No)
+            .mode(0o600)
+            .nonblock(true);
+        match parent_dir.open_with(&temp_name, &options) {
+            Ok(file) => {
+                staged = Some((temp_name, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(MissionStoreError::Write),
+        }
+    }
+    let (temp_name, mut file) = staged.ok_or(MissionStoreError::Write)?;
+    fault(TxContractSaveFaultPoint::BeforeWrite)
+        .and_then(|()| file.write_all(&bytes))
+        .map_err(|_| MissionStoreError::Write)?;
+    fault(TxContractSaveFaultPoint::BeforeFileSync)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| MissionStoreError::Sync)?;
+    fault(TxContractSaveFaultPoint::BeforeAtomicReplace).map_err(|_| MissionStoreError::Rename)?;
+    verify_namespace()?;
+    let file_identity =
+        cap_object_identity(&file.metadata().map_err(|_| MissionStoreError::Authority)?)?;
+    let verify_file = |file: &CapFile, entry: &std::ffi::OsStr| -> Result<(), MissionStoreError> {
+        let opened = file.metadata().map_err(|_| MissionStoreError::Authority)?;
+        let named = parent_dir
+            .symlink_metadata(entry)
+            .map_err(|_| MissionStoreError::Authority)?;
+        if !opened.is_file()
+            || !named.is_file()
+            || cap_object_identity(&opened)? != file_identity
+            || cap_object_identity(&named)? != file_identity
+            || opened.nlink() != 1
+            || named.nlink() != 1
+            || opened.mode() & 0o077 != 0
+            || opened.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err(MissionStoreError::Authority);
+        }
+        Ok(())
+    };
+    verify_file(&file, std::ffi::OsStr::new(&temp_name))?;
+    match renameat_with(
+        &parent_sync,
+        temp_name.as_str(),
+        &parent_sync,
+        name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::EXIST => return Err(MissionStoreError::Conflict),
+        Err(_) => return Err(MissionStoreError::Rename),
+    }
+    // From this point onward a complete mission has been published. No error
+    // may claim rollback or invite an unconditional retry of this creation.
+    fault(TxContractSaveFaultPoint::ParentDirectorySync)
+        .and_then(|()| parent_sync.sync_all())
+        .map_err(|_| MissionStoreError::Indeterminate)?;
+    verify_namespace().map_err(|_| MissionStoreError::Indeterminate)?;
+    verify_file(&file, name).map_err(|_| MissionStoreError::Indeterminate)?;
+    #[cfg(target_os = "macos")]
+    if native_tx_descriptor_path(&file, &final_path)
+        .map_err(|_| MissionStoreError::Indeterminate)?
+        != final_path
+    {
+        return Err(MissionStoreError::Indeterminate);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| MissionStoreError::Indeterminate)?;
+    let mut persisted = Vec::new();
+    Read::by_ref(&mut file)
+        .take(TX_CONTRACT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut persisted)
+        .map_err(|_| MissionStoreError::Indeterminate)?;
+    if persisted != bytes {
+        return Err(MissionStoreError::Indeterminate);
+    }
+    verify_file(&file, name).map_err(|_| MissionStoreError::Indeterminate)?;
+    verify_namespace().map_err(|_| MissionStoreError::Indeterminate)?;
+    Ok(MissionCreateReceipt {
+        path: final_path,
+        current,
+        durability: "file_and_directory_synced",
+        owner_acknowledgement: "unavailable_no_mission_driver",
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MissionMutationReceipt {
     pub previous: MissionRevisionToken,
@@ -8892,6 +9179,306 @@ mod tests {
     use std::rc::Rc;
 
     type RecordedStepIds = Rc<RefCell<Vec<String>>>;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mission_creation_fixture(root: &Path) -> Mission {
+        let mut mission = Mission::new(
+            crate::plan::MissionId("mission:create-test".into()),
+            "Fresh pending draft",
+            root.to_str().unwrap(),
+            crate::plan::MissionOwnership {
+                planner: "planner".into(),
+                dispatcher: "dispatcher".into(),
+                operator: "operator".into(),
+            },
+            1_000,
+        );
+        mission.candidates.push(crate::plan::CandidateAction {
+            candidate_id: crate::plan::CandidateActionId("candidate:create-test".into()),
+            requested_by: MissionActorRole::Operator,
+            action: StepAction::SendText {
+                pane_id: 42,
+                text: "printf 'creation-test'".into(),
+                paste_mode: Some(false),
+            },
+            rationale: "Explicit draft input".into(),
+            score: None,
+            created_at_ms: 1_000,
+        });
+        mission.assignments.push(crate::plan::Assignment {
+            assignment_id: crate::plan::AssignmentId("assignment:create-test".into()),
+            candidate_id: mission.candidates[0].candidate_id.clone(),
+            assigned_by: MissionActorRole::Operator,
+            assignee: "operator".into(),
+            reservation_intent: None,
+            approval_state: crate::plan::ApprovalState::Pending {
+                requested_by: "operator".into(),
+                requested_at_ms: 1_000,
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000,
+            updated_at_ms: None,
+        });
+        mission.validate().unwrap();
+        mission
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_publishes_private_complete_draft_and_exact_token() {
+        let (_directory, root) = canonical_tempdir();
+        std::fs::create_dir(root.join("missions")).unwrap();
+        let mission = mission_creation_fixture(&root);
+        let receipt = create_mission_contract(
+            &root,
+            Path::new("missions/draft.json"),
+            &mission,
+        ).unwrap();
+        let path = root.join("missions/draft.json");
+        assert_eq!(receipt.path, path);
+        assert_eq!(receipt.current, MissionRevisionToken::from_mission(&mission).unwrap());
+        assert_eq!(receipt.current.revision, 0);
+        assert_eq!(receipt.durability, "file_and_directory_synced");
+        assert_eq!(receipt.owner_acknowledgement, "unavailable_no_mission_driver");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert!(!root.join(".ft").exists(), "creation dispatches no work or sidecar mutations");
+        let guard = MissionMutationGuard::acquire(&root, &path, Some(&receipt.current)).unwrap();
+        assert_eq!(guard.mission().revision, 0);
+        assert_eq!(guard.mission().lifecycle_state, crate::plan::MissionLifecycleState::Planning);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_never_replaces_any_existing_destination() {
+        for kind in 0..5 {
+            let (_directory, root) = canonical_tempdir();
+            let path = root.join("mission.json");
+            let foreign = root.join("foreign.json");
+            match kind {
+                0 => std::fs::write(&path, b"existing authority").unwrap(),
+                1 => {
+                    std::fs::write(&foreign, b"foreign authority").unwrap();
+                    std::os::unix::fs::symlink(&foreign, &path).unwrap();
+                }
+                2 => std::os::unix::fs::symlink(&foreign, &path).unwrap(),
+                3 => std::fs::create_dir(&path).unwrap(),
+                _ => {
+                    std::fs::write(&foreign, b"hard-linked authority").unwrap();
+                    std::fs::hard_link(&foreign, &path).unwrap();
+                }
+            }
+            let before = std::fs::symlink_metadata(&path).unwrap();
+            let entries = std::fs::read_dir(&root).unwrap().count();
+            assert_eq!(
+                create_mission_contract(&root, &path, &mission_creation_fixture(&root)).unwrap_err(),
+                MissionStoreError::Conflict,
+                "destination kind {kind}",
+            );
+            let after = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!((before.dev(), before.ino(), before.nlink()), (after.dev(), after.ino(), after.nlink()));
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), entries);
+            if kind == 0 {
+                assert_eq!(std::fs::read(&path).unwrap(), b"existing authority");
+            } else if kind == 1 {
+                assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign authority");
+            } else if kind == 4 {
+                assert_eq!(std::fs::read(&foreign).unwrap(), b"hard-linked authority");
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_late_competing_creator_wins_without_replacement() {
+        let (_directory, root) = canonical_tempdir();
+        let path = root.join("mission.json");
+        let mission = mission_creation_fixture(&root);
+        let mut winner = mission_creation_fixture(&root);
+        winner.mission_id.0 = "mission:competing-creator".into();
+        let winner_bytes = serde_json::to_vec_pretty(&winner).unwrap();
+        let mut winning_receipt = None;
+        let result = create_mission_contract_impl(&root, &path, &mission, |point| {
+            if point == TxContractSaveFaultPoint::BeforeAtomicReplace {
+                winning_receipt = Some(create_mission_contract(&root, &path, &winner).unwrap());
+            }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), MissionStoreError::Conflict);
+        assert_eq!(std::fs::read(&path).unwrap(), winner_bytes);
+        assert_eq!(winning_receipt.unwrap().current, MissionRevisionToken::from_mission(&winner).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_faults_distinguish_absent_from_published_contracts() {
+        for (point, expected, published) in [
+            (TxContractSaveFaultPoint::BeforeWrite, MissionStoreError::Write, false),
+            (TxContractSaveFaultPoint::BeforeFileSync, MissionStoreError::Sync, false),
+            (TxContractSaveFaultPoint::BeforeAtomicReplace, MissionStoreError::Rename, false),
+            (TxContractSaveFaultPoint::ParentDirectorySync, MissionStoreError::Indeterminate, true),
+        ] {
+            let (_directory, root) = canonical_tempdir();
+            let path = root.join("mission.json");
+            let mission = mission_creation_fixture(&root);
+            let result = create_mission_contract_impl(&root, &path, &mission, |at| {
+                if at == point { Err(std::io::Error::other("private injected error")) } else { Ok(()) }
+            });
+            let error = result.unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("private injected error"));
+            assert_eq!(path.exists(), published);
+            assert_eq!(mission.revision, 0);
+            if published {
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(bytes, serde_json::to_vec_pretty(&mission).unwrap());
+                let loaded = Mission::from_json_slice(&bytes).unwrap();
+                loaded.validate().unwrap();
+                assert_eq!(loaded.revision, 0);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_parent_replacement_never_reports_unpublished_after_rename() {
+        for published in [false, true] {
+            let (_directory, root) = canonical_tempdir();
+            let parent = root.join("missions");
+            let retained = root.join("retained-parent");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("mission.json");
+            let mission = mission_creation_fixture(&root);
+            let point = if published {
+                TxContractSaveFaultPoint::ParentDirectorySync
+            } else {
+                TxContractSaveFaultPoint::BeforeAtomicReplace
+            };
+            let result = create_mission_contract_impl(&root, &path, &mission, |at| {
+                if at == point {
+                    std::fs::rename(&parent, &retained).unwrap();
+                    std::fs::create_dir(&parent).unwrap();
+                }
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err(), if published {
+                MissionStoreError::Indeterminate
+            } else {
+                MissionStoreError::Conflict
+            });
+            assert!(!path.exists());
+            let retained_path = retained.join("mission.json");
+            assert_eq!(retained_path.exists(), published);
+            if published {
+                assert_eq!(std::fs::read(&retained_path).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_rejects_staging_identity_and_published_leaf_substitution() {
+        for published in [false, true] {
+            let (_directory, root) = canonical_tempdir();
+            let path = root.join("mission.json");
+            let retained = root.join("retained-own-bytes.json");
+            let mission = mission_creation_fixture(&root);
+            let point = if published {
+                TxContractSaveFaultPoint::ParentDirectorySync
+            } else {
+                TxContractSaveFaultPoint::BeforeAtomicReplace
+            };
+            let result = create_mission_contract_impl(&root, &path, &mission, |at| {
+                if at == point {
+                    let replace = if published {
+                        path.clone()
+                    } else {
+                        std::fs::read_dir(&root).unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .find(|entry| entry.file_name().unwrap().to_string_lossy().starts_with(".mission-create."))
+                            .unwrap()
+                    };
+                    std::fs::rename(&replace, &retained).unwrap();
+                    std::fs::write(&replace, b"substituted namespace entry").unwrap();
+                }
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err(), if published {
+                MissionStoreError::Indeterminate
+            } else {
+                MissionStoreError::Authority
+            });
+            assert_eq!(std::fs::read(&retained).unwrap(), serde_json::to_vec_pretty(&mission).unwrap());
+            if published {
+                assert_eq!(std::fs::read(&path).unwrap(), b"substituted namespace entry");
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_refuses_path_aliases_missing_parents_and_foreign_workspace() {
+        let (_directory, root) = canonical_tempdir();
+        let mission = mission_creation_fixture(&root);
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        for path in ["./mission.json", "real/../mission.json", "missing/mission.json", "alias/mission.json", "real//mission.json"] {
+            assert_eq!(
+                create_mission_contract(&root, Path::new(path), &mission).unwrap_err(),
+                MissionStoreError::Authority,
+                "unsafe spelling {path}",
+            );
+        }
+        let mut foreign = mission.clone();
+        foreign.workspace_id.push_str("/.");
+        assert_eq!(create_mission_contract(&root, Path::new("mission.json"), &foreign).unwrap_err(), MissionStoreError::Authority);
+        std::os::unix::fs::symlink(&root, root.join("workspace-alias")).unwrap();
+        assert_eq!(create_mission_contract(&root.join("workspace-alias"), Path::new("mission.json"), &mission).unwrap_err(), MissionStoreError::Authority);
+        assert!(!root.join("mission.json").exists());
+        assert!(!root.join("real/mission.json").exists());
+        assert!(!root.join("missing").exists());
+        assert!(!root.join(".ft").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_create_refuses_nonfresh_approved_or_oversized_drafts_before_staging() {
+        let (_directory, root) = canonical_tempdir();
+        let path = root.join("mission.json");
+        for variant in 0..7 {
+            let mut mission = mission_creation_fixture(&root);
+            match variant {
+                0 => mission.revision = 1,
+                1 => mission.lifecycle_state = crate::plan::MissionLifecycleState::Running,
+                2 => mission.updated_at_ms = Some(1_001),
+                3 => mission.assignments[0].approval_state = crate::plan::ApprovalState::NotRequired,
+                4 => mission.assignments[0].outcome = Some(crate::plan::Outcome::Success {
+                    reason_code: "claimed completion".into(), completed_at_ms: 1_001,
+                }),
+                5 => mission.pause_resume_state.total_pause_count = 1,
+                _ => mission.assignments[0].reservation_intent = Some(crate::plan::ReservationIntent {
+                    reservation_id: crate::plan::ReservationIntentId("reservation:claimed".into()),
+                    requested_by: MissionActorRole::Operator,
+                    paths: vec!["src/lib.rs".into()], exclusive: true, reason: None,
+                    requested_at_ms: 1_000, expires_at_ms: None,
+                }),
+            }
+            assert_eq!(create_mission_contract(&root, &path, &mission).unwrap_err(), MissionStoreError::Invalid);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+        let mut oversized = mission_creation_fixture(&root);
+        let StepAction::SendText { text, .. } = &mut oversized.candidates[0].action else { unreachable!() };
+        *text = "x".repeat(TX_CONTRACT_MAX_BYTES);
+        assert_eq!(create_mission_contract(&root, &path, &oversized).unwrap_err(), MissionStoreError::TooLarge);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 
     fn stored_mission_fixture(path: &Path) -> Mission {
         let mut mission = Mission::new(
