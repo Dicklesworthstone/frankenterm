@@ -2488,7 +2488,9 @@ impl MissionMutationGuard {
         let bytes = guard.read_authoritative_contract_bytes()?;
         let persisted: MissionTxContract =
             serde_json::from_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
-        persisted.validate().map_err(|_| MissionStoreError::Invalid)?;
+        persisted
+            .validate()
+            .map_err(|_| MissionStoreError::Invalid)?;
         validate_tx_contract_state_outcome(&persisted).map_err(|_| MissionStoreError::Invalid)?;
         if !mission_dispatch_contract_matches(&expected, &persisted)? {
             return Err(MissionStoreError::Conflict);
@@ -2651,7 +2653,7 @@ pub trait StepExecutor {
     fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput>;
 
     /// Consume the scoped allow-once approvals the passing gates relied on,
-    /// just before commit (ft-0rlfq.9). A lost claim marks its gate
+    /// before commit or compensation dispatch (ft-0rlfq.9). A lost claim marks its gate
     /// unsatisfied. Executors without durable approvals have nothing to claim.
     fn claim_prepare_approvals(&self, _gate_inputs: &mut [TxPrepareGateInput], _now_ms: i64) {}
 
@@ -4555,8 +4557,12 @@ pub fn recover_mission_assignment_dispatch(
     contract: &mut MissionTxContract,
     now_ms: i64,
 ) -> Result<bool, MissionStoreError> {
-    expected.validate().map_err(|_| MissionStoreError::Invalid)?;
-    contract.validate().map_err(|_| MissionStoreError::Invalid)?;
+    expected
+        .validate()
+        .map_err(|_| MissionStoreError::Invalid)?;
+    contract
+        .validate()
+        .map_err(|_| MissionStoreError::Invalid)?;
     validate_tx_contract_state_outcome(contract).map_err(|_| MissionStoreError::Invalid)?;
     let digest = expected
         .intent
@@ -4593,8 +4599,7 @@ pub fn recover_mission_assignment_dispatch(
         crate::plan::AssignmentId,
         String,
         crate::plan::CandidateActionId,
-    ) = serde_json::from_str(&expected.intent.summary)
-        .map_err(|_| MissionStoreError::Invalid)?;
+    ) = serde_json::from_str(&expected.intent.summary).map_err(|_| MissionStoreError::Invalid)?;
     if digest.len() != 64
         || !digest
             .bytes()
@@ -4661,9 +4666,7 @@ pub fn recover_mission_assignment_dispatch(
             IdempotencyError::ReservationInProgress { .. }
             | IdempotencyError::PlanMutationInProgress { .. }
             | IdempotencyError::ExecutionMutationInProgress { .. }
-            | IdempotencyError::SpoolCatalogMutationInProgress => {
-                MissionStoreError::InProgress
-            }
+            | IdempotencyError::SpoolCatalogMutationInProgress => MissionStoreError::InProgress,
             _ => MissionStoreError::Authority,
         })?;
     if !matches!(
@@ -4683,7 +4686,9 @@ pub fn recover_mission_assignment_dispatch(
     recovered.receipts.extend(report.receipts);
     recovered.lifecycle_state = MissionTxState::Committed;
     recovered.outcome = TxOutcome::Committed;
-    recovered.validate().map_err(|_| MissionStoreError::Invalid)?;
+    recovered
+        .validate()
+        .map_err(|_| MissionStoreError::Invalid)?;
 
     // Even an already committed snapshot is republished and synchronized:
     // the previous process may have lost the final directory-sync reply.
@@ -6623,7 +6628,34 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         gate_contract.plan.compensations.clear();
         gate_contract.plan.preconditions.clear();
 
-        let gate_inputs = self.executor.evaluate_gates(&gate_contract, now_ms);
+        let mut gate_inputs = self.executor.evaluate_gates(&gate_contract, now_ms);
+        let mut report = evaluate_prepare_phase(
+            &gate_contract.intent.tx_id,
+            &gate_contract.plan,
+            &gate_inputs,
+            kill_switch,
+            now_ms,
+        )
+        .map_err(TxExecutionError::CompensationPhase)?;
+        // Compensation is an external effect, so an allow-once approval must
+        // be consumed just as it is for forward dispatch. Validate the whole
+        // fresh batch first: missing/denied gates and a hard stop must not
+        // spend approvals. Already-compensated durable rows were excluded by
+        // compensation_gate_report and never reach this claim boundary.
+        if report.outcome == TxPrepareOutcome::AllReady {
+            self.executor
+                .claim_prepare_approvals(&mut gate_inputs, now_ms);
+            // A competing caller may have consumed an approval after the
+            // presence check. Only the post-claim gates authorize effects.
+            report = evaluate_prepare_phase(
+                &gate_contract.intent.tx_id,
+                &gate_contract.plan,
+                &gate_inputs,
+                kill_switch,
+                now_ms,
+            )
+            .map_err(TxExecutionError::CompensationPhase)?;
+        }
         let mut gate_events = Vec::new();
         self.record_prepare_gate_events(
             &gate_contract,
@@ -6632,14 +6664,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &gate_inputs,
             now_ms,
         );
-        let report = evaluate_prepare_phase(
-            &gate_contract.intent.tx_id,
-            &gate_contract.plan,
-            &gate_inputs,
-            kill_switch,
-            now_ms,
-        )
-        .map_err(TxExecutionError::CompensationPhase)?;
         if report.outcome != TxPrepareOutcome::AllReady {
             return Err(TxExecutionError::CompensationPhase(format!(
                 "compensation prepare gates rejected dispatch with outcome {:?}",
@@ -8903,10 +8927,7 @@ mod tests {
             .unwrap();
         let tx_path = tx_guard.authoritative_path().to_path_buf();
         assert_eq!(std::fs::metadata(&tx_path).unwrap().nlink(), 1);
-        assert_eq!(
-            std::fs::metadata(&tx_path).unwrap().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(std::fs::metadata(&tx_path).unwrap().mode() & 0o777, 0o600);
         contract.lifecycle_state = MissionTxState::Prepared;
         save_tx_contract_atomic(&tx_guard, &tx_path, &contract).unwrap();
         let prepared_bytes = std::fs::read(&tx_path).unwrap();
@@ -8919,7 +8940,9 @@ mod tests {
         assert_eq!(reopened.lifecycle_state, MissionTxState::Prepared);
         assert_eq!(std::fs::read(&tx_path).unwrap(), prepared_bytes);
         assert_eq!(
-            std::fs::read_dir(tx_path.parent().unwrap()).unwrap().count(),
+            std::fs::read_dir(tx_path.parent().unwrap())
+                .unwrap()
+                .count(),
             1
         );
         drop(tx_guard);
@@ -8930,8 +8953,7 @@ mod tests {
         *text = "changed command\n".into();
         let receipt = mutation.commit(&mut mission).unwrap();
         let mutation =
-            MissionMutationGuard::acquire(directory.path(), &path, Some(&receipt.current))
-                .unwrap();
+            MissionMutationGuard::acquire(directory.path(), &path, Some(&receipt.current)).unwrap();
         assert_eq!(
             mutation
                 .publish_assignment_dispatch(&assignment_id)
@@ -8985,19 +9007,15 @@ mod tests {
                     Ok(())
                 }
             });
-            assert_eq!(
-                result.err().unwrap(),
-                expected_error,
-                "cutpoint {point:?}"
-            );
-            let finals: Vec<_> =
-                std::fs::read_dir(directory.path().join(".ft/mission-dispatch"))
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .filter(|path| {
-                        path.extension().is_some_and(|extension| extension == "json")
-                    })
-                    .collect();
+            assert_eq!(result.err().unwrap(), expected_error, "cutpoint {point:?}");
+            let finals: Vec<_> = std::fs::read_dir(directory.path().join(".ft/mission-dispatch"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .collect();
             assert_eq!(finals.len(), usize::from(published));
             if published {
                 let contract: MissionTxContract =
@@ -9007,12 +9025,12 @@ mod tests {
             }
             // A complete final seed can settle durability on retry; a retained
             // failed stage never occupies the stable executable slot.
-            let (guard, contract) = mutation
-                .publish_assignment_dispatch(assignment_id)
-                .unwrap();
+            let (guard, contract) = mutation.publish_assignment_dispatch(assignment_id).unwrap();
             assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
             assert_eq!(
-                std::fs::metadata(guard.authoritative_path()).unwrap().nlink(),
+                std::fs::metadata(guard.authoritative_path())
+                    .unwrap()
+                    .nlink(),
                 1
             );
         }
@@ -9095,9 +9113,7 @@ mod tests {
             let mission = stored_dispatch_mission_fixture(&path);
             let assignment_id = &mission.assignments[0].assignment_id;
             let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
-            let (guard, _) = mutation
-                .publish_assignment_dispatch(assignment_id)
-                .unwrap();
+            let (guard, _) = mutation.publish_assignment_dispatch(assignment_id).unwrap();
             let tx_path = guard.authoritative_path().to_path_buf();
             drop(guard);
             let retained = tx_path.with_extension("retained");
@@ -9133,9 +9149,7 @@ mod tests {
         let mission = stored_dispatch_mission_fixture(&path);
         let assignment_id = &mission.assignments[0].assignment_id;
         let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
-        let (guard, mut contract) = mutation
-            .publish_assignment_dispatch(assignment_id)
-            .unwrap();
+        let (guard, mut contract) = mutation.publish_assignment_dispatch(assignment_id).unwrap();
         let tx_path = guard.authoritative_path().to_path_buf();
         drop(guard);
         contract.outcome = TxOutcome::Committed;
@@ -13825,6 +13839,288 @@ mod tests {
         let _ = engine.execute(&mut contract, 5_000);
         assert_eq!(engine.executor.claims.get(), 0);
         assert_eq!(engine.executor.tokens.get(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CompensationApprovalFault {
+        None,
+        DeniedPolicy,
+        MissingGate,
+        LostClaim,
+    }
+
+    #[derive(Clone)]
+    struct CompensationApprovalExecutor {
+        approvals: Rc<OneShotApprovalExecutor>,
+        dispatched: RecordedStepIds,
+        claimed_actions: Rc<RefCell<Vec<String>>>,
+        fault: CompensationApprovalFault,
+    }
+
+    impl CompensationApprovalExecutor {
+        fn new(tokens: u32, fault: CompensationApprovalFault) -> Self {
+            Self {
+                approvals: Rc::new(OneShotApprovalExecutor {
+                    tokens: std::cell::Cell::new(tokens),
+                    claims: std::cell::Cell::new(0),
+                }),
+                dispatched: Rc::new(RefCell::new(Vec::new())),
+                claimed_actions: Rc::new(RefCell::new(Vec::new())),
+                fault,
+            }
+        }
+    }
+
+    impl StepExecutor for CompensationApprovalExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            let mut gates = self.approvals.evaluate_gates(contract, now_ms);
+            for (gate, step) in gates.iter_mut().zip(&contract.plan.steps) {
+                gate.required_approval
+                    .as_mut()
+                    .expect("fixture requires scoped approvals")
+                    .action_fingerprint = step.action.canonical_string();
+            }
+            match self.fault {
+                CompensationApprovalFault::DeniedPolicy => {
+                    gates[0].policy_passed = false;
+                }
+                CompensationApprovalFault::MissingGate => {
+                    gates.pop();
+                }
+                CompensationApprovalFault::None | CompensationApprovalFault::LostClaim => {}
+            }
+            gates
+        }
+
+        fn claim_prepare_approvals(&self, gate_inputs: &mut [TxPrepareGateInput], now_ms: i64) {
+            self.claimed_actions
+                .borrow_mut()
+                .extend(gate_inputs.iter().map(|gate| {
+                    gate.required_approval
+                        .as_ref()
+                        .expect("fixture requires scoped approvals")
+                        .action_fingerprint
+                        .clone()
+                }));
+            if matches!(self.fault, CompensationApprovalFault::LostClaim) {
+                self.approvals.tokens.set(0);
+            }
+            self.approvals.claim_prepare_approvals(gate_inputs, now_ms);
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            self.approvals.execute_steps(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            contract: &MissionTxContract,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            self.dispatched.borrow_mut().extend(
+                commit_report
+                    .step_results
+                    .iter()
+                    .filter(|result| result.outcome.is_committed())
+                    .map(|result| result.step_id.0.clone()),
+            );
+            self.approvals
+                .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn automatic_compensation_claims_its_own_scoped_approval() {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(2);
+        let expected_claims = vec![
+            contract.plan.steps[0].action.canonical_string(),
+            contract.plan.steps[1].action.canonical_string(),
+            contract.plan.compensations[0].action.canonical_string(),
+        ];
+        let executor = CompensationApprovalExecutor::new(3, CompensationApprovalFault::None);
+        let engine = TxExecutionEngine::new(
+            executor.clone(),
+            TxExecutionConfig {
+                fail_step: Some("step-1".to_string()),
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
+        assert_eq!(executor.approvals.claims.get(), 3);
+        assert_eq!(executor.approvals.tokens.get(), 0);
+        assert_eq!(*executor.claimed_actions.borrow(), expected_claims);
+        assert_eq!(executor.dispatched.borrow().as_slice(), ["step-0"]);
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&contract, "step-0"), 5_000),
+            Some(StepOutcome::Compensated { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_rollback_spends_approval_once_and_replay_needs_no_new_claim() {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .unwrap();
+        let committed_before_rollback = contract.clone();
+        let executor = CompensationApprovalExecutor::new(1, CompensationApprovalFault::None);
+        let engine = TxExecutionEngine::new(executor.clone(), TxExecutionConfig::default());
+
+        let first = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .unwrap();
+        assert!(first.compensation_report.is_fully_rolled_back());
+        assert_eq!(executor.approvals.claims.get(), 1);
+        assert_eq!(executor.approvals.tokens.get(), 0);
+        assert_eq!(
+            executor.claimed_actions.borrow().as_slice(),
+            [contract.plan.compensations[0].action.canonical_string()]
+        );
+
+        // The process may die after recording the undo but before saving the
+        // mutated contract. Reopening with the older contract must reconstruct
+        // the durable outcome without another approval or external effect.
+        drop(store);
+        let mut store =
+            IdempotencyStore::open(store_dir.path(), IdempotencyPolicy::default()).unwrap();
+        contract = committed_before_rollback;
+        let recovered = TxExecutionEngine::new(executor.clone(), TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 7_000)
+            .unwrap();
+
+        assert!(recovered.compensation_report.is_fully_rolled_back());
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(executor.approvals.claims.get(), 1);
+        assert_eq!(executor.approvals.tokens.get(), 0);
+        assert_eq!(executor.dispatched.borrow().as_slice(), ["step-0"]);
+        assert_eq!(executor.claimed_actions.borrow().len(), 1);
+    }
+
+    #[test]
+    fn failed_compensation_approval_claim_leaves_contract_and_spool_unchanged() {
+        for (steps, fault) in [
+            (1, CompensationApprovalFault::LostClaim),
+            (2, CompensationApprovalFault::None),
+        ] {
+            let (store_dir, mut store) = durable_store();
+            let mut contract = make_test_contract(steps);
+            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .unwrap();
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(store_dir.path());
+            // Either an atomic claim loses its race, or two approved presence
+            // checks compete for one token. Both must block the entire batch.
+            let executor = CompensationApprovalExecutor::new(1, fault);
+            let engine = TxExecutionEngine::new(executor.clone(), TxExecutionConfig::default());
+
+            let error = engine
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .expect_err("a failed approval claim must stop compensation");
+
+            assert!(matches!(
+                error,
+                TxExecutionError::CompensationPhase(ref detail)
+                    if detail.contains("RequireApproval")
+            ));
+            assert_eq!(executor.approvals.claims.get() as usize, steps);
+            assert_eq!(executor.approvals.tokens.get(), 0);
+            assert!(executor.dispatched.borrow().is_empty());
+            assert_eq!(serde_json::to_value(&contract).unwrap(), original_contract);
+            assert_eq!(
+                durable_ledger_file_snapshot(store_dir.path()),
+                original_spool
+            );
+            for step in &contract.plan.steps {
+                assert!(
+                    store
+                        .peek_cached_outcome(
+                            &test_compensation_key(&contract, &step.step_id.0),
+                            6_000
+                        )
+                        .is_none(),
+                    "a rejected claim must not append a Pending compensation record"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_compensation_batches_do_not_spend_approvals() {
+        for (config, fault) in [
+            (
+                TxExecutionConfig {
+                    kill_switch: MissionKillSwitchLevel::HardStop,
+                    ..TxExecutionConfig::default()
+                },
+                CompensationApprovalFault::None,
+            ),
+            (
+                TxExecutionConfig {
+                    paused: true,
+                    ..TxExecutionConfig::default()
+                },
+                CompensationApprovalFault::None,
+            ),
+            (
+                TxExecutionConfig {
+                    max_steps_per_batch: 1,
+                    ..TxExecutionConfig::default()
+                },
+                CompensationApprovalFault::None,
+            ),
+            (
+                TxExecutionConfig::default(),
+                CompensationApprovalFault::DeniedPolicy,
+            ),
+            (
+                TxExecutionConfig::default(),
+                CompensationApprovalFault::MissingGate,
+            ),
+        ] {
+            let (store_dir, mut store) = durable_store();
+            let mut contract = make_test_contract(2);
+            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+                .execute_with_store(&mut contract, &mut store, 5_000)
+                .unwrap();
+            let original_contract = serde_json::to_value(&contract).unwrap();
+            let original_spool = durable_ledger_file_snapshot(store_dir.path());
+            let executor = CompensationApprovalExecutor::new(2, fault);
+            let engine = TxExecutionEngine::new(executor.clone(), config);
+
+            let error = engine
+                .rollback_with_store(&mut contract, &mut store, 6_000)
+                .expect_err("blocked compensation batch must not dispatch");
+
+            assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+            assert_eq!(executor.approvals.claims.get(), 0);
+            assert_eq!(executor.approvals.tokens.get(), 2);
+            assert!(executor.claimed_actions.borrow().is_empty());
+            assert!(executor.dispatched.borrow().is_empty());
+            assert_eq!(serde_json::to_value(&contract).unwrap(), original_contract);
+            assert_eq!(
+                durable_ledger_file_snapshot(store_dir.path()),
+                original_spool
+            );
+        }
     }
 
     #[test]
@@ -19329,8 +19625,7 @@ mod tests {
         let mut contract = expected.clone();
 
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
-                .unwrap()
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000).unwrap()
         );
         assert_eq!(contract.lifecycle_state, MissionTxState::Committed);
         assert_eq!(contract.outcome, TxOutcome::Committed);
@@ -19355,8 +19650,7 @@ mod tests {
         let mut reloaded: MissionTxContract =
             serde_json::from_slice(&guard.read_authoritative_contract_bytes().unwrap()).unwrap();
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut reloaded, 7_000)
-                .unwrap()
+            recover_mission_assignment_dispatch(&guard, &expected, &mut reloaded, 7_000).unwrap()
         );
         assert_eq!(reloaded.receipts, receipts);
         assert_eq!(reloaded.lifecycle_state, MissionTxState::Committed);
@@ -19385,13 +19679,10 @@ mod tests {
             let guard = acquire_tx_contract_lock(&root, &path).unwrap();
             let original = guard.read_authoritative_contract_bytes().unwrap();
 
-            assert!(!recover_mission_assignment_dispatch(
-                &guard,
-                &expected,
-                &mut contract,
-                6_000
-            )
-            .unwrap());
+            assert!(
+                !recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
+                    .unwrap()
+            );
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         }
     }
@@ -19416,13 +19707,10 @@ mod tests {
             let original = guard.read_authoritative_contract_bytes().unwrap();
             let mut contract = expected.clone();
 
-            assert!(!recover_mission_assignment_dispatch(
-                &guard,
-                &expected,
-                &mut contract,
-                6_000
-            )
-            .unwrap());
+            assert!(
+                !recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
+                    .unwrap()
+            );
             assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
             assert!(contract.receipts.is_empty());
             assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
@@ -19522,7 +19810,9 @@ mod tests {
             .open_idempotency_store(IdempotencyPolicy::default())
             .unwrap();
         let key = test_commit_key(&expected, &expected.plan.steps[0].step_id.0);
-        let proof = other_store.acquire_durable_key_leases([key], 6_000).unwrap();
+        let proof = other_store
+            .acquire_durable_key_leases([key], 6_000)
+            .unwrap();
         let original = guard.read_authoritative_contract_bytes().unwrap();
         let mut contract = expected.clone();
 
@@ -19533,8 +19823,7 @@ mod tests {
         assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
         drop(proof);
         assert!(
-            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 7_000)
-                .unwrap()
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 7_000).unwrap()
         );
     }
 
