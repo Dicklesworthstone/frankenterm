@@ -82125,16 +82125,35 @@ fn emit_mission_success(
     Ok(())
 }
 
+fn mission_error_envelope(
+    err: &MissionCommandError,
+    transaction_report: Option<&RobotTxRunData>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "ok": false,
+        "error": err.message,
+        "error_code": err.error_code,
+        "exit_code": err.exit_code,
+        "hint": err.hint,
+    });
+    if let Some(report) = transaction_report {
+        envelope["transaction_report"] = serde_json::json!(report);
+    }
+    envelope
+}
+
 fn emit_mission_error(format: MissionCommandOutputFormat, err: MissionCommandError) -> ! {
+    emit_mission_error_with_transaction_report(format, err, None)
+}
+
+fn emit_mission_error_with_transaction_report(
+    format: MissionCommandOutputFormat,
+    err: MissionCommandError,
+    transaction_report: Option<&RobotTxRunData>,
+) -> ! {
     match format {
         MissionCommandOutputFormat::Json => {
-            let envelope = serde_json::json!({
-                "ok": false,
-                "error": err.message,
-                "error_code": err.error_code,
-                "exit_code": err.exit_code,
-                "hint": err.hint,
-            });
+            let envelope = mission_error_envelope(&err, transaction_report);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".to_string())
@@ -82143,8 +82162,14 @@ fn emit_mission_error(format: MissionCommandOutputFormat, err: MissionCommandErr
         MissionCommandOutputFormat::Plain => {
             eprintln!("Error: {}", err.message);
             eprintln!("Code: {}", err.error_code);
-            if let Some(hint) = err.hint {
+            if let Some(hint) = err.hint.as_deref() {
                 eprintln!("Hint: {hint}");
+            }
+            if let Some(report) = transaction_report {
+                eprintln!(
+                    "Transaction report:\n{}",
+                    serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+                );
             }
         }
     }
@@ -83275,6 +83300,35 @@ fn mission_assignment_transaction_error(
     error
 }
 
+#[cfg(feature = "subprocess-bridge")]
+#[derive(Debug)]
+struct MissionAssignmentDispatchError {
+    command: MissionCommandError,
+    transaction_report: Option<Box<RobotTxRunData>>,
+}
+
+#[cfg(feature = "subprocess-bridge")]
+impl From<MissionCommandError> for MissionAssignmentDispatchError {
+    fn from(command: MissionCommandError) -> Self {
+        Self {
+            command,
+            transaction_report: None,
+        }
+    }
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn mission_assignment_report_error(
+    error: MissionCommandError,
+    contract_path: &Path,
+    transaction_report: Option<&RobotTxRunData>,
+) -> MissionAssignmentDispatchError {
+    MissionAssignmentDispatchError {
+        command: mission_assignment_transaction_error(error, contract_path),
+        transaction_report: transaction_report.cloned().map(Box::new),
+    }
+}
+
 /// Use the same live policy, approvals, target lookup and durable engine as tx run.
 #[cfg(feature = "subprocess-bridge")]
 async fn execute_mission_assignment_transaction(
@@ -83449,7 +83503,7 @@ async fn run_mission_assignment_dispatch(
     assignment_id: &str,
     expected_token: &str,
     dry_run: bool,
-) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+) -> Result<(serde_json::Value, Vec<String>), MissionAssignmentDispatchError> {
     use frankenterm_core::mission_dispatch::compile_assignment_dispatch;
     use frankenterm_core::plan::AssignmentId;
 
@@ -83468,7 +83522,8 @@ async fn run_mission_assignment_dispatch(
                 "No transaction was published. Inspect mission status before continuing."
                     .to_string(),
             ),
-        });
+        }
+        .into());
     }
     let action = mission_assignment_action_summary(&expected)?;
     let mut data = serde_json::json!({
@@ -83547,7 +83602,9 @@ async fn run_mission_assignment_dispatch(
         &mut contract,
         mission_now_ms(),
     )
-    .map_err(|error| mission_assignment_transaction_error(error, contract_path))?;
+    .map_err(|error| {
+        mission_assignment_report_error(error, contract_path, transaction_report.as_ref())
+    })?;
     data["status"] = serde_json::json!("action_committed");
     data["policy_evaluated"] = serde_json::json!(!recovered);
     data["replayed"] = serde_json::json!(recovered);
@@ -83624,7 +83681,7 @@ struct MissionDriveProgress {
 #[derive(Debug)]
 struct MissionDriveCommandOutput {
     progress: MissionDriveProgress,
-    error: Option<MissionCommandError>,
+    error: Option<MissionAssignmentDispatchError>,
 }
 
 #[cfg(feature = "subprocess-bridge")]
@@ -83841,7 +83898,7 @@ where
         };
         return Ok(MissionDriveCommandOutput {
             progress,
-            error: Some(error),
+            error: Some(error.into()),
         });
     }
     if request.dry_run {
@@ -83862,16 +83919,19 @@ where
             progress.stopped_assignment = Some(assignment_id);
             return Ok(MissionDriveCommandOutput {
                 progress,
-                error: Some(MissionCommandError {
-                    exit_code: MISSION_EXIT_VALIDATION,
-                    error_code: "mission.drive.admission_budget_exhausted",
-                    message: "The drive stopped before admitting its next assignment because its time budget expired."
-                        .to_string(),
-                    hint: Some(
-                        "Committed actions remain saved. Inspect mission status and resume with a fresh exact token; an action already running is not interrupted by this budget."
+                error: Some(
+                    MissionCommandError {
+                        exit_code: MISSION_EXIT_VALIDATION,
+                        error_code: "mission.drive.admission_budget_exhausted",
+                        message: "The drive stopped before admitting its next assignment because its time budget expired."
                             .to_string(),
-                    ),
-                }),
+                        hint: Some(
+                            "Committed actions remain saved. Inspect mission status and resume with a fresh exact token; an action already running is not interrupted by this budget."
+                                .to_string(),
+                        ),
+                    }
+                    .into(),
+                ),
             });
         }
         let token = match serde_json::to_string(&progress.last_confirmed_token) {
@@ -83881,7 +83941,7 @@ where
                 progress.stopped_assignment = Some(assignment_id);
                 return Ok(MissionDriveCommandOutput {
                     progress,
-                    error: Some(mission_drive_receipt_error()),
+                    error: Some(mission_drive_receipt_error().into()),
                 });
             }
         };
@@ -83898,6 +83958,7 @@ where
         .await
         .and_then(|(data, _)| {
             mission_drive_accept_dispatch(data, &assignment_id, &progress.last_confirmed_token)
+                .map_err(MissionAssignmentDispatchError::from)
         });
         progress.elapsed_ms = mission_drive_elapsed_ms(elapsed());
         match dispatched {
@@ -83944,11 +84005,15 @@ fn mission_drive_output_envelope(output: &MissionDriveCommandOutput) -> serde_js
             .unresolved_assignments
             .saturating_sub(output.progress.committed_actions.len())
     );
-    if let Some(error) = &output.error {
+    if let Some(failure) = &output.error {
+        let error = &failure.command;
         envelope["error"] = serde_json::json!(error.message);
         envelope["error_code"] = serde_json::json!(error.error_code);
         envelope["exit_code"] = serde_json::json!(error.exit_code);
         envelope["hint"] = serde_json::json!(error.hint);
+        if let Some(report) = failure.transaction_report.as_deref() {
+            envelope["transaction_report"] = serde_json::json!(report);
+        }
     }
     envelope
 }
@@ -84020,18 +84085,26 @@ fn emit_mission_drive_output(
                 );
             }
             println!("  The last confirmed token may be stale after concurrent control changes.");
-            if let Some(error) = &output.error {
+            if let Some(failure) = &output.error {
+                let error = &failure.command;
                 eprintln!("Error: {}", error.message);
                 eprintln!("Code: {}", error.error_code);
                 if let Some(hint) = &error.hint {
                     eprintln!("Hint: {hint}");
                 }
+                if let Some(report) = failure.transaction_report.as_deref() {
+                    eprintln!(
+                        "Transaction report:\n{}",
+                        serde_json::to_string_pretty(report)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                }
             }
         }
     }
-    if let Some(error) = output.error {
+    if let Some(failure) = output.error {
         // All per-action guards were dropped before producing this value.
-        std::process::exit(error.exit_code);
+        std::process::exit(failure.command.exit_code);
     }
     Ok(())
 }
@@ -84614,7 +84687,13 @@ async fn handle_mission_command(
                     dry_run,
                 )
                 .await
-                .unwrap_or_else(|error| emit_mission_error(output_format, error));
+                .unwrap_or_else(|failure| {
+                    emit_mission_error_with_transaction_report(
+                        output_format,
+                        failure.command,
+                        failure.transaction_report.as_deref(),
+                    )
+                });
                 emit_mission_success(output_format, data, &plain_lines)?;
             }
             #[cfg(not(feature = "subprocess-bridge"))]
@@ -108917,7 +108996,12 @@ mod tests {
             .await
             .expect("blocked admission retains a reviewable plan");
             assert_eq!(
-                output.error.as_ref().expect("preflight refusal").error_code,
+                output
+                    .error
+                    .as_ref()
+                    .expect("preflight refusal")
+                    .command
+                    .error_code,
                 "mission.drive.blocked"
             );
             assert_eq!(output.progress.plan.assignment_ids.len(), 1);
@@ -109071,7 +109155,12 @@ mod tests {
             .await
             .expect("partial progress is returned on a competing pause");
             assert_eq!(
-                output.error.as_ref().expect("token conflict").error_code,
+                output
+                    .error
+                    .as_ref()
+                    .expect("token conflict")
+                    .command
+                    .error_code,
                 frankenterm_core::tx_execution::MissionStoreError::Conflict.code()
             );
             assert_eq!(output.progress.committed_actions.len(), 1);
@@ -109142,6 +109231,7 @@ mod tests {
                     .error
                     .as_ref()
                     .expect("admission deadline")
+                    .command
                     .error_code,
                 "mission.drive.admission_budget_exhausted"
             );
@@ -109164,7 +109254,7 @@ mod tests {
         run_async_test(async {
             let (_dir, layout, path, token) = mission_drive_fixture(2);
             seed_mission_drive_commits(&layout, &path, &token, &["assignment:drive-0"]);
-            let output = run_mission_drive_with_boundary(
+            let mut output = run_mission_drive_with_boundary(
                 &layout,
                 &frankenterm_core::config::Config::default(),
                 None,
@@ -109226,6 +109316,62 @@ mod tests {
             assert!(
                 !layout.db_path.exists(),
                 "binding refusal precedes runtime construction"
+            );
+
+            // This diagnostic fixture tests encoding, not another live action.
+            let before_diagnostics = mission_drive_output_envelope(&output);
+            assert!(before_diagnostics.get("transaction_report").is_none());
+            let contract = frankenterm_core::mission_dispatch::compile_assignment_dispatch(
+                &persisted,
+                &frankenterm_core::plan::AssignmentId("assignment:drive-1".into()),
+            )
+            .expect("compile unresolved diagnostic fixture");
+            let mut gates = build_robot_tx_prepare_gate_inputs(&contract);
+            gates[0].approval_satisfied = false;
+            gates[0].approval_reason_code = Some("approval_token_missing".into());
+            gates[0].required_approval = Some(
+                frankenterm_core::plan::TxPrepareApprovalRequirement {
+                    workspace_id: persisted.workspace_id.clone(),
+                    action_kind: "send_text".into(),
+                    pane_id: gates[0].pane_id,
+                    action_fingerprint: "drive-approval-fingerprint".into(),
+                    reason_code: Some("approval_required".into()),
+                },
+            );
+            let prepare_report = frankenterm_core::plan::evaluate_prepare_phase(
+                &contract.intent.tx_id,
+                &contract.plan,
+                &gates,
+                frankenterm_core::plan::MissionKillSwitchLevel::Off,
+                mission_now_ms(),
+            )
+            .expect("classify diagnostic approval refusal");
+            let report = RobotTxRunData {
+                contract_file: "retained-refusal-fixture.json".into(),
+                tx_id: contract.intent.tx_id.0,
+                plan_id: contract.plan.plan_id.0,
+                steering_receipt_id: None,
+                steering_tx_hash: None,
+                prepare_report,
+                commit_report: None,
+                compensation_report: None,
+                final_state: frankenterm_core::plan::MissionTxState::Planned,
+            };
+            output.error.as_mut().expect("stopped drive").transaction_report =
+                Some(Box::new(report.clone()));
+            let with_diagnostics = mission_drive_output_envelope(&output);
+            assert_eq!(with_diagnostics["ok"], false);
+            assert_eq!(with_diagnostics["data"], before_diagnostics["data"]);
+            assert_eq!(with_diagnostics["error_code"], before_diagnostics["error_code"]);
+            assert_eq!(with_diagnostics["exit_code"], before_diagnostics["exit_code"]);
+            assert_eq!(
+                with_diagnostics["transaction_report"],
+                serde_json::to_value(&report).expect("diagnostic report JSON")
+            );
+            assert_eq!(
+                with_diagnostics["transaction_report"]["prepare_report"]["gate_inputs"][0]
+                    ["required_approval"]["action_fingerprint"],
+                "drive-approval-fingerprint"
             );
         });
     }
@@ -109373,7 +109519,10 @@ mod tests {
                 )
                 .await
                 .expect_err("an unpersistable success must be refused before a pane action");
-                assert_eq!(error.error_code, "mission.dispatch.revision_exhausted");
+                assert_eq!(
+                    error.command.error_code,
+                    "mission.dispatch.revision_exhausted"
+                );
                 assert_eq!(std::fs::read(&path).expect("unchanged mission"), before);
                 assert!(!layout.ft_dir.join("mission-dispatch").exists());
                 assert!(!layout.db_path.exists());
@@ -109510,7 +109659,10 @@ mod tests {
                     )
                     .await
                     .expect_err("workspace mismatch must refuse before runtime resolution");
-                    assert_eq!(error.error_code, "mission.dispatch.workspace_mismatch");
+                    assert_eq!(
+                        error.command.error_code,
+                        "mission.dispatch.workspace_mismatch"
+                    );
                     assert_eq!(std::fs::read(&path).expect("reread mission"), before);
                     assert!(!layout.ft_dir.join("mission-dispatch").exists());
                     assert!(!layout.ft_dir.join("tx_ledgers").exists());
@@ -109552,7 +109704,7 @@ mod tests {
             .await
             .expect_err("stale dispatch authority must not supersede a pause");
             assert_eq!(
-                error.error_code,
+                error.command.error_code,
                 frankenterm_core::tx_execution::MissionStoreError::Conflict.code()
             );
             assert_eq!(std::fs::read(&path).expect("reread mission"), paused);
@@ -109653,9 +109805,150 @@ mod tests {
             )
             .await
             .expect_err("a settled assignment cannot create a second dispatch");
-            assert_eq!(error.error_code, "mission.dispatch.already_settled");
+            assert_eq!(error.command.error_code, "mission.dispatch.already_settled");
             assert_eq!(std::fs::read(&path).expect("reread mission"), persisted);
         });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_refusal_preserves_approval_details_without_settling() {
+        use frankenterm_core::plan::{
+            AssignmentId, MissionKillSwitchLevel, MissionTxContract, MissionTxState,
+            TxCommitReport, TxCommitStepInput, TxCompensationStepInput,
+            TxPrepareApprovalRequirement, TxPrepareGateInput, TxPrepareOutcome,
+        };
+        use frankenterm_core::tx_execution::StepExecutor;
+
+        struct ApprovalRequired {
+            workspace_id: String,
+        }
+
+        impl StepExecutor for ApprovalRequired {
+            fn evaluate_gates(
+                &self,
+                contract: &MissionTxContract,
+                _now_ms: i64,
+            ) -> Vec<TxPrepareGateInput> {
+                let mut gates = build_robot_tx_prepare_gate_inputs(contract);
+                for gate in &mut gates {
+                    gate.approval_satisfied = false;
+                    gate.approval_reason_code = Some("approval_token_missing".into());
+                    gate.required_approval = Some(TxPrepareApprovalRequirement {
+                        workspace_id: self.workspace_id.clone(),
+                        action_kind: "send_text".into(),
+                        pane_id: gate.pane_id,
+                        action_fingerprint: "approval-dispatch-fingerprint".into(),
+                        reason_code: Some("approval_required".into()),
+                    });
+                }
+                gates
+            }
+
+            fn execute_steps(
+                &self,
+                _contract: &MissionTxContract,
+                _fail_step: Option<&str>,
+                _now_ms: i64,
+            ) -> Vec<TxCommitStepInput> {
+                panic!("an approval refusal must not dispatch a pane action");
+            }
+
+            fn execute_compensations(
+                &self,
+                _contract: &MissionTxContract,
+                _commit_report: &TxCommitReport,
+                _fail_for_step: Option<&str>,
+                _now_ms: i64,
+            ) -> Vec<TxCompensationStepInput> {
+                panic!("an approval refusal must not dispatch compensation");
+            }
+        }
+
+        let (_dir, layout, path) = mission_lifecycle_fixture();
+        let before = std::fs::read(&path).expect("read original mission");
+        let mission = load_mission_from_path(&path).expect("load mission fixture");
+        let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+            &mission,
+        )
+        .expect("exact revision token");
+        let token = serde_json::to_string(&token).expect("serialize token");
+        let mutation = acquire_mission_mutation(&layout, &path, Some(&token))
+            .expect("lock mission");
+        let assignment_id = AssignmentId("assignment:cli-a".into());
+        let expected = frankenterm_core::mission_dispatch::compile_assignment_dispatch(
+            mutation.mission(),
+            &assignment_id,
+        )
+        .expect("compile assignment");
+        let (contract_lock, mut contract) = mutation
+            .publish_assignment_dispatch(&assignment_id)
+            .expect("publish assignment transaction");
+
+        let report = execute_tx_run_with_executor(
+            ApprovalRequired {
+                workspace_id: mutation.workspace_root().to_string_lossy().to_string(),
+            },
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            1_800_000_000_000,
+        )
+        .expect("an approval refusal is a classified transaction result");
+
+        assert_eq!(
+            report.prepare_report.outcome,
+            TxPrepareOutcome::RequireApproval
+        );
+        assert_eq!(report.final_state, MissionTxState::Planned);
+        assert!(report.commit_report.is_none());
+
+        let failure = finish_mission_assignment_dispatch(
+            mutation,
+            &assignment_id,
+            &expected,
+            &contract_lock,
+            &mut contract,
+            1_800_000_000_001,
+        )
+        .map_err(|error| {
+            mission_assignment_report_error(
+                error,
+                contract_lock.authoritative_path(),
+                Some(&report),
+            )
+        })
+        .expect_err("a refused action cannot settle its mission assignment");
+
+        let envelope = mission_error_envelope(
+            &failure.command,
+            failure.transaction_report.as_deref(),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            "mission.dispatch.action_not_committed"
+        );
+        assert_eq!(envelope["exit_code"], MISSION_EXIT_VALIDATION);
+        assert_eq!(
+            envelope["transaction_report"],
+            serde_json::to_value(&report).expect("serialize original transaction report")
+        );
+
+        let gate = &envelope["transaction_report"]["prepare_report"]["gate_inputs"][0];
+        assert_eq!(gate["approval_reason_code"], "approval_token_missing");
+        assert_eq!(
+            gate["required_approval"]["action_fingerprint"],
+            "approval-dispatch-fingerprint"
+        );
+        assert_eq!(std::fs::read(&path).expect("reread mission"), before);
     }
 
     #[cfg(all(
