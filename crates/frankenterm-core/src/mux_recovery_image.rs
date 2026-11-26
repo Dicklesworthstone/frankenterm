@@ -4138,8 +4138,16 @@ mod tests {
             is_attached: true,
             recovery_policy: Some(RecoveryDomainPolicy::GuardianLocal {
                 commands,
-                socket_path: "/var/tmp/g.sock".into(),
-                token_path: "/var/tmp/g.token".into(),
+                // Absolute on this platform, as validate requires; on Windows
+                // `/var/tmp/...` is not.
+                socket_path: std::env::temp_dir()
+                    .join("g.sock")
+                    .to_string_lossy()
+                    .into_owned(),
+                token_path: std::env::temp_dir()
+                    .join("g.token")
+                    .to_string_lossy()
+                    .into_owned(),
             }),
         });
         image

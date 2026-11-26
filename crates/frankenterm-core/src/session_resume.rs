@@ -3334,9 +3334,12 @@ mod tests {
 
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
+        // Absolute on this platform, so the home check passes, and one byte
+        // over the limit.
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
         let oversized = PathBuf::from(format!(
-            "/{}",
-            "a".repeat(MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES)
+            "{root}{}",
+            "a".repeat(MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES + 1 - root.len())
         ));
         let cx = crate::cx::for_request();
         let mut request = Box::pin(discover_antigravity_conversations_from_home_with_cx(

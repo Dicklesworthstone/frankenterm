@@ -1954,6 +1954,13 @@ mod tests {
         }
     }
 
+    /// A pane cwd as WezTerm captures it (a file URI) and the local path the
+    /// restored pane gets. On Windows `/home/...` is not an absolute path.
+    #[cfg(not(windows))]
+    const CAPTURED_CWD: (&str, &str) = ("file:///home/agent/project", "/home/agent/project");
+    #[cfg(windows)]
+    const CAPTURED_CWD: (&str, &str) = ("file:///C:/agent/project", r"C:\agent\project");
+
     fn leaf(pane_id: u64, cwd: Option<&str>) -> PaneNode {
         PaneNode::Leaf {
             pane_id,
@@ -2081,7 +2088,7 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             let restorer = make_restorer(mock.clone());
-            let snapshot = single_tab_snapshot(leaf(42, Some("/home/user")));
+            let snapshot = single_tab_snapshot(leaf(42, Some(CAPTURED_CWD.1)));
 
             let result = restorer.restore(&snapshot).await.unwrap();
 
@@ -2533,6 +2540,10 @@ mod tests {
         });
     }
 
+    // The Unix-path normalize tests are cfg(unix): `/home/user` is not an
+    // absolute path on Windows, whose cases are in
+    // normalize_cwd_maps_windows_drive_file_uris.
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_file_uri() {
         assert_eq!(
@@ -2589,8 +2600,17 @@ mod tests {
         );
         assert!(normalize_restored_cwd("file:///C:").is_err());
         assert!(normalize_restored_cwd("file:///Users/x").is_err());
+        for bad in [
+            "file:///C:/x?q",
+            "file:///C:/x#f",
+            "file:///C:/%zz",
+            "file:///C:/%00x",
+        ] {
+            assert!(normalize_restored_cwd(bad).is_err(), "{bad}");
+        }
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_plain_path() {
         assert_eq!(normalize_restored_cwd("/tmp/work").unwrap(), "/tmp/work");
@@ -3231,15 +3251,15 @@ mod tests {
         run_async_test(async {
             let mock = Arc::new(MockWezterm::new());
             let restorer = make_restorer(mock.clone());
-            let tree = leaf(1, Some("file:///home/agent/project"));
-            let snapshot = single_tab_snapshot(tree);
+            let (uri, local) = CAPTURED_CWD;
+            let snapshot = single_tab_snapshot(leaf(1, Some(uri)));
 
             let result = restorer.restore(&snapshot).await.unwrap();
 
             assert_eq!(result.panes_created, 1);
             let new_id = result.pane_id_map[&1];
             let pane = mock.pane_state(new_id).await.unwrap();
-            assert_eq!(pane.cwd, "/home/agent/project");
+            assert_eq!(pane.cwd, local);
         });
     }
 
@@ -3358,11 +3378,13 @@ mod tests {
         assert!(normalize_restored_cwd("file://").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_file_uri_root_only() {
         assert_eq!(normalize_restored_cwd("file:///").unwrap(), "/");
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_file_uri_with_spaces() {
         assert_eq!(
@@ -3383,6 +3405,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_strictly_decodes_percent_encoding() {
         assert_eq!(
@@ -3394,6 +3417,7 @@ mod tests {
         assert!(normalize_restored_cwd("file:///home/%00bad").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_cwd_rejects_file_uri_query_and_fragment_delimiters() {
         assert!(normalize_restored_cwd("file:///tmp/project?query").is_err());
@@ -3510,9 +3534,10 @@ mod tests {
 
     #[test]
     fn first_leaf_cwd_file_uri_normalized() {
-        let node = leaf(1, Some("file:///home/agent"));
-        let cwd_map = HashMap::from([(1, normalize_restored_cwd("file:///home/agent").unwrap())]);
-        assert_eq!(first_leaf_cwd(&node, &cwd_map), Some("/home/agent"));
+        let (uri, local) = CAPTURED_CWD;
+        let node = leaf(1, Some(uri));
+        let cwd_map = HashMap::from([(1, normalize_restored_cwd(uri).unwrap())]);
+        assert_eq!(first_leaf_cwd(&node, &cwd_map), Some(local));
     }
 
     #[test]

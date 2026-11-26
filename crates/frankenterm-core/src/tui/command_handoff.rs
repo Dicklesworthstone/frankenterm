@@ -287,7 +287,13 @@ mod tests {
 
     #[test]
     fn execute_inner_supports_shell_quoted_args() {
-        let result = execute_inner("echo \"hello quoted world\"");
+        // The handoff runs the program itself, with no shell, and on Windows
+        // `echo` is only a cmd builtin.
+        #[cfg(windows)]
+        let command = "cmd /C \"exit 0\"";
+        #[cfg(not(windows))]
+        let command = "echo \"hello quoted world\"";
+        let result = execute_inner(command);
         assert!(result.success());
         assert!(result.launch_error.is_none());
     }

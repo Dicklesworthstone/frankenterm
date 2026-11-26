@@ -4105,6 +4105,10 @@ mod tests {
         }
     }
 
+    // Unix only: Windows finds System32's WSL `bash` before PATH, so the
+    // script runs in a WSL distro without its jq. The verifier checks
+    // repository fixtures, nothing platform-specific.
+    #[cfg(unix)]
     #[test]
     fn fixture_manifest_shell_verifier_retains_run_jsonl_contract() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

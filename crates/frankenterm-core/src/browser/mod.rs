@@ -5308,6 +5308,10 @@ mod tests {
         drop(child_copy);
     }
 
+    // Unix only: Windows refuses to rename a directory while the held lock
+    // file in it is open (ERROR_SHARING_VIOLATION), so there the replacement
+    // cannot happen.
+    #[cfg(unix)]
     #[test]
     fn stable_profile_lock_registry_detects_account_directory_replacement() {
         let temp = tempfile::tempdir().expect("isolated replacement root");

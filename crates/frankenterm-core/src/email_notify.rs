@@ -1963,7 +1963,22 @@ mod transport_tests {
             task.join().unwrap();
             // The fixture has closed its listener, so the relay is unreachable.
             let unreachable = notifier.deliver(&cx, &payload).await;
-            assert_eq!(unreachable.error.as_deref(), Some("email.connect_failed"));
+            // Refused at once on Unix. Windows retries a refused loopback
+            // connect for about two seconds, the test's whole budget, so the
+            // attempt may end as a timeout, which opens the breaker too.
+            let unreachable_codes: &[&str] = if cfg!(windows) {
+                &["email.connect_failed", "email.timeout"]
+            } else {
+                &["email.connect_failed"]
+            };
+            assert!(
+                unreachable
+                    .error
+                    .as_deref()
+                    .is_some_and(|code| unreachable_codes.contains(&code)),
+                "{:?}",
+                unreachable.error
+            );
             // Now open: skipped without connecting, until the cooldown ends.
             let skipped = notifier.deliver(&cx, &payload).await;
             assert_eq!(skipped.error.as_deref(), Some("email.circuit_open"));
