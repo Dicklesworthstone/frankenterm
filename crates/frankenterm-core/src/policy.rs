@@ -4672,6 +4672,10 @@ impl ConnectorOperationDispatchError {
 // Policy Engine
 // ============================================================================
 
+const INVALID_REDACTION_POLICY_RULE_ID: &str = "policy.invalid_redaction_config";
+const INVALID_REDACTION_POLICY_REASON: &str =
+    "Secret redaction policy is invalid; correct safety.redaction and rebuild the policy engine";
+
 /// Policy engine for authorizing actions
 ///
 /// This is the central authorization point for all actions in wa.
@@ -4742,8 +4746,11 @@ pub struct PolicyEngine {
     approval_tracker: ApprovalTracker,
     /// Revocation registry for credential/session/connector access revocation
     revocation_registry: RevocationRegistry,
-    /// Secret redactor configured from `[safety.redaction]` (ft-mgy5t2.17)
-    redactor: Redactor,
+    /// Secret redactor configured from `[safety.redaction]` (ft-mgy5t2.17).
+    /// A rejected policy permanently fences this engine: no action may be
+    /// authorized, and all nonempty text is withheld instead of falling back
+    /// to a catalog that cannot recognize the operator's workspace secrets.
+    redactor: Option<Redactor>,
 }
 
 impl PolicyEngine {
@@ -4808,7 +4815,7 @@ impl PolicyEngine {
             namespace_isolation_enabled: false,
             approval_tracker: ApprovalTracker::default(),
             revocation_registry: RevocationRegistry::default(),
-            redactor: Redactor::new(),
+            redactor: Some(Redactor::new()),
         }
     }
 
@@ -4817,6 +4824,10 @@ impl PolicyEngine {
     /// This is the recommended constructor when building from TOML config,
     /// since it wires input capabilities, command gate, policy rules,
     /// redaction, decision log, and trauma guard settings in a single call.
+    /// An invalid redaction policy produces a fenced engine, including for
+    /// embedded callers that did not run `Config::validate`. All authorization
+    /// paths deny with `policy.invalid_redaction_config`; redaction withholds
+    /// every nonempty input. Reconstruct the engine after fixing the policy.
     #[must_use]
     pub fn from_safety_config(config: &crate::config::SafetyConfig) -> Self {
         let mut engine = Self::new(
@@ -4836,17 +4847,18 @@ impl PolicyEngine {
         engine.audit_chain = AuditChain::from_config(&config.audit_chain);
         engine.compliance_engine = ComplianceEngine::from_config(&config.compliance);
         engine.redactor = match config.redaction.build_redactor() {
-            Ok(redactor) => redactor,
-            Err(err) => {
-                record_policy_engine_config_fallback();
-                tracing::warn!(
+            Ok(redactor) => Some(redactor),
+            Err(_) => {
+                // A custom pattern or placeholder may itself contain a
+                // literal secret. Keep construction diagnostics content-free.
+                tracing::error!(
                     target: "ft::policy",
-                    event = "policy_engine_config_fallback",
+                    event = "policy_engine_redaction_rejected",
                     section = "safety.redaction",
-                    error = %err,
-                    "Operator-supplied [safety.redaction] pattern failed to compile; falling back to built-in Redactor catalog (ft-mgy5t2.17)"
+                    rule_id = INVALID_REDACTION_POLICY_RULE_ID,
+                    "Invalid secret redaction policy; authorization and text disclosure are disabled"
                 );
-                Redactor::new()
+                None
             }
         };
         engine.credential_broker =
@@ -5263,6 +5275,11 @@ impl PolicyEngine {
         connector_id: &str,
         now_ms: u64,
     ) -> Result<(), String> {
+        if self.redactor.is_none() {
+            return Err(format!(
+                "{INVALID_REDACTION_POLICY_RULE_ID}: {INVALID_REDACTION_POLICY_REASON}"
+            ));
+        }
         self.quarantine_registry.tick_kill_switch(now_ms);
         let level = self.quarantine_registry.kill_switch().level;
         if self.quarantine_registry.kill_switch().allows_inflight() {
@@ -5291,6 +5308,11 @@ impl PolicyEngine {
         request: crate::connector_host_runtime::ConnectorOperationRequest,
         now_ms: u64,
     ) -> Result<ConnectorMeshOperationAdmission, ConnectorOperationDispatchError> {
+        if self.redactor.is_none() {
+            return Err(ConnectorOperationDispatchError::Denied {
+                reason: INVALID_REDACTION_POLICY_RULE_ID.to_string(),
+            });
+        }
         if !self
             .quarantine_registry
             .kill_switch()
@@ -6466,6 +6488,20 @@ impl PolicyEngine {
         request: &PolicyRecommendationRequest,
     ) -> PolicyRecommendationReceipt {
         let decision = self.evaluate_authorization(&request.input, None, None, false);
+        if self.redactor.is_none() {
+            // Recommendation serialization also copies the request's domain
+            // and evidence. Without a valid policy none of that free text can
+            // be disclosed, even though the action itself was denied.
+            let mut input = PolicyInput::new(request.input.action, request.input.actor)
+                .with_surface(request.input.surface);
+            input.pane_id = request.input.pane_id;
+            return PolicyRecommendationReceipt::from_decision(
+                &input,
+                &decision,
+                &request.signals,
+                &[],
+            );
+        }
         PolicyRecommendationReceipt::from_decision(
             &request.input,
             &decision,
@@ -6563,6 +6599,27 @@ impl PolicyEngine {
         credential_sensitivity: Option<CredentialSensitivity>,
         consume_rate_limit: bool,
     ) -> PolicyDecision {
+        if self.redactor.is_none() {
+            // Do not construct a context from the original input: domain,
+            // workflow, reservation ownership, and text summaries may contain
+            // secrets that the rejected policy was meant to protect.
+            let mut safe_input =
+                PolicyInput::new(input.action, input.actor).with_surface(input.surface);
+            safe_input.pane_id = input.pane_id;
+            let mut context = DecisionContext::from_input(&safe_input);
+            context.record_rule(
+                INVALID_REDACTION_POLICY_RULE_ID,
+                true,
+                Some("deny"),
+                Some(INVALID_REDACTION_POLICY_REASON.to_string()),
+            );
+            context.set_determining_rule(INVALID_REDACTION_POLICY_RULE_ID);
+            return PolicyDecision::deny_with_rule(
+                INVALID_REDACTION_POLICY_REASON,
+                INVALID_REDACTION_POLICY_RULE_ID,
+            )
+            .with_context(context);
+        }
         let mut context = DecisionContext::from_input(input);
 
         // Auto-expire TTL'd quarantines on each real authorize() tick (the
@@ -7653,16 +7710,23 @@ impl PolicyEngine {
     ///
     /// Uses the `Redactor` to replace detected secrets with `[REDACTED]`.
     /// This should be called on all text before it is written to logs, audit
-    /// trails, or exported.
+    /// trails, or exported. A rejected policy withholds all nonempty text.
     #[must_use]
     pub fn redact_secrets(&self, text: &str) -> String {
-        self.redactor.redact(text)
+        match &self.redactor {
+            Some(redactor) => redactor.redact(text),
+            None if text.is_empty() => String::new(),
+            None => crate::redactor::REDACTED_MARKER.to_string(),
+        }
     }
 
     /// Check if text contains secrets that would be redacted
     #[must_use]
     pub fn contains_secrets(&self, text: &str) -> bool {
-        self.redactor.contains_secrets(text)
+        self.redactor.as_ref().map_or_else(
+            || !text.is_empty(),
+            |redactor| redactor.contains_secrets(text),
+        )
     }
 
     /// Capture a unified telemetry snapshot from all subsystems.
@@ -13061,6 +13125,158 @@ mod tests {
         );
         assert!(builtin_out.contains("[CUSTOM_SCRUBBED]"), "{builtin_out}");
         assert!(!builtin_out.contains("sk-abc"), "{builtin_out}");
+    }
+
+    #[test]
+    fn invalid_redaction_policy_fences_actions_and_withholds_all_text() {
+        let secret = "ORCHID_INTERNAL_CANARY";
+        assert_eq!(Redactor::new().redact(secret), secret);
+
+        for invalid_kind in 0..5 {
+            let mut safety = crate::config::SafetyConfig::default();
+            safety.redaction.patterns = vec![secret.to_string()];
+            match invalid_kind {
+                0 => safety.redaction.patterns.push(format!("{secret}[")),
+                1 => safety.redaction.placeholder = " \t".to_string(),
+                2 => safety.redaction.enabled = false,
+                3 => safety.redaction.redact_audit = false,
+                _ => safety.redaction.redact_segments = false,
+            }
+            let mut engine = PolicyEngine::from_safety_config(&safety);
+            assert_eq!(
+                engine.redact_secrets(secret),
+                crate::redactor::REDACTED_MARKER
+            );
+            assert_eq!(
+                engine.redact_secrets("unclassified\ntext\u{0}λ"),
+                crate::redactor::REDACTED_MARKER
+            );
+            assert!(engine.contains_secrets(secret));
+            assert!(engine.contains_secrets("unclassified text"));
+            assert_eq!(engine.redact_secrets(""), "");
+            assert!(!engine.contains_secrets(""));
+
+            for actor in [
+                ActorKind::Human,
+                ActorKind::Robot,
+                ActorKind::Mcp,
+                ActorKind::Workflow,
+            ] {
+                for action in [
+                    ActionKind::SendText,
+                    ActionKind::ReadOutput,
+                    ActionKind::Spawn,
+                ] {
+                    let mut capabilities = PaneCapabilities::prompt();
+                    capabilities.is_reserved = Some(true);
+                    capabilities.reserved_by = Some(secret.to_string());
+                    let input = PolicyInput::new(action, actor)
+                        .with_pane(7)
+                        .with_capabilities(capabilities)
+                        .with_command_text(secret)
+                        .with_text_summary(secret)
+                        .with_workflow(secret)
+                        .with_domain(secret);
+                    for decision in [engine.authorize(&input), engine.authorize_preview(&input)] {
+                        assert!(decision.is_denied());
+                        assert_eq!(decision.rule_id(), Some(INVALID_REDACTION_POLICY_RULE_ID));
+                        assert!(!decision.requires_approval());
+                        let context = decision.context().expect("denial context");
+                        assert_eq!(context.action, action);
+                        assert_eq!(context.actor, actor);
+                        assert_eq!(context.pane_id, Some(7));
+                        assert!(!serde_json::to_string(&decision).unwrap().contains(secret));
+                    }
+                }
+            }
+            assert_eq!(engine.tracked_rate_limit_entry_count(), 0);
+            assert!(
+                !engine
+                    .decision_log()
+                    .export_json()
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_redaction_policy_recommendation_omits_untrusted_evidence() {
+        let secret = "ORCHID_INTERNAL_CANARY";
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.redaction.patterns = vec![format!("{secret}[")];
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human)
+                .with_pane(42)
+                .with_domain(secret)
+                .with_workflow(secret)
+                .with_text_summary(secret),
+        )
+        .with_evidence(secret, secret);
+        let receipt = engine.recommend(&request);
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Deny);
+        assert_eq!(receipt.pane_id, Some(42));
+        assert_eq!(receipt.domain, None);
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == INVALID_REDACTION_POLICY_RULE_ID)
+        );
+        assert!(!serde_json::to_string(&receipt).unwrap().contains(secret));
+        assert_eq!(engine.decision_log().len(), 0);
+    }
+
+    #[test]
+    fn invalid_redaction_policy_fences_connector_boundaries() {
+        use crate::connector_host_runtime::{ConnectorCapability, ConnectorOperationRequest};
+        use crate::connector_lifecycle::LifecycleIntent;
+
+        let secret = "ORCHID_INTERNAL_CANARY";
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.redaction.patterns = vec![format!("{secret}[")];
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+        let error = engine
+            .run_connector_lifecycle_intent(
+                LifecycleIntent::Enable {
+                    connector_id: secret.to_string(),
+                },
+                1_000,
+            )
+            .unwrap_err();
+        assert!(error.contains(INVALID_REDACTION_POLICY_RULE_ID));
+        assert!(!error.contains(secret));
+        assert_eq!(engine.lifecycle_manager().op_counter(), 0);
+
+        let error = engine
+            .route_connector_operation_through_mesh(
+                secret,
+                ConnectorOperationRequest::new(secret, secret, ConnectorCapability::Invoke),
+                1_000,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorOperationDispatchError::Denied { reason }
+                if reason == INVALID_REDACTION_POLICY_RULE_ID
+        ));
+
+        let input = PolicyInput::new(ActionKind::ConnectorCredentialAction, ActorKind::Human)
+            .with_domain(secret);
+        let scope = CredentialScope {
+            provider: secret.to_string(),
+            resource: secret.to_string(),
+            operations: vec![secret.to_string()],
+        };
+        let decision = engine.authorize_connector_credential_action(
+            &input,
+            &scope,
+            CredentialSensitivity::Medium,
+        );
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some(INVALID_REDACTION_POLICY_RULE_ID));
+        assert!(!serde_json::to_string(&decision).unwrap().contains(secret));
     }
 
     #[test]
