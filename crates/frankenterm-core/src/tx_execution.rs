@@ -2279,6 +2279,236 @@ impl MissionMutationGuard {
         &self.mission
     }
 
+    /// Recheck the locked mission immediately before admitting external work.
+    /// Recovery reads may use a detached descriptor, but effects require the
+    /// original namespace and every byte of the observed revision to remain
+    /// authoritative.
+    pub fn verify_current(&self) -> Result<(), MissionStoreError> {
+        self.guard.authorizes(self.guard.authoritative_path())?;
+        let bytes = self.guard.read_authoritative_contract_bytes()?;
+        if hex::encode(Sha256::digest(&bytes)) != self.original_bytes_sha256 {
+            return Err(MissionStoreError::Conflict);
+        }
+        Ok(())
+    }
+
+    /// Publish or reopen the stable transaction slot for one assignment.
+    ///
+    /// The seed is compiled from this guard's authoritative mission. A retry
+    /// preserves the existing transaction's receipts and lifecycle, and may
+    /// never replace its immutable action, target, assignee or incarnation.
+    /// Publication is a synced, no-replace rename through pinned directories;
+    /// no observer can load a partially written seed. Keep both returned and
+    /// mission guards alive through execution and outcome persistence.
+    pub fn publish_assignment_dispatch(
+        &self,
+        assignment_id: &crate::plan::AssignmentId,
+    ) -> Result<(TxContractLockGuard, MissionTxContract), MissionStoreError> {
+        #[cfg(all(
+            feature = "subprocess-bridge",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        {
+            self.publish_assignment_dispatch_impl(assignment_id, |_| Ok(()))
+        }
+        #[cfg(not(all(
+            feature = "subprocess-bridge",
+            any(target_os = "linux", target_os = "macos")
+        )))]
+        {
+            let _ = assignment_id;
+            Err(MissionStoreError::Authority)
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn publish_assignment_dispatch_impl<F>(
+        &self,
+        assignment_id: &crate::plan::AssignmentId,
+        mut fault: F,
+    ) -> Result<(TxContractLockGuard, MissionTxContract), MissionStoreError>
+    where
+        F: FnMut(TxContractSaveFaultPoint) -> std::io::Result<()>,
+    {
+        use cap_std::fs::DirBuilderExt as _;
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        self.verify_current()?;
+        let expected =
+            crate::mission_dispatch::compile_assignment_dispatch(self.mission(), assignment_id)
+                .map_err(|_| MissionStoreError::Invalid)?;
+        let seed_bytes =
+            serde_json::to_vec_pretty(&expected).map_err(|_| MissionStoreError::Invalid)?;
+        if seed_bytes.len() > TX_CONTRACT_MAX_BYTES {
+            return Err(MissionStoreError::TooLarge);
+        }
+        let digest = expected
+            .intent
+            .tx_id
+            .0
+            .strip_prefix("mission-tx:")
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or(MissionStoreError::Invalid)?;
+        let name = format!("{digest}.json");
+        let directory_name = "mission-dispatch";
+        let directory_path = self.guard.control_display.join(directory_name);
+        let mut builder = cap_std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match self
+            .guard
+            .control_dir
+            .create_dir_with(directory_name, &builder)
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(MissionStoreError::Authority),
+        }
+        let directory = self
+            .guard
+            .control_dir
+            .open_dir_nofollow(directory_name)
+            .map_err(|_| MissionStoreError::Authority)?;
+        let metadata = directory
+            .dir_metadata()
+            .map_err(|_| MissionStoreError::Authority)?;
+        if metadata.mode() & 0o077 != 0 || metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(MissionStoreError::Authority);
+        }
+        let directory_identity = cap_object_identity(&metadata)?;
+        let directory_sync = open_directory_sync_file(&directory, &directory_path)?;
+        // Also settle a directory left by a prior interrupted publication.
+        sync_pinned_directory(&self.guard.control_dir, &self.guard.control_display)?;
+
+        let verify_namespace = || -> Result<(), MissionStoreError> {
+            self.verify_current()?;
+            let current = self
+                .guard
+                .control_dir
+                .open_dir_nofollow(directory_name)
+                .map_err(|_| MissionStoreError::Authority)?;
+            let current_metadata = current
+                .dir_metadata()
+                .map_err(|_| MissionStoreError::Authority)?;
+            if cap_object_identity(&current_metadata)? != directory_identity
+                || current_metadata.mode() & 0o077 != 0
+                || current_metadata.uid() != rustix::process::geteuid().as_raw()
+            {
+                return Err(MissionStoreError::Conflict);
+            }
+            Ok(())
+        };
+
+        match directory.symlink_metadata(&name) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.nlink() != 1 {
+                    return Err(MissionStoreError::Authority);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut seed = None;
+                for _ in 0..64 {
+                    let nonce = TX_CONTRACT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+                    let temp_name =
+                        format!(".{digest}.{}.{nonce}.recovery.tmp", std::process::id());
+                    let mut options = CapOpenOptions::new();
+                    options
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .follow(FollowSymlinks::No)
+                        .mode(0o600)
+                        .nonblock(true);
+                    match directory.open_with(&temp_name, &options) {
+                        Ok(file) => {
+                            seed = Some((temp_name, file));
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(_) => return Err(MissionStoreError::Write),
+                    }
+                }
+                let (temp_name, mut file) = seed.ok_or(MissionStoreError::Write)?;
+                // Retain failed staging files for inspection. Only the final
+                // deterministic .json name is executable transaction authority.
+                fault(TxContractSaveFaultPoint::BeforeWrite)
+                    .and_then(|()| file.write_all(&seed_bytes))
+                    .map_err(|_| MissionStoreError::Write)?;
+                fault(TxContractSaveFaultPoint::BeforeFileSync)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|_| MissionStoreError::Sync)?;
+                fault(TxContractSaveFaultPoint::BeforeAtomicReplace)
+                    .map_err(|_| MissionStoreError::Rename)?;
+                verify_namespace()?;
+                let opened = file.metadata().map_err(|_| MissionStoreError::Authority)?;
+                let named = directory
+                    .symlink_metadata(&temp_name)
+                    .map_err(|_| MissionStoreError::Authority)?;
+                if !named.is_file()
+                    || named.nlink() != 1
+                    || cap_object_identity(&opened)? != cap_object_identity(&named)?
+                {
+                    return Err(MissionStoreError::Authority);
+                }
+                match renameat_with(
+                    &directory_sync,
+                    temp_name.as_str(),
+                    &directory_sync,
+                    name.as_str(),
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error == rustix::io::Errno::EXIST => {
+                        // Another mission file can name the same incarnation.
+                        // Never replace its slot; inspect it under the tx lock.
+                    }
+                    Err(_) => return Err(MissionStoreError::Rename),
+                }
+            }
+            Err(_) => return Err(MissionStoreError::Authority),
+        }
+        fault(TxContractSaveFaultPoint::ParentDirectorySync)
+            .and_then(|()| directory_sync.sync_all())
+            .map_err(|_| MissionStoreError::Indeterminate)?;
+        verify_namespace().map_err(|_| MissionStoreError::Indeterminate)?;
+        let path = directory_path.join(name);
+        let guard = acquire_tx_contract_lock(&self.guard.workspace_display, &path)?;
+        // The lock's ambient discovery must resolve back to the pinned
+        // directory that admitted publication, not a substituted namespace.
+        if guard.parent_identity != directory_identity
+            || guard.control_identity != self.guard.control_identity
+            || guard.workspace_identity != self.guard.workspace_identity
+        {
+            return Err(MissionStoreError::Conflict);
+        }
+        let bytes = guard.read_authoritative_contract_bytes()?;
+        let persisted: MissionTxContract =
+            serde_json::from_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
+        persisted.validate().map_err(|_| MissionStoreError::Invalid)?;
+        validate_tx_contract_state_outcome(&persisted).map_err(|_| MissionStoreError::Invalid)?;
+        if !mission_dispatch_contract_matches(&expected, &persisted)? {
+            return Err(MissionStoreError::Conflict);
+        }
+        guard.authorizes(guard.authoritative_path())?;
+        // Reopening a complete seed after an interrupted publication must
+        // settle its durability too, without changing any retained evidence.
+        guard
+            .contract_file
+            .lock()
+            .map_err(|_| MissionStoreError::Authority)?
+            .sync_all()
+            .map_err(|_| MissionStoreError::Indeterminate)?;
+        guard
+            .sync_parent()
+            .map_err(|_| MissionStoreError::Indeterminate)?;
+        self.verify_current()?;
+        Ok((guard, persisted))
+    }
+
     pub fn commit(
         self,
         mission: &mut Mission,
@@ -2362,6 +2592,17 @@ impl MissionMutationGuard {
             owner_acknowledgement: "unavailable_no_mission_driver",
         })
     }
+}
+
+fn mission_dispatch_contract_matches(
+    expected: &MissionTxContract,
+    actual: &MissionTxContract,
+) -> Result<bool, MissionStoreError> {
+    let encode = |contract: &MissionTxContract| {
+        serde_json::to_vec(&(contract.tx_version, &contract.intent, &contract.plan))
+            .map_err(|_| MissionStoreError::Invalid)
+    };
+    Ok(encode(expected)? == encode(actual)?)
 }
 
 // ── Step Executor Trait ──────────────────────────────────────────────────────
@@ -4291,6 +4532,171 @@ fn compensation_idempotency_key(
         step_id,
         &fingerprint,
     ))
+}
+
+/// Recover a mission assignment's committed action from authoritative durable proof.
+///
+/// This never dispatches an action. The expected contract must come from
+/// `compile_assignment_dispatch` for the mission held by the caller's mutation
+/// guard. A true result means that the matching action has durable success
+/// evidence and its terminal transaction contract has been saved and synced.
+/// Keep the mission mutation guard until the assignment outcome is also saved.
+///
+/// A false result supplies no execution authority: the normal transaction
+/// executor must still classify absent, failed, or unsettled durable outcomes.
+///
+/// # Errors
+///
+/// Fails closed on a foreign contract, unsupported compiler shape, stale loaded
+/// snapshot, unavailable proof, or a contract persistence failure.
+pub fn recover_mission_assignment_dispatch(
+    contract_lock: &TxContractLockGuard,
+    expected: &MissionTxContract,
+    contract: &mut MissionTxContract,
+    now_ms: i64,
+) -> Result<bool, MissionStoreError> {
+    expected.validate().map_err(|_| MissionStoreError::Invalid)?;
+    contract.validate().map_err(|_| MissionStoreError::Invalid)?;
+    validate_tx_contract_state_outcome(contract).map_err(|_| MissionStoreError::Invalid)?;
+    let digest = expected
+        .intent
+        .tx_id
+        .0
+        .strip_prefix("mission-tx:")
+        .ok_or(MissionStoreError::Invalid)?;
+    let [step] = expected.plan.steps.as_slice() else {
+        return Err(MissionStoreError::Invalid);
+    };
+    let explicit_pane_action = match &step.action {
+        StepAction::SendText { .. } => true,
+        StepAction::WaitFor {
+            pane_id, condition, ..
+        } => {
+            let condition_pane = match condition {
+                crate::plan::WaitCondition::Pattern { pane_id, .. }
+                | crate::plan::WaitCondition::PaneIdle { pane_id, .. }
+                | crate::plan::WaitCondition::StableTail { pane_id, .. } => *pane_id,
+                crate::plan::WaitCondition::External { .. } => {
+                    return Err(MissionStoreError::Invalid);
+                }
+            };
+            pane_id.or(condition_pane).is_some()
+                && !matches!(
+                    (pane_id, condition_pane),
+                    (Some(outer), Some(inner)) if *outer != inner
+                )
+        }
+        _ => false,
+    };
+    let binding: (
+        String,
+        crate::plan::AssignmentId,
+        String,
+        crate::plan::CandidateActionId,
+    ) = serde_json::from_str(&expected.intent.summary)
+        .map_err(|_| MissionStoreError::Invalid)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || expected.plan.plan_id.0 != format!("mission-plan:{digest}")
+        || expected.intent.correlation_id != format!("mission-dispatch:{digest}")
+        || step.step_id.0 != format!("assignment:{digest}")
+        || step.ordinal != 0
+        || step.description != "Execute the assignment's explicit pane action"
+        || !explicit_pane_action
+        || expected.intent.requested_by != crate::plan::MissionActorRole::Dispatcher
+        || binding.0 != "frankenterm.mission.assignment-binding.v1"
+        || expected.lifecycle_state != MissionTxState::Planned
+        || expected.outcome != TxOutcome::Pending
+        || !expected.receipts.is_empty()
+        || !expected.plan.preconditions.is_empty()
+        || !expected.plan.compensations.is_empty()
+        || expected.intent.created_at_ms < 0
+        || now_ms < expected.intent.created_at_ms
+    {
+        return Err(MissionStoreError::Invalid);
+    }
+    if !mission_dispatch_contract_matches(expected, contract)? {
+        return Err(MissionStoreError::Conflict);
+    }
+
+    contract_lock
+        .authorizes(contract_lock.authoritative_path())
+        .map_err(MissionStoreError::from)?;
+    // The caller may not substitute an unsaved mutable snapshot for the
+    // contract actually protected by this guard.
+    let persisted: MissionTxContract = serde_json::from_slice(
+        &contract_lock
+            .read_authoritative_contract_bytes()
+            .map_err(MissionStoreError::from)?,
+    )
+    .map_err(|_| MissionStoreError::Invalid)?;
+    if serde_json::to_vec(&persisted).map_err(|_| MissionStoreError::Invalid)?
+        != serde_json::to_vec(&*contract).map_err(|_| MissionStoreError::Invalid)?
+    {
+        return Err(MissionStoreError::Conflict);
+    }
+    if matches!(
+        contract.lifecycle_state,
+        MissionTxState::Draft
+            | MissionTxState::Compensating
+            | MissionTxState::Compensated
+            | MissionTxState::RolledBack
+    ) {
+        return Err(MissionStoreError::Invalid);
+    }
+
+    let mut store = contract_lock
+        .open_idempotency_store(IdempotencyPolicy::default())
+        .map_err(MissionStoreError::from)?;
+    let key = commit_idempotency_key(contract, &step.step_id.0)
+        .map_err(|_| MissionStoreError::Invalid)?;
+    let logical_now_ms = u64::try_from(now_ms).map_err(|_| MissionStoreError::Invalid)?;
+    // A live spool refresh under the exclusive plan barrier is the proof.
+    // Neither contract receipts nor an in-memory dedup cache can supply it.
+    let proof = store
+        .acquire_durable_key_leases([key.clone()], logical_now_ms)
+        .map_err(|err| match err {
+            IdempotencyError::ReservationInProgress { .. }
+            | IdempotencyError::PlanMutationInProgress { .. }
+            | IdempotencyError::ExecutionMutationInProgress { .. }
+            | IdempotencyError::SpoolCatalogMutationInProgress => {
+                MissionStoreError::InProgress
+            }
+            _ => MissionStoreError::Authority,
+        })?;
+    if !matches!(
+        proof.get(&key).and_then(|lease| lease.observed_outcome()),
+        Some(StepOutcome::Success { .. })
+    ) {
+        return Ok(false);
+    }
+
+    let mut recovered = contract.clone();
+    let report = recovered_commit_success_report(
+        &recovered,
+        &HashSet::from([step.step_id.0.clone()]),
+        now_ms,
+    )
+    .map_err(|_| MissionStoreError::Invalid)?;
+    recovered.receipts.extend(report.receipts);
+    recovered.lifecycle_state = MissionTxState::Committed;
+    recovered.outcome = TxOutcome::Committed;
+    recovered.validate().map_err(|_| MissionStoreError::Invalid)?;
+
+    // Even an already committed snapshot is republished and synchronized:
+    // the previous process may have lost the final directory-sync reply.
+    // Retain the durable proof barrier until that acknowledgement succeeds.
+    save_tx_contract_atomic(
+        contract_lock,
+        contract_lock.authoritative_path(),
+        &recovered,
+    )
+    .map_err(MissionStoreError::from)?;
+    *contract = recovered;
+    drop(proof);
+    Ok(true)
 }
 
 /// What an operator proved happened to an effect a crash left `Pending`.
@@ -8440,6 +8846,310 @@ mod tests {
         mission.lifecycle_state = crate::plan::MissionLifecycleState::Running;
         std::fs::write(path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
         mission
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn stored_dispatch_mission_fixture(path: &Path) -> Mission {
+        let mut mission = stored_mission_fixture(path);
+        mission.candidates.push(crate::plan::CandidateAction {
+            candidate_id: crate::plan::CandidateActionId("candidate:dispatch".into()),
+            requested_by: crate::plan::MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 42,
+                text: "printf 'dispatch-test\\n'\n".into(),
+                paste_mode: Some(false),
+            },
+            rationale: "Explicit test pane".into(),
+            score: None,
+            created_at_ms: 1_001,
+        });
+        mission.assignments.push(crate::plan::Assignment {
+            assignment_id: crate::plan::AssignmentId("assignment:dispatch".into()),
+            candidate_id: mission.candidates[0].candidate_id.clone(),
+            assigned_by: crate::plan::MissionActorRole::Dispatcher,
+            assignee: "test-agent".into(),
+            reservation_intent: None,
+            approval_state: crate::plan::ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_002,
+            updated_at_ms: None,
+        });
+        mission.updated_at_ms = Some(1_003);
+        mission.validate().unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
+        mission
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_preserves_existing_execution_and_exact_binding() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("mission.json");
+        let mut mission = stored_dispatch_mission_fixture(&path);
+        let assignment_id = mission.assignments[0].assignment_id.clone();
+        let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+        let (tx_guard, mut contract) = mutation
+            .publish_assignment_dispatch(&assignment_id)
+            .unwrap();
+        let tx_path = tx_guard.authoritative_path().to_path_buf();
+        assert_eq!(std::fs::metadata(&tx_path).unwrap().nlink(), 1);
+        assert_eq!(
+            std::fs::metadata(&tx_path).unwrap().mode() & 0o777,
+            0o600
+        );
+        contract.lifecycle_state = MissionTxState::Prepared;
+        save_tx_contract_atomic(&tx_guard, &tx_path, &contract).unwrap();
+        let prepared_bytes = std::fs::read(&tx_path).unwrap();
+        drop(tx_guard);
+
+        let (tx_guard, reopened) = mutation
+            .publish_assignment_dispatch(&assignment_id)
+            .unwrap();
+        assert_eq!(tx_guard.authoritative_path(), tx_path);
+        assert_eq!(reopened.lifecycle_state, MissionTxState::Prepared);
+        assert_eq!(std::fs::read(&tx_path).unwrap(), prepared_bytes);
+        assert_eq!(
+            std::fs::read_dir(tx_path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        drop(tx_guard);
+
+        let StepAction::SendText { text, .. } = &mut mission.candidates[0].action else {
+            panic!("fixture must contain a pane send");
+        };
+        *text = "changed command\n".into();
+        let receipt = mutation.commit(&mut mission).unwrap();
+        let mutation =
+            MissionMutationGuard::acquire(directory.path(), &path, Some(&receipt.current))
+                .unwrap();
+        assert_eq!(
+            mutation
+                .publish_assignment_dispatch(&assignment_id)
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+        assert_eq!(std::fs::read(&tx_path).unwrap(), prepared_bytes);
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_faults_never_expose_a_partial_contract() {
+        for (point, expected_error, published) in [
+            (
+                TxContractSaveFaultPoint::BeforeWrite,
+                MissionStoreError::Write,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::BeforeFileSync,
+                MissionStoreError::Sync,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::BeforeAtomicReplace,
+                MissionStoreError::Rename,
+                false,
+            ),
+            (
+                TxContractSaveFaultPoint::ParentDirectorySync,
+                MissionStoreError::Indeterminate,
+                true,
+            ),
+        ] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("mission.json");
+            let mission = stored_dispatch_mission_fixture(&path);
+            let assignment_id = &mission.assignments[0].assignment_id;
+            let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+            let result = mutation.publish_assignment_dispatch_impl(assignment_id, |at| {
+                if at == point {
+                    Err(std::io::Error::other("injected publication cutpoint"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(
+                result.err().unwrap(),
+                expected_error,
+                "cutpoint {point:?}"
+            );
+            let finals: Vec<_> =
+                std::fs::read_dir(directory.path().join(".ft/mission-dispatch"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.extension().is_some_and(|extension| extension == "json")
+                    })
+                    .collect();
+            assert_eq!(finals.len(), usize::from(published));
+            if published {
+                let contract: MissionTxContract =
+                    serde_json::from_slice(&std::fs::read(&finals[0]).unwrap()).unwrap();
+                contract.validate().unwrap();
+                assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+            }
+            // A complete final seed can settle durability on retry; a retained
+            // failed stage never occupies the stable executable slot.
+            let (guard, contract) = mutation
+                .publish_assignment_dispatch(assignment_id)
+                .unwrap();
+            assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+            assert_eq!(
+                std::fs::metadata(guard.authoritative_path()).unwrap().nlink(),
+                1
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_refuses_changed_mission_before_any_seed() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("mission.json");
+        let mut mission = stored_dispatch_mission_fixture(&path);
+        let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+        mission.title = "concurrent in-place change".into();
+        std::fs::write(&path, serde_json::to_vec(&mission).unwrap()).unwrap();
+        assert_eq!(mutation.verify_current(), Err(MissionStoreError::Conflict));
+        assert_eq!(
+            mutation
+                .publish_assignment_dispatch(&mission.assignments[0].assignment_id)
+                .err()
+                .unwrap(),
+            MissionStoreError::Conflict
+        );
+        assert!(!directory.path().join(".ft/mission-dispatch").exists());
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_refuses_directory_replacement_before_rename() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("mission.json");
+        let mission = stored_dispatch_mission_fixture(&path);
+        let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+        let dispatch_dir = directory.path().join(".ft/mission-dispatch");
+        let detached = directory.path().join(".ft/detached-dispatch");
+        let result = mutation.publish_assignment_dispatch_impl(
+            &mission.assignments[0].assignment_id,
+            |point| {
+                if point == TxContractSaveFaultPoint::BeforeAtomicReplace {
+                    std::fs::rename(&dispatch_dir, &detached)?;
+                    std::fs::create_dir(&dispatch_dir)?;
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result.err().unwrap(), MissionStoreError::Conflict);
+        assert_eq!(std::fs::read_dir(&dispatch_dir).unwrap().count(), 0);
+        assert!(std::fs::read_dir(&detached).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+        }));
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_refuses_symlink_and_hardlink_slots() {
+        for hardlink in [false, true] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let path = directory.path().join("mission.json");
+            let mission = stored_dispatch_mission_fixture(&path);
+            let assignment_id = &mission.assignments[0].assignment_id;
+            let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+            let (guard, _) = mutation
+                .publish_assignment_dispatch(assignment_id)
+                .unwrap();
+            let tx_path = guard.authoritative_path().to_path_buf();
+            drop(guard);
+            let retained = tx_path.with_extension("retained");
+            std::fs::rename(&tx_path, &retained).unwrap();
+            if hardlink {
+                std::fs::hard_link(&retained, &tx_path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&retained, &tx_path).unwrap();
+            }
+            let before = std::fs::read(&retained).unwrap();
+            assert_eq!(
+                mutation
+                    .publish_assignment_dispatch(assignment_id)
+                    .err()
+                    .unwrap(),
+                MissionStoreError::Authority
+            );
+            assert_eq!(std::fs::read(&retained).unwrap(), before);
+        }
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_publication_rejects_incoherent_retained_outcome() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("mission.json");
+        let mission = stored_dispatch_mission_fixture(&path);
+        let assignment_id = &mission.assignments[0].assignment_id;
+        let mutation = MissionMutationGuard::acquire(directory.path(), &path, None).unwrap();
+        let (guard, mut contract) = mutation
+            .publish_assignment_dispatch(assignment_id)
+            .unwrap();
+        let tx_path = guard.authoritative_path().to_path_buf();
+        drop(guard);
+        contract.outcome = TxOutcome::Committed;
+        let corrupted = serde_json::to_vec(&contract).unwrap();
+        std::fs::write(&tx_path, &corrupted).unwrap();
+
+        assert_eq!(
+            mutation
+                .publish_assignment_dispatch(assignment_id)
+                .err()
+                .unwrap(),
+            MissionStoreError::Invalid
+        );
+        assert_eq!(std::fs::read(&tx_path).unwrap(), corrupted);
     }
 
     #[test]
@@ -18523,4 +19233,310 @@ mod tests {
         ));
         Ok(())
     }
+
+    // Mission assignment recovery regression tests.
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn mission_dispatch_recovery_contract() -> MissionTxContract {
+        let mut contract = make_test_contract(1);
+        let digest = "ab".repeat(32);
+        contract.intent = TxIntent {
+            tx_id: TxId(format!("mission-tx:{digest}")),
+            requested_by: MissionActorRole::Dispatcher,
+            summary: serde_json::to_string(&(
+                "frankenterm.mission.assignment-binding.v1",
+                crate::plan::AssignmentId("assignment:recovery".to_string()),
+                "worker:recovery",
+                crate::plan::CandidateActionId("candidate:recovery".to_string()),
+            ))
+            .unwrap(),
+            correlation_id: format!("mission-dispatch:{digest}"),
+            created_at_ms: 1_000,
+        };
+        contract.plan.tx_id = contract.intent.tx_id.clone();
+        contract.plan.plan_id = TxPlanId(format!("mission-plan:{digest}"));
+        contract.plan.steps[0].step_id = TxStepId(format!("assignment:{digest}"));
+        contract.plan.steps[0].description =
+            "Execute the assignment's explicit pane action".to_string();
+        contract.plan.compensations.clear();
+        contract
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn seed_mission_dispatch_recovery_outcome(
+        guard: &TxContractLockGuard,
+        contract: &MissionTxContract,
+        outcome: StepOutcome,
+    ) {
+        let mut store = guard
+            .open_idempotency_store(IdempotencyPolicy::default())
+            .unwrap();
+        let execution_id = "mission-dispatch-before-crash";
+        store
+            .create_ledger(execution_id, &compiled_plan_from_contract(contract))
+            .unwrap();
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .unwrap();
+        store
+            .transition_phase(execution_id, TxPhase::Committing)
+            .unwrap();
+        let key = test_commit_key(contract, &contract.plan.steps[0].step_id.0);
+        if outcome.is_pending() {
+            let mut reservation = store
+                .acquire_durable_reservation(execution_id, &key, 5_000)
+                .unwrap();
+            store
+                .record_execution_reserved(
+                    &mut reservation,
+                    execution_id,
+                    key,
+                    StepOutcome::Pending,
+                    StepRisk::High,
+                    "worker:recovery",
+                    5_000,
+                )
+                .unwrap();
+        } else {
+            record_durable_test_outcome(
+                &mut store,
+                execution_id,
+                key,
+                outcome,
+                StepRisk::High,
+                "worker:recovery",
+                5_000,
+            )
+            .unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_recovers_durable_success_after_contract_and_mission_save_crash() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission-dispatch.json");
+        let expected = mission_dispatch_recovery_contract();
+        write_authoritative_contract(&path, &expected);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        seed_mission_dispatch_recovery_outcome(
+            &guard,
+            &expected,
+            StepOutcome::Success {
+                result: Some("pane action acknowledged".to_string()),
+            },
+        );
+        let mut contract = expected.clone();
+
+        assert!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000)
+                .unwrap()
+        );
+        assert_eq!(contract.lifecycle_state, MissionTxState::Committed);
+        assert_eq!(contract.outcome, TxOutcome::Committed);
+        assert_eq!(contract.receipts.len(), 1);
+        assert_eq!(
+            contract.receipts[0]["reason_code"],
+            "commit_step_recovered_durable_success"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &guard.read_authoritative_contract_bytes().unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&contract).unwrap()
+        );
+        let receipts = contract.receipts.clone();
+        drop(guard);
+
+        // The mission save can fail after this terminal tx save too. A new
+        // process must recover that same success without adding another receipt.
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        let mut reloaded: MissionTxContract =
+            serde_json::from_slice(&guard.read_authoritative_contract_bytes().unwrap()).unwrap();
+        assert!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut reloaded, 7_000)
+                .unwrap()
+        );
+        assert_eq!(reloaded.receipts, receipts);
+        assert_eq!(reloaded.lifecycle_state, MissionTxState::Committed);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_receipts_and_terminal_json_are_not_durable_success_proof() {
+        for claimed_committed in [false, true] {
+            let (_dir, root) = canonical_tempdir();
+            let path = root.join("mission-dispatch.json");
+            let expected = mission_dispatch_recovery_contract();
+            let mut contract = expected.clone();
+            if claimed_committed {
+                contract.receipts = recovered_commit_success_report(
+                    &contract,
+                    &HashSet::from([contract.plan.steps[0].step_id.0.clone()]),
+                    5_000,
+                )
+                .unwrap()
+                .receipts;
+                contract.lifecycle_state = MissionTxState::Committed;
+                contract.outcome = TxOutcome::Committed;
+            }
+            write_authoritative_contract(&path, &contract);
+            let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+            let original = guard.read_authoritative_contract_bytes().unwrap();
+
+            assert!(!recover_mission_assignment_dispatch(
+                &guard,
+                &expected,
+                &mut contract,
+                6_000
+            )
+            .unwrap());
+            assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_does_not_recover_pending_or_failed_actions() {
+        for outcome in [
+            StepOutcome::Pending,
+            StepOutcome::Failed {
+                error_code: "dispatch_failed".to_string(),
+                error_message: "action was not acknowledged".to_string(),
+                compensated: false,
+            },
+        ] {
+            let (_dir, root) = canonical_tempdir();
+            let path = root.join("mission-dispatch.json");
+            let expected = mission_dispatch_recovery_contract();
+            write_authoritative_contract(&path, &expected);
+            let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+            seed_mission_dispatch_recovery_outcome(&guard, &expected, outcome);
+            let original = guard.read_authoritative_contract_bytes().unwrap();
+            let mut contract = expected.clone();
+
+            assert!(!recover_mission_assignment_dispatch(
+                &guard,
+                &expected,
+                &mut contract,
+                6_000
+            )
+            .unwrap());
+            assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+            assert!(contract.receipts.is_empty());
+            assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_recovery_binds_assignment_creation_time_beyond_tx_hash() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission-dispatch.json");
+        let expected = mission_dispatch_recovery_contract();
+        let mut foreign = expected.clone();
+        foreign.intent.created_at_ms += 1;
+        assert_eq!(
+            test_commit_key(&expected, &expected.plan.steps[0].step_id.0),
+            test_commit_key(&foreign, &foreign.plan.steps[0].step_id.0),
+            "creation time is deliberately outside the general tx hash"
+        );
+        write_authoritative_contract(&path, &foreign);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        seed_mission_dispatch_recovery_outcome(
+            &guard,
+            &foreign,
+            StepOutcome::Success { result: None },
+        );
+        let original = guard.read_authoritative_contract_bytes().unwrap();
+
+        assert_eq!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut foreign, 6_000),
+            Err(MissionStoreError::Conflict)
+        );
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+        assert_eq!(foreign.lifecycle_state, MissionTxState::Planned);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_recovery_rejects_unsaved_mutable_snapshot() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission-dispatch.json");
+        let expected = mission_dispatch_recovery_contract();
+        write_authoritative_contract(&path, &expected);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        seed_mission_dispatch_recovery_outcome(
+            &guard,
+            &expected,
+            StepOutcome::Success { result: None },
+        );
+        let original = guard.read_authoritative_contract_bytes().unwrap();
+        let mut stale = expected.clone();
+        stale.lifecycle_state = MissionTxState::Prepared;
+
+        assert_eq!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut stale, 6_000),
+            Err(MissionStoreError::Conflict)
+        );
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_recovery_rejects_contracts_with_compensation() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission-dispatch.json");
+        let mut expected = mission_dispatch_recovery_contract();
+        expected.plan.compensations.push(TxCompensation {
+            for_step_id: expected.plan.steps[0].step_id.clone(),
+            action: expected.plan.steps[0].action.clone(),
+        });
+        write_authoritative_contract(&path, &expected);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        let mut contract = expected.clone();
+        let original = guard.read_authoritative_contract_bytes().unwrap();
+
+        assert_eq!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000),
+            Err(MissionStoreError::Invalid)
+        );
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mission_dispatch_recovery_waits_for_live_durable_proof_ownership() {
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("mission-dispatch.json");
+        let expected = mission_dispatch_recovery_contract();
+        write_authoritative_contract(&path, &expected);
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
+        seed_mission_dispatch_recovery_outcome(
+            &guard,
+            &expected,
+            StepOutcome::Success { result: None },
+        );
+        let mut other_store = guard
+            .open_idempotency_store(IdempotencyPolicy::default())
+            .unwrap();
+        let key = test_commit_key(&expected, &expected.plan.steps[0].step_id.0);
+        let proof = other_store.acquire_durable_key_leases([key], 6_000).unwrap();
+        let original = guard.read_authoritative_contract_bytes().unwrap();
+        let mut contract = expected.clone();
+
+        assert_eq!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 6_000),
+            Err(MissionStoreError::InProgress)
+        );
+        assert_eq!(guard.read_authoritative_contract_bytes().unwrap(), original);
+        drop(proof);
+        assert!(
+            recover_mission_assignment_dispatch(&guard, &expected, &mut contract, 7_000)
+                .unwrap()
+        );
+    }
+
+    // End mission assignment recovery regression tests.
 }
