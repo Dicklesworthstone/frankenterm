@@ -341,7 +341,11 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
         } else {
             ""
         };
-        format!("{}{ft_block}{newline}{}", &content[..start], &content[end..])
+        format!(
+            "{}{ft_block}{newline}{}",
+            &content[..start],
+            &content[end..]
+        )
     } else if content.is_empty() {
         format!("{ft_block}\n")
     } else if content.ends_with('\n') {

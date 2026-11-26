@@ -153,8 +153,8 @@ fn finishing_cold_tier_redaction_retires_an_empty_overflow_quarantine() {
         "-----BEGIN PRIVATE KEY-----\n{}",
         "SensitiveMaterial\n".repeat(32)
     );
-    let (redacted, evidence) = ChunkBytes::<Raw>::from_raw(unfinished.into_bytes())
-        .redact_with_streaming(&mut redactor);
+    let (redacted, evidence) =
+        ChunkBytes::<Raw>::from_raw(unfinished.into_bytes()).redact_with_streaming(&mut redactor);
     assert!(evidence.made_changes());
     assert!(!String::from_utf8_lossy(redacted.as_bytes()).contains("SensitiveMaterial"));
 

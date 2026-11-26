@@ -305,7 +305,10 @@ mod tests {
                 detected_at_ms: 777,
             }))
         );
-        let replay = detection.replace(r#""replayed":false"#, r#""replayed":true,"detected_at":123"#);
+        let replay = detection.replace(
+            r#""replayed":false"#,
+            r#""replayed":true,"detected_at":123"#,
+        );
         let Ok(StreamUpdate::Detection(replayed)) = decode_stream_frame(&replay) else {
             panic!("expected replayed detection");
         };

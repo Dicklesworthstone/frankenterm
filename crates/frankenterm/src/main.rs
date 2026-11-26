@@ -96445,7 +96445,10 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
                         println!("  Backup: {}", backup.display());
                     }
                 } else {
-                    println!("⚠ shell rc needs updated OSC 133 markers ({})", shell_type.name());
+                    println!(
+                        "⚠ shell rc needs updated OSC 133 markers ({})",
+                        shell_type.name()
+                    );
                     println!("  Run: ft setup shell --apply");
                 }
             }

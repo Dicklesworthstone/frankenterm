@@ -2098,21 +2098,17 @@ impl StreamingRedactor {
             }
             if self.pending.len() > self.max_pending_bytes {
                 record_streaming_redactor_pending_overflow();
-                self.suppression = Some(
-                    if self.redactor.custom_patterns.is_empty() {
-                        STREAMING_ARMOURED_HEADER
-                            .captures(self.pending.as_str())
-                            .filter(|header| {
-                                header.get(0).is_some_and(|whole| whole.start() == 0)
-                            })
-                            .and_then(|header| header.name("label"))
-                            .and_then(|label| armoured_terminator(label.as_str()))
-                            .map(StreamingSuppression::armour)
-                            .unwrap_or(StreamingSuppression::UntilFinish)
-                    } else {
-                        StreamingSuppression::UntilFinish
-                    },
-                );
+                self.suppression = Some(if self.redactor.custom_patterns.is_empty() {
+                    STREAMING_ARMOURED_HEADER
+                        .captures(self.pending.as_str())
+                        .filter(|header| header.get(0).is_some_and(|whole| whole.start() == 0))
+                        .and_then(|header| header.name("label"))
+                        .and_then(|label| armoured_terminator(label.as_str()))
+                        .map(StreamingSuppression::armour)
+                        .unwrap_or(StreamingSuppression::UntilFinish)
+                } else {
+                    StreamingSuppression::UntilFinish
+                });
                 // Emit one content-free marker for this entire episode. Its
                 // continuation contributes byte evidence without more markers.
                 let marker = if self.redactor.include_pattern_names {
@@ -2820,23 +2816,18 @@ mod tests {
                     result,
                     streaming.redact_chunk(&footer.as_bytes()[split..]),
                 );
-                result = super::merge_redaction_results(
-                    result,
-                    streaming.redact_chunk(b"\nafter!\n"),
-                );
+                result =
+                    super::merge_redaction_results(result, streaming.redact_chunk(b"\nafter!\n"));
                 result = super::merge_redaction_results(result, streaming.finish());
                 assert_eq!(
-                    result.bytes,
-                    b"before!\n[REDACTED]\nafter!\n",
+                    result.bytes, b"before!\n[REDACTED]\nafter!\n",
                     "{label} split={split}"
                 );
                 assert_eq!(result.evidence.replacement_count, 1);
                 assert_eq!(
                     result.evidence.original_input_bytes,
-                    (prefix.len()
-                        + b"StillSensitive\n".len()
-                        + footer.len()
-                        + b"\nafter!\n".len()) as u64
+                    (prefix.len() + b"StillSensitive\n".len() + footer.len() + b"\nafter!\n".len())
+                        as u64
                 );
             }
         }
