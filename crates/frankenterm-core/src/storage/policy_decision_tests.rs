@@ -2948,13 +2948,23 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
         progress_after,
     );
 
+    // Allocate the ID the way the writer does. A bare rowid insert would
+    // reuse ID 1 after this full prune, which the v53 stream trigger refuses.
     let new_ts = old_ts + 1000;
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![pane, 0i64, "postreset zero", 15, new_ts],
-    )
-    .unwrap();
+    let postreset_id: i64 = conn
+        .query_row(
+            "INSERT INTO output_segments (id, pane_id, seq, content, content_len, captured_at) \
+                 SELECT max_segment_id + 1, ?1, ?2, ?3, ?4, ?5 \
+                 FROM segment_stream_state WHERE singleton = 1 \
+                 RETURNING id",
+            params![pane, 0i64, "postreset zero", 15, new_ts],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        postreset_id, 7,
+        "pruned segment IDs 1..=6 are never reissued"
+    );
 
     let config = FtsSyncConfig::default();
     let (indexed, final_seq) = sync_fts_for_pane_for_conn(&mut conn, pane as u64, &config).unwrap();
