@@ -76,6 +76,18 @@ impl RecorderBackendKind {
             Self::Rusqlite
         }
     }
+
+    /// The backends that open on this platform, for the cross-backend tests:
+    /// both on Unix, and only `rusqlite` elsewhere, where the append log
+    /// refuses to open (see [`Self::platform_default`]).
+    #[cfg(test)]
+    pub(crate) const fn opening_on_this_platform() -> &'static [Self] {
+        if cfg!(unix) {
+            &[Self::AppendLog, Self::Rusqlite]
+        } else {
+            &[Self::Rusqlite]
+        }
+    }
 }
 
 impl std::fmt::Display for RecorderBackendKind {
@@ -4591,7 +4603,8 @@ fn recorder_named_file_matches(
         && recorder_file_identity(&named)? == recorder_file_identity(&held)?)
 }
 
-#[cfg(test)]
+// Only the Unix append-log tests inject directory sync failures.
+#[cfg(all(test, unix))]
 mod directory_sync_test_hook {
     use super::{CapMetadata, File, RecorderStorageError, recorder_file_identity};
     use std::cell::RefCell;
@@ -4637,7 +4650,7 @@ mod directory_sync_test_hook {
 }
 
 fn sync_directory_file(file: &File) -> std::result::Result<(), RecorderStorageError> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     directory_sync_test_hook::on_sync(file)?;
     file.sync_all()?;
     Ok(())
@@ -6264,6 +6277,8 @@ mod tests {
         }
     }
 
+    // AppendLogRecorderStorage::open refuses off Unix, so append-log tests are cfg(unix).
+    #[cfg(unix)]
     #[test]
     fn bootstrap_selects_append_log_backend() {
         let dir = tempdir().unwrap();
@@ -6411,6 +6426,7 @@ recorder_backend = "frankensqlite"
         assert!(!db_path.with_extension("sqlite3-shm").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn append_log_slot_admission_is_atomic_at_capacity_one() {
         let dir = tempdir().unwrap();
@@ -6590,16 +6606,19 @@ recorder_backend = "frankensqlite"
 
     #[test]
     fn concrete_storage_slot_admission_guards_share_bounded_helper() {
-        let append_dir = tempdir().unwrap();
-        let mut append_config = test_config(append_dir.path());
-        append_config.queue_capacity = 1;
-        let append_storage = AppendLogRecorderStorage::open(append_config).unwrap();
-        let append_first = append_storage.try_acquire_slot().unwrap();
-        assert!(matches!(
-            append_storage.try_acquire_slot(),
-            Err(RecorderStorageError::QueueFull { capacity: 1 })
-        ));
-        drop(append_first);
+        #[cfg(unix)]
+        {
+            let append_dir = tempdir().unwrap();
+            let mut append_config = test_config(append_dir.path());
+            append_config.queue_capacity = 1;
+            let append_storage = AppendLogRecorderStorage::open(append_config).unwrap();
+            let append_first = append_storage.try_acquire_slot().unwrap();
+            assert!(matches!(
+                append_storage.try_acquire_slot(),
+                Err(RecorderStorageError::QueueFull { capacity: 1 })
+            ));
+            drop(append_first);
+        }
 
         let sqlite_dir = tempdir().unwrap();
         let mut sqlite_config = recorder_test_config(sqlite_dir.path()).rusqlite;
@@ -6613,6 +6632,7 @@ recorder_backend = "frankensqlite"
         drop(sqlite_first);
     }
 
+    #[cfg(unix)]
     async fn append_one(storage: &AppendLogRecorderStorage, n: u64) -> AppendResponse {
         storage
             .append_batch(AppendRequest {
@@ -6625,6 +6645,7 @@ recorder_backend = "frankensqlite"
             .unwrap()
     }
 
+    #[cfg(unix)]
     const TINY_RETENTION: AppendLogRetention = AppendLogRetention {
         roll_at_bytes: 2_000,
         max_total_bytes: 6_000,
@@ -7012,6 +7033,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn append_log_rolls_into_sealed_segments_and_stays_under_budget() {
         run_async_test(async {
@@ -7060,6 +7082,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_after_rolls_continues_ordinals_even_with_stale_state() {
         run_async_test(async {
@@ -7397,6 +7420,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn latest_offset_survives_a_roll_that_empties_the_active_log() {
         run_async_test(async {
@@ -7429,6 +7453,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_checkpointed_consumer_pins_the_log_against_rolling() {
         run_async_test(async {
@@ -7460,10 +7485,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn latest_offsets_identify_last_record_before_and_after_reopen() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -8783,6 +8805,7 @@ recorder_backend = "frankensqlite"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn append_assigns_monotonic_offsets() {
         run_async_test(async {
@@ -8823,6 +8846,7 @@ recorder_backend = "frankensqlite"
     /// The concrete Cx-first append path and legacy append path share the same
     /// owned blocking mutation body. For a live Cx they must retain one ordered
     /// offset stream and otherwise remain observationally equivalent.
+    #[cfg(unix)]
     #[test]
     fn trait_append_batch_with_cx_matches_legacy() {
         run_async_test(async {
@@ -8870,6 +8894,7 @@ recorder_backend = "frankensqlite"
 
     /// The concrete Cx-first checkpoint commit must round-trip through the
     /// existing Cx-first read boundary for a live caller context.
+    #[cfg(unix)]
     #[test]
     fn trait_checkpoint_cx_variants_round_trip() {
         run_async_test(async {
@@ -9031,6 +9056,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn duplicate_batch_id_is_idempotent() {
         run_async_test(async {
@@ -9074,44 +9100,47 @@ recorder_backend = "frankensqlite"
     #[test]
     fn conflicting_batch_id_content_is_rejected_without_mutation_by_both_backends() {
         run_async_test(async {
-            let append_dir = tempdir().unwrap();
-            let append_config = test_config(append_dir.path());
-            let append_path = append_config.data_path.clone();
-            let append = AppendLogRecorderStorage::open(append_config).unwrap();
-            append
-                .append_batch(AppendRequest {
-                    batch_id: "content-bound".to_string(),
-                    events: vec![sample_event("first", 1, 0, "one")],
-                    required_durability: DurabilityLevel::Appended,
-                    producer_ts_ms: 1,
-                })
-                .await
-                .unwrap();
-            let append_len = std::fs::metadata(&append_path).unwrap().len();
-            let append_error = append
-                .append_batch(AppendRequest {
-                    batch_id: "content-bound".to_string(),
-                    events: vec![sample_event("second", 1, 1, "different")],
-                    required_durability: DurabilityLevel::Fsync,
-                    producer_ts_ms: 2,
-                })
-                .await
-                .unwrap_err();
-            assert!(matches!(
-                append_error,
-                RecorderStorageError::IdempotencyConflict { ref batch_id }
-                    if batch_id == "content-bound"
-            ));
-            assert_eq!(std::fs::metadata(&append_path).unwrap().len(), append_len);
-            assert_eq!(
+            #[cfg(unix)]
+            {
+                let append_dir = tempdir().unwrap();
+                let append_config = test_config(append_dir.path());
+                let append_path = append_config.data_path.clone();
+                let append = AppendLogRecorderStorage::open(append_config).unwrap();
                 append
-                    .health()
+                    .append_batch(AppendRequest {
+                        batch_id: "content-bound".to_string(),
+                        events: vec![sample_event("first", 1, 0, "one")],
+                        required_durability: DurabilityLevel::Appended,
+                        producer_ts_ms: 1,
+                    })
                     .await
-                    .latest_offset
-                    .map(|offset| offset.ordinal),
-                Some(0)
-            );
-            assert!(!append.health().await.degraded);
+                    .unwrap();
+                let append_len = std::fs::metadata(&append_path).unwrap().len();
+                let append_error = append
+                    .append_batch(AppendRequest {
+                        batch_id: "content-bound".to_string(),
+                        events: vec![sample_event("second", 1, 1, "different")],
+                        required_durability: DurabilityLevel::Fsync,
+                        producer_ts_ms: 2,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    append_error,
+                    RecorderStorageError::IdempotencyConflict { ref batch_id }
+                        if batch_id == "content-bound"
+                ));
+                assert_eq!(std::fs::metadata(&append_path).unwrap().len(), append_len);
+                assert_eq!(
+                    append
+                        .health()
+                        .await
+                        .latest_offset
+                        .map(|offset| offset.ordinal),
+                    Some(0)
+                );
+                assert!(!append.health().await.degraded);
+            }
 
             let sqlite_dir = tempdir().unwrap();
             let sqlite =
@@ -9156,6 +9185,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn duplicate_batch_id_upgrades_requested_durability_without_duplication() {
         run_async_test(async {
@@ -9224,6 +9254,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_commit_is_monotonic_and_persisted() {
         run_async_test(async {
@@ -9289,6 +9320,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn startup_truncates_torn_tail_and_recovers_ordinal() {
         run_async_test(async {
@@ -9332,6 +9364,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_batch_larger_than_configured_byte_limit() {
         run_async_test(async {
@@ -9409,6 +9442,7 @@ recorder_backend = "frankensqlite"
 
     // ── Request validation ───────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn rejects_empty_batch_id() {
         run_async_test(async {
@@ -9429,6 +9463,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_empty_events_list() {
         run_async_test(async {
@@ -9449,6 +9484,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_batch_exceeding_event_count_limit() {
         run_async_test(async {
@@ -9477,6 +9513,7 @@ recorder_backend = "frankensqlite"
 
     // ── Idempotency cache eviction ───────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn idempotency_cache_evicts_oldest_when_full() {
         run_async_test(async {
@@ -9547,6 +9584,7 @@ recorder_backend = "frankensqlite"
 
     // ── Health and lag metrics ────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn health_reports_correct_state() {
         run_async_test(async {
@@ -9579,6 +9617,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn lag_metrics_track_consumer_offsets() {
         run_async_test(async {
@@ -9642,6 +9681,7 @@ recorder_backend = "frankensqlite"
 
     // ── Checkpoint regression ────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_regression_returns_error() {
         run_async_test(async {
@@ -9686,6 +9726,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn health_ignores_checkpoint_regression_from_caller_data() {
         run_async_test(async {
@@ -9752,6 +9793,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn health_ignores_invalid_append_request_from_caller_data() {
         run_async_test(async {
@@ -9796,6 +9838,7 @@ recorder_backend = "frankensqlite"
 
     // ── Read checkpoint for unknown consumer ─────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn read_checkpoint_unknown_consumer_returns_none() {
         run_async_test(async {
@@ -9813,6 +9856,7 @@ recorder_backend = "frankensqlite"
 
     // ── Flush modes ──────────────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn flush_buffered_and_durable() {
         run_async_test(async {
@@ -9944,10 +9988,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn mutation_with_cx_pre_cancel_is_typed_and_never_enters_blocking_body() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10075,10 +10116,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn mutation_with_cx_cancelled_at_completion_never_delivers_success() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10189,10 +10227,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn mutation_with_cx_midflight_cancel_retains_owned_settlement_and_exact_retry() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10479,10 +10514,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn cross_operation_blocking_bodies_share_one_serialization_authority() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10663,10 +10695,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn flush_with_cx_leaves_executor_responsive_and_reopens_for_both_backends() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10747,10 +10776,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn flush_with_cx_pre_cancel_never_enters_blocking_body() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10803,10 +10829,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn flush_with_cx_midflight_cancel_is_non_success_and_retry_reconciles() {
         run_async_test(async {
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempdir().unwrap();
                 let mut config = recorder_test_config(dir.path());
                 config.backend = backend;
@@ -10935,6 +10958,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn enqueued_durability_does_not_fsync() {
         run_async_test(async {
@@ -10956,6 +10980,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn fsync_durability_committed() {
         run_async_test(async {
@@ -11160,6 +11185,7 @@ recorder_backend = "frankensqlite"
         assert!(rejected.acquire().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn owned_repair_preserves_buffered_receipts_and_removes_failed_batch_suffix() {
         run_async_test(async {
@@ -11230,6 +11256,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn role_neutral_path_leases_reject_cross_role_opens_without_mutating_owner() {
         run_async_test(async {
@@ -11278,6 +11305,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn recorder_paths_cannot_target_the_lease_namespace() {
         for name in [
@@ -11297,6 +11325,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_leases_preserve_filesystem_equivalence_for_absent_targets() {
         for (original, alias) in [
@@ -11371,6 +11400,7 @@ recorder_backend = "frankensqlite"
         assert_eq!(std::fs::read_dir(&reserved).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn durable_flush_repairs_failed_writer_without_admitting_another_event() {
         run_async_test(async {
@@ -11430,6 +11460,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_data_writer_refuses_all_mutations_until_reopen() {
         run_async_test(async {
@@ -11490,6 +11521,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_state_refusal_preserves_event_log_before_recovery() {
         let dir = tempdir().unwrap();
@@ -11542,6 +11574,7 @@ recorder_backend = "frankensqlite"
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn state_rename_refusal_with_unchanged_names_is_definitely_unpublished() {
         let dir = tempdir().unwrap();
@@ -11561,6 +11594,7 @@ recorder_backend = "frankensqlite"
         assert!(dir.path().join(&state_file.temporary_name).is_file());
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_acknowledgement_loss_retains_progress_and_retries_durably() {
         run_async_test(async {
@@ -11650,6 +11684,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn persisted_state_staging_identity_rejects_replaced_name() {
         let dir = tempdir().unwrap();
@@ -11701,6 +11736,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn persisted_state_publication_uses_canonical_bytes_on_disk() {
         let dir = tempdir().unwrap();
@@ -11734,6 +11770,7 @@ recorder_backend = "frankensqlite"
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_continues_ordinals() {
         run_async_test(async {
@@ -11773,6 +11810,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_uses_scanned_ordinal_when_state_ordinal_is_stale() {
         run_async_test(async {
@@ -11815,6 +11853,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_drops_only_checkpoints_beyond_recovered_log_head() {
         run_async_test(async {
@@ -12059,6 +12098,7 @@ recorder_backend = "frankensqlite"
 
     // ── Backend kind ─────────────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn backend_kind_is_append_log() {
         run_async_test(async {
@@ -12133,6 +12173,7 @@ recorder_backend = "frankensqlite"
 
     // ── Multi-batch ordering ─────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn multi_batch_accepted_count_correct() {
         run_async_test(async {
@@ -12162,6 +12203,7 @@ recorder_backend = "frankensqlite"
 
     // ── Open with empty data file ────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn open_with_empty_data_file() {
         run_async_test(async {
@@ -12180,6 +12222,7 @@ recorder_backend = "frankensqlite"
 
     // ── Lag with no consumers ────────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn lag_with_no_consumers() {
         run_async_test(async {
@@ -12434,6 +12477,7 @@ recorder_backend = "frankensqlite"
         assert!(cfg.state_path.to_str().unwrap().contains("state.json"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn multiple_consumers_checkpoint_advance() {
         run_async_test(async {
@@ -12491,6 +12535,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn lag_metrics_empty_store() {
         run_async_test(async {
@@ -12503,6 +12548,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn flush_empty_store() {
         run_async_test(async {
@@ -12518,6 +12564,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn single_event_accepted_count_is_one() {
         run_async_test(async {
@@ -12539,6 +12586,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn byte_offset_monotonicity_across_batches() {
         run_async_test(async {
@@ -12571,6 +12619,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopen_preserves_checkpoints_across_restart() {
         run_async_test(async {
@@ -12619,6 +12668,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn health_with_latest_offset_after_multi_event_batch() {
         run_async_test(async {
@@ -12648,6 +12698,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn appended_durability_defers_state_publication_and_recovers_from_log() {
         // Appended durability defers state publication to checkpoint/flush.
@@ -12774,6 +12825,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn response_backend_always_append_log() {
         run_async_test(async {
@@ -12795,6 +12847,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn committed_at_ms_is_nonzero() {
         run_async_test(async {
@@ -12876,6 +12929,7 @@ recorder_backend = "frankensqlite"
         assert_eq!(back, lag);
     }
 
+    #[cfg(unix)]
     #[test]
     fn torn_tail_with_only_length_prefix_no_payload() {
         run_async_test(async {
@@ -12916,6 +12970,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn segment_id_preserved_across_reopen() {
         run_async_test(async {
@@ -12952,6 +13007,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn flush_updates_flushed_at_ms() {
         run_async_test(async {
@@ -12984,6 +13040,7 @@ recorder_backend = "frankensqlite"
 
     // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn whitespace_only_batch_id_rejected() {
         run_async_test(async {
@@ -13052,6 +13109,7 @@ recorder_backend = "frankensqlite"
         cfg.validate().expect("default config should be valid");
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_noop_when_same_ordinal() {
         run_async_test(async {
@@ -13086,6 +13144,7 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn lag_consumers_sorted_alphabetically() {
         run_async_test(async {
@@ -13170,6 +13229,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn health_queue_depth_reflects_zero_when_idle() {
         run_async_test(async {
@@ -13552,6 +13612,7 @@ recorder_backend = "frankensqlite"
     // ft-tfxjg: Data namespace durability & ancestor chain tests
     // =========================================================================
 
+    #[cfg(unix)]
     #[test]
     fn ensure_durable_parent_chain_creates_nested_and_is_idempotent() {
         let dir = tempdir().unwrap();
@@ -13611,6 +13672,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_durable_parent_chain_sync_failure_retry_performs_sync() {
         let dir = tempdir().unwrap();
@@ -13645,6 +13707,7 @@ recorder_backend = "frankensqlite"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn append_log_disjoint_nested_directories_open_and_durability() {
         run_async_test(async {

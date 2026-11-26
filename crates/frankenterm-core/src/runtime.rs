@@ -18610,6 +18610,8 @@ mod tests {
         });
     }
 
+    // AppendLogRecorderStorage::open refuses off Unix, so append-log-only tests are cfg(unix).
+    #[cfg(unix)]
     #[test]
     fn authority_admitted_capture_reaches_only_selected_recorder_backend_without_duplicates() {
         run_async_test_isolated(|| async {
@@ -18943,6 +18945,7 @@ mod tests {
         (text, *redaction)
     }
 
+    #[cfg(unix)]
     #[test]
     fn normal_watch_batches_two_authorized_recorder_captures_in_one_real_transaction() {
         run_async_test_isolated(|| async {
@@ -19263,10 +19266,7 @@ mod tests {
     fn recorder_prefix_ack_tracks_exact_ids_in_ledger_order_for_both_backends() {
         run_async_test_isolated(|| async {
             use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempfile::tempdir().expect("prefix fixture");
                 let path = dir.path().join("primary.sqlite3");
                 let primary = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
@@ -19402,10 +19402,7 @@ mod tests {
     fn recorder_prefix_crash_before_ack_preserves_batch_obligations_for_both_backends() {
         run_async_test_isolated(|| async {
             use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
-            for backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &backend in RecorderBackendKind::opening_on_this_platform() {
                 let dir = tempfile::tempdir().expect("prefix crash fixture");
                 let path = dir.path().join("primary.sqlite3");
                 let primary = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
@@ -19504,10 +19501,7 @@ mod tests {
         run_async_test_isolated(|| async {
             use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
 
-            for target_backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &target_backend in RecorderBackendKind::opening_on_this_platform() {
                 let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
                 let primary_path = primary_dir.path().join("primary.sqlite3");
                 let primary_path_text = primary_path.to_string_lossy().into_owned();
@@ -19601,10 +19595,7 @@ mod tests {
                 AppendLogRetention, RecorderBackendKind, bootstrap_recorder_storage,
             };
 
-            for target_backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &target_backend in RecorderBackendKind::opening_on_this_platform() {
                 let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
                 let primary_path = primary_dir.path().join("primary.sqlite3");
                 let primary_path_text = primary_path.to_string_lossy().into_owned();
@@ -19916,10 +19907,7 @@ mod tests {
             const SECRET_PREFIX: &str = "sk-";
             const SECRET_SUFFIX: &str = "abcdefghijklmnopqrstuvwxyz";
 
-            for target_backend in [
-                RecorderBackendKind::AppendLog,
-                RecorderBackendKind::Rusqlite,
-            ] {
+            for &target_backend in RecorderBackendKind::opening_on_this_platform() {
                 let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
                 let primary_path = primary_dir.path().join("primary.sqlite3");
                 let primary_path_text = primary_path.to_string_lossy().into_owned();
@@ -20050,6 +20038,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn recorder_delivery_append_failure_never_acknowledges_primary_ledger() {
         run_async_test_isolated(|| async {
@@ -20122,14 +20111,14 @@ mod tests {
 
             let recorder_dir = tempfile::tempdir().expect("recorder cancellation tempdir");
             let storage = bootstrap_recorder_storage(RecorderStorageConfig {
-                backend: RecorderBackendKind::AppendLog,
+                backend: RecorderBackendKind::platform_default(),
                 append_log: AppendLogStorageConfig {
                     data_path: recorder_dir.path().join("events.log"),
                     state_path: recorder_dir.path().join("state.json"),
                     ..AppendLogStorageConfig::default()
                 },
                 rusqlite: RusqliteStorageConfig {
-                    db_path: recorder_dir.path().join("unused.sqlite3"),
+                    db_path: recorder_dir.path().join("events.sqlite3"),
                     ..RusqliteStorageConfig::default()
                 },
             })

@@ -988,10 +988,12 @@ pub fn remediation_for_error(class: RecorderStorageErrorClass) -> &'static str {
 mod tests {
     use super::*;
     use crate::recorder_storage::{
-        AppendLogRecorderStorage, AppendLogStorageConfig, CheckpointConsumerId, DurabilityLevel,
-        FlushMode, RecorderBackendKind, RecorderCheckpoint, RecorderConsumerLag, RecorderOffset,
-        RusqliteRecorderStorage, RusqliteStorageConfig,
+        CheckpointConsumerId, FlushMode, RecorderBackendKind, RecorderCheckpoint,
+        RecorderConsumerLag, RecorderOffset,
     };
+    // The real-storage test below needs the append log, which is Unix only,
+    // as are its event helper and these imports.
+    #[cfg(unix)]
     use crate::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
         RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
@@ -1080,6 +1082,7 @@ mod tests {
         InstrumentedStorage::new(TestRecorderStorage::new(backend), telemetry)
     }
 
+    #[cfg(unix)]
     fn telemetry_test_event(event_id: &str) -> RecorderEvent {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1197,8 +1200,14 @@ mod tests {
         assert!(telem.snapshot().append_rate_ewma.abs() < f64::EPSILON);
     }
 
+    // Attribution across both real backends; the append log is Unix only.
+    #[cfg(unix)]
     #[test]
     fn real_duplicate_batches_are_attributed_as_replays_without_double_counting_writes() {
+        use crate::recorder_storage::{
+            AppendLogRecorderStorage, AppendLogStorageConfig, DurabilityLevel,
+            RusqliteRecorderStorage, RusqliteStorageConfig,
+        };
         use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 
         let runtime = RuntimeBuilder::current_thread()

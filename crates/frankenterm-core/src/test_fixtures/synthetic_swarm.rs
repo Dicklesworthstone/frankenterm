@@ -578,10 +578,9 @@ fn diagnostics_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder_storage::{
-        AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
-        RecorderStorage,
-    };
+    #[cfg(unix)]
+    use crate::recorder_storage::{AppendLogRecorderStorage, AppendLogStorageConfig};
+    use crate::recorder_storage::{AppendRequest, DurabilityLevel, RecorderStorage};
     use crate::runtime_async::CompatRuntime;
     use tempfile::tempdir;
 
@@ -596,6 +595,7 @@ mod tests {
         runtime.block_on(future);
     }
 
+    #[cfg(unix)]
     fn append_log_config(dir: &std::path::Path) -> AppendLogStorageConfig {
         AppendLogStorageConfig {
             data_path: dir.join("events.log"),
@@ -657,8 +657,18 @@ mod tests {
         run_async_test(async {
             let scenario = synthetic_swarm_scenario(SyntheticSwarmScale::Fleet10);
             let dir = tempdir().expect("tempdir");
+            // The append log is Unix only; elsewhere the recorder is rusqlite.
+            #[cfg(unix)]
             let storage =
                 AppendLogRecorderStorage::open(append_log_config(dir.path())).expect("open");
+            #[cfg(not(unix))]
+            let storage = crate::recorder_storage::RusqliteRecorderStorage::open(
+                crate::recorder_storage::RusqliteStorageConfig {
+                    db_path: dir.path().join("events.sqlite3"),
+                    ..crate::recorder_storage::RusqliteStorageConfig::default()
+                },
+            )
+            .expect("open");
 
             let response = storage
                 .append_batch(AppendRequest {
