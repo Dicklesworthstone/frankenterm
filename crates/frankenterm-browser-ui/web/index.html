@@ -45,6 +45,15 @@
       <button id="fleet-refresh" type="button" disabled>Refresh</button>
       <button id="fleet-text-toggle" type="button" aria-pressed="false" disabled>Use text view</button>
     </nav>
+    <details id="fleet-attention">
+      <summary id="attention-summary">Attention (0 unread)</summary>
+      <p>Warnings, errors and input requests received by this tab. The latest 50 are kept here. Reviewing an item updates this tab only.</p>
+      <label for="attention-items">Choose a detection</label>
+      <select id="attention-items" size="3" disabled></select>
+      <button id="attention-review" type="button" disabled>Mark reviewed</button>
+      <button id="attention-inspect" type="button" disabled>Verify pane for inspection</button>
+      <p id="attention-status" role="status"></p>
+    </details>
     <button id="fleet-notifications-toggle" type="button" aria-pressed="false" aria-describedby="fleet-notifications-help fleet-notifications-status" disabled>Enable notifications</button>
     <p id="fleet-notifications-status" role="status" aria-live="polite">Notifications are off for this tab.</p>
     <p id="fleet-notifications-help">Opt in to private system alerts for new warnings, errors and input requests. Alerts contain no terminal text or pane titles. While enabled, detection updates and session checks continue when this tab is hidden; captured-output streams and rendering pause. Closing the tab stops alerts. Clicking an alert verifies the session and stored pane identity before offering read-only inspection.</p>

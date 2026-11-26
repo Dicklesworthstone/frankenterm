@@ -170,7 +170,7 @@ function fixture(t, options = {}) {
     setRepeating: (fn, delay) => { const id = ++handle; intervals.set(id, { fn, delay }); return id; },
     clearRepeating: (id) => intervals.delete(id),
     ResizeObserverImpl: class { constructor(fn) { this.callback = fn; observers.push(this); } observe(node) { this.node = node; } },
-    now: () => 10_000,
+    now: options.now ?? (() => 10_000),
   });
   t.after(() => app.dispose());
   const frame = () => {
@@ -606,11 +606,12 @@ function notificationReady(source) {
   source.message("ready", { schema: "ft.stream.v1", stream: "events", kind: "ready",
     data: { channel: "all", pane_id: null, durable_detections: true, cursor } }, cursor);
 }
-function emitNotificationDetection(source, id = "1", paneUuid = "pane-original") {
+function emitNotificationDetection(source, id = "1", paneUuid = "pane-original", { detectedAt = 1000, severity = "warning", eventType = "usage" } = {}) {
   source.emit("event", {
-    data: '{"schema":"ft.stream.v1","stream":"events","kind":"event","data":{"delivery":"durable","event":{"type":"pattern_detected","event_id":'
-      + id + ',"pane_id":18446744073709551615,"pane_uuid":' + JSON.stringify(paneUuid)
-      + ',"detection":{"severity":"warning","event_type":"usage","matched_text":"secret terminal text"}}}}',
+    data: '{"schema":"ft.stream.v1","stream":"events","kind":"event","data":{"delivery":"durable","detected_at":'
+      + JSON.stringify(detectedAt) + ',"event":{"type":"pattern_detected","event_id":' + id + ',"pane_id":18446744073709551615,"pane_uuid":' + JSON.stringify(paneUuid)
+      + ',"detection":{"severity":' + JSON.stringify(severity) + ',"event_type":' + JSON.stringify(eventType)
+      + ',"matched_text":"secret terminal text"}}}}',
     lastEventId: "event-v1:" + DETECTION_EPOCH + ":all:" + id,
   });
 }
@@ -735,4 +736,60 @@ test("hidden notification click waits for foreground session admission and pageh
   assert.equal(feed.closed, true);
   assert.equal(f.timers.size, 0);
   assert.equal(f.get("fleet-notifications-toggle").attrs["aria-pressed"], "false");
+});
+
+test("attention triages admitted warnings and input requests without notification permission", async (t) => {
+  let time = 10_000;
+  const f = fixture(t, { now: () => time, paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}' });
+  await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed);
+  const select = f.get("attention-items"), summary = f.get("attention-summary");
+  emitNotificationDetection(feed, "9007199254740993");
+  emitNotificationDetection(feed, "9007199254740993"); // already admitted
+  emitNotificationDetection(feed, "9007199254740994", null, { severity: "info", eventType: "progress" });
+  f.frame();
+  assert.equal(select.children.length, 1);
+  assert.match(select.children[0].textContent, /Unread · recent · warning.*#9007199254740993/);
+  select.value = select.children[0].value;
+  select.emit("change"); f.get("attention-review").emit("click");
+  assert.equal(summary.textContent, "Attention (0 unread)");
+  assert.match(select.children[0].textContent, /Reviewed/);
+  emitNotificationDetection(feed, "9007199254740995", null, { severity: "info", eventType: "input.required" });
+  time = 42_000; f.frame();
+  assert.equal(select.children.length, 2);
+  assert.match(select.children[1].textContent, /Reviewed · older/);
+  assert.match(select.children[0].textContent, /input.required/);
+  assert.equal(select.value, select.children[1].value, "insertion must preserve the exact reviewed event");
+  assert.equal(summary.textContent, "Attention (1 unread)");
+  assert.doesNotMatch(select.children.map((option) => option.textContent).join(" "), /secret/);
+  f.get("attention-inspect").emit("click"); await flush();
+  assert.match(f.get("attention-status").textContent, /identity was verified/);
+  assert.equal(f.get("pane-output-id").value, "18446744073709551615");
+  assert.equal(f.sources.length, 1);
+  select.value = select.children[0].value; select.emit("change");
+  assert.equal(f.get("attention-inspect").disabled, true);
+  assert.equal(f.notifications.length, 0);
+  f.app.dispose();
+  assert.deepEqual(select.children, []);
+});
+
+test("attention evicts a selected item without acting on its replacement", async (t) => {
+  const verification = deferred();
+  const f = fixture(t, { verifyNotificationSession: () => verification.promise });
+  await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed);
+  emitNotificationDetection(feed); f.frame();
+  const list = f.get("attention-items");
+  list.value = list.children[0].value; list.emit("change");
+  f.get("attention-inspect").emit("click");
+  const initialRequests = f.requests.length;
+  for (let id = 2; id <= 51; id++) emitNotificationDetection(feed, String(id));
+  f.frame();
+  assert.equal(list.children.length, 50);
+  assert.equal(list.value, "");
+  assert.equal(f.get("attention-review").disabled, true);
+  assert.match(f.get("attention-summary").textContent, /50 unread.*1 older item/);
+  verification.resolve(true); await flush();
+  assert.equal(f.requests.length, initialRequests);
+  assert.equal(f.get("pane-output-id").value, "");
 });

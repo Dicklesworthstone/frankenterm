@@ -894,6 +894,7 @@ where
         }
         for stored in page.events {
             let event_id = stored.id;
+            let detected_at = stored.detected_at;
             let mut event = super::server::stored_event_to_bus_event(stored);
             if let Event::PatternDetected { pane_uuid, .. } = &mut event {
                 *pane_uuid = pane_uuids.remove(&event_id);
@@ -919,7 +920,7 @@ where
                 "events",
                 "event",
                 *seq,
-                json!({ "event": event_json, "replayed": true, "delivery": "durable" }),
+                json!({ "event": event_json, "replayed": true, "delivery": "durable", "detected_at": detected_at }),
             );
             let Some(event) = frame_to_sse_with_event_id(
                 "event",
@@ -1956,6 +1957,7 @@ mod tests {
             assert_eq!(events.len(), 2);
             for payload in &events {
                 assert_eq!(payload["data"]["delivery"], "durable");
+                assert_eq!(payload["data"]["detected_at"], 1);
             }
             let first = &events[0]["data"]["event"];
             assert_eq!(first["event_id"], 11);

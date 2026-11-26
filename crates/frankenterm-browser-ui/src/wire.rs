@@ -225,7 +225,7 @@ pub fn decode_stream_frame(payload: &str) -> Result<StreamUpdate, WireError> {
                     pane_uuid,
                     rule_id: detection.rule_id,
                     severity: detection.severity,
-                    detected_at_ms: frame.ts_ms,
+                    detected_at_ms: frame.data["detected_at"].as_i64().unwrap_or(frame.ts_ms),
                 }),
                 BusEvent::PaneDiscovered {
                     pane_id,
@@ -305,6 +305,11 @@ mod tests {
                 detected_at_ms: 777,
             }))
         );
+        let replay = detection.replace(r#""replayed":false"#, r#""replayed":true,"detected_at":123"#);
+        let Ok(StreamUpdate::Detection(replayed)) = decode_stream_frame(&replay) else {
+            panic!("expected replayed detection");
+        };
+        assert_eq!(replayed.detected_at_ms, 123);
         let ready = r#"{"schema":"ft.stream.v1","stream":"events","kind":"ready","seq":1,"ts_ms":1,"data":{"channel":"all"}}"#;
         assert_eq!(decode_stream_frame(ready), Ok(StreamUpdate::Ready));
         let lag = r#"{"schema":"ft.stream.v1","stream":"events","kind":"lag","seq":3,"ts_ms":1,"data":{"missed":4}}"#;

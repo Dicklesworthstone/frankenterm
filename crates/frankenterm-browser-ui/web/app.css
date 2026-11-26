@@ -128,3 +128,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, #terminal:foc
   }
   #pane-output { border-left: none; border-top: 1px solid #444; }
 }
+
+#fleet-attention { margin: 4px 10px; max-height: 35%; overflow: auto; flex-shrink: 0; }
+#fleet-attention summary { cursor: pointer; }
+#fleet-attention p { margin: 4px 0; font-size: 12px; }
+#attention-items { display: block; width: 100%; background: #20242c; color: #eee; font: inherit; }
+#fleet-attention button { margin: 4px 4px 0 0; }

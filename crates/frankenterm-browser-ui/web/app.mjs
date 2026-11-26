@@ -20,6 +20,87 @@ const SCREEN_TEXT_MAX_CHARS = 2 * GRID_MAX_COLS * GRID_MAX_ROWS + GRID_MAX_ROWS;
 const NOTIFICATION_INTERVAL_MS = 5_000;
 const NOTIFICATION_CURSOR_KEY = "frankenterm-detection-notifications-v1";
 
+function needsAttention(target) {
+  return ["warning", "error", "critical"].includes(target.severity)
+    || ["auth.device_code", "auth.error", "auth.login_required", "auth.oauth_required",
+      "session.approval_needed", "auth.prompt", "prompt", "prompt.waiting",
+      "approval.required", "permission.required", "input.required", "waiting_for_input"].includes(target.eventType);
+}
+
+// The SSE owner already deduplicates durable events by epoch and exact event ID.
+// Keep only the small display projection in tab memory. Never persist a review
+// or mark the underlying watcher event handled.
+function mountAttentionQueue(doc, inspect, now) {
+  const limit = 50;
+  const list = doc.getElementById("attention-items");
+  const summary = doc.getElementById("attention-summary");
+  const review = doc.getElementById("attention-review");
+  const inspectButton = doc.getElementById("attention-inspect");
+  const status = doc.getElementById("attention-status");
+  let items = [];
+  let dropped = 0;
+  let dirty = true;
+  let staleBoundary = Infinity;
+  const selected = () => items.find((row) => row.key === list.value);
+  function buttons() {
+    const row = selected();
+    review.disabled = !row;
+    review.textContent = row?.reviewed ? "Mark unread" : "Mark reviewed";
+    inspectButton.disabled = !row?.target.paneUuid;
+  }
+  function render() {
+    const time = now();
+    if (!dirty && time < staleBoundary) return;
+    dirty = false;
+    staleBoundary = Infinity;
+    const previous = list.value;
+    const options = items.map((row) => {
+      const option = doc.createElement("option");
+      option.value = row.key;
+      const { severity, paneId, eventType } = row.target;
+      const expiresAt = row.detectedAt === null ? null : row.detectedAt + 30_000;
+      if (expiresAt !== null && expiresAt > time) staleBoundary = Math.min(staleBoundary, expiresAt);
+      const freshness = expiresAt === null ? "time unknown" : time >= expiresAt ? "older" : "recent";
+      option.textContent = (row.reviewed ? "Reviewed" : "Unread") + " · " + freshness + " · "
+        + (severity || "attention") + (eventType && /^[a-zA-Z0-9._-]{1,80}$/.test(eventType) ? " · " + eventType : "")
+        + " · pane " + paneId + " · #" + row.target.id;
+      return option;
+    });
+    list.replaceChildren(...options);
+    // Reordering, eviction and replay must never retarget the user's action.
+    list.value = items.some((row) => row.key === previous) ? previous : "";
+    list.disabled = items.length === 0;
+    const unread = items.filter((row) => !row.reviewed).length;
+    summary.textContent = "Attention (" + unread + " unread)" + (dropped ? " · " + dropped + " older items omitted" : "");
+    buttons();
+  }
+  list.addEventListener("change", () => { status.textContent = ""; buttons(); });
+  review.addEventListener("click", () => {
+    const row = selected();
+    if (!row) return;
+    row.reviewed = !row.reviewed;
+    dirty = true;
+    render();
+  });
+  inspectButton.addEventListener("click", () => {
+    const row = selected();
+    if (row?.target.paneUuid) inspect(row.target);
+  });
+  return {
+    detection(target, detectedAt) {
+      if (!needsAttention(target)) return;
+      const key = target.epoch + ":" + target.id;
+      items.unshift({ key, target, detectedAt, reviewed: false });
+      if (items.length > limit) { items.pop(); dropped += 1; }
+      dirty = true;
+    },
+    contains(target) { return selected()?.target === target; },
+    report(message) { status.textContent = message; },
+    render,
+    clear() { items = []; dropped = 0; dirty = true; status.textContent = ""; render(); },
+  };
+}
+
 // Explicit, per-tab opt-in. Persist only bounded cursor identities, never an
 // event payload, pane title, terminal text, access token or notification target.
 export function createDetectionNotifications({
@@ -184,11 +265,7 @@ export function createDetectionNotifications({
     detection(target) {
       // Advance even while disabled: opting in must not announce old frames.
       if (disposed || !remember(target) || !checkPermission()) return;
-      const attention = ["warning", "error", "critical"].includes(target.severity)
-        || ["auth.device_code", "auth.error", "auth.login_required", "auth.oauth_required",
-          "session.approval_needed", "auth.prompt", "prompt", "prompt.waiting",
-          "approval.required", "permission.required", "input.required", "waiting_for_input"].includes(target.eventType);
-      if (!attention) return;
+      if (!needsAttention(target)) return;
       // A burst keeps one latest target, one notification and one timer.
       pending = { epoch: target.epoch, id: target.id, paneId: target.paneId, paneUuid: target.paneUuid ?? null };
       displayPending();
@@ -468,7 +545,7 @@ export function createFleetStream(viewer, {
                 ? event.detection.severity : null,
               eventType: typeof event.detection?.event_type === "string" && event.detection.event_type.length <= 128
                 ? event.detection.event_type : null,
-            });
+            }, Number.isSafeInteger(frame.data.detected_at) && frame.data.detected_at >= 0 ? frame.data.detected_at : null);
           }
         } else if (nextCursor) onCheckpoint({ epoch: nextCursor.epoch, id: nextCursor.decimal });
       } catch (_) { /* Optional system notifications cannot reject an admitted frame. */ }
@@ -918,6 +995,7 @@ export function mountFleetApp({
 
   function failModel() {
     if (disposed) return;
+    attention.clear();
     notifications?.disable("Fleet detections are unavailable. Reload the viewer before enabling notifications.");
     try { stopFleet(); } catch (_) { /* stop still aborts outstanding snapshots */ }
     viewer = null;
@@ -976,25 +1054,35 @@ export function mountFleetApp({
     },
   });
 
+  const attention = mountAttentionQueue(doc, (target) => {
+    if (!active || disposed || !viewer) return;
+    cancelInspection();
+    inspection = { target, fromQueue: true };
+    void inspectDetection();
+  }, now);
+
   function cancelInspection() {
     inspectionGeneration += 1;
     inspection = null;
     inspectionController?.abort();
     inspectionController = null;
   }
-  async function inspectNotification() {
-    if (!inspection || !active || disposed || !notifications.isEnabled()) return;
-    const target = inspection;
+  async function inspectDetection() {
+    if (!inspection || !active || disposed) return;
+    const { target, fromQueue } = inspection;
+    const admitted = () => fromQueue ? attention.contains(target) : notifications.isEnabled();
+    if (!admitted()) return;
+    const report = (message) => fromQueue ? attention.report(message) : notifications.report(message);
     inspection = null;
     const expected = ++inspectionGeneration;
     const controller = new AbortController();
     inspectionController = controller;
-    const current = () => !disposed && active && notifications.isEnabled()
+    const current = () => !disposed && active && admitted()
       && inspectionGeneration === expected && !controller.signal.aborted;
     const deadline = setTimer(() => controller.abort(), 10_000);
     try {
       if (!await verifyNotificationSession()) {
-        if (current()) notifications.report("Your session could not be verified yet. Review Detections or try again after the session check completes.");
+        if (current()) report("Your session could not be verified yet. Review Detections or try again after the session check completes.");
         return;
       }
       if (!current()) return;
@@ -1006,14 +1094,14 @@ export function mountFleetApp({
       if (!current()) return;
       if (notificationPaneExists(target, body)) {
         element("pane-output-id").value = target.paneId;
-        notifications.report("The detected pane's stored identity was verified. Choose Open output to inspect retained capture; the pane may no longer be live.");
+        report("The detected pane's stored identity was verified. Choose Open output to inspect retained capture; the pane may no longer be live.");
         element("pane-output-id").focus();
       } else {
-        notifications.report("The detected pane is unavailable or its identity changed. Review Detections or search captured history.");
+        report("The detected pane is unavailable or its identity changed. Review Detections or search captured history.");
       }
     } catch (_) {
-      if (!disposed && active && inspectionGeneration === expected) {
-        notifications.report("The detected pane could not be verified. Review Detections or search captured history.");
+      if (!disposed && active && admitted() && inspectionGeneration === expected) {
+        report("The detected pane could not be verified. Review Detections or search captured history.");
       }
     } finally {
       clearTimer(deadline);
@@ -1042,9 +1130,9 @@ export function mountFleetApp({
     onInspect(target) {
       if (disposed || !notifications.isEnabled()) return;
       cancelInspection();
-      inspection = target;
+      inspection = { target, fromQueue: false };
       host.focus?.();
-      if (active) return inspectNotification();
+      if (active) return inspectDetection();
       notifications.report("Return to this tab to verify the session and inspect the detection.");
     },
   });
@@ -1134,6 +1222,7 @@ export function mountFleetApp({
       } catch (_) { failModel(); }
     }
     inspector.render();
+    attention.render();
     scheduleFrame();
   }
   function resume() {
@@ -1145,7 +1234,7 @@ export function mountFleetApp({
     resize();
     startFleet();
     scheduleFrame();
-    if (inspection) void inspectNotification();
+    if (inspection) void inspectDetection();
   }
   function suspend({ keepNotifications = false } = {}) {
     active = false;
@@ -1164,6 +1253,7 @@ export function mountFleetApp({
   function dispose() {
     if (disposed) return;
     disposed = true;
+    attention.clear();
     notifications.dispose();
     suspend();
     inspector.close();
@@ -1218,10 +1308,15 @@ export function mountFleetApp({
       reportError: snapshots.reportError,
     }, {
       apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh,
-      onDetection: notifications.detection,
+      onDetection(target, detectedAt) {
+        attention.detection(target, detectedAt);
+        notifications.detection(target);
+      },
       onCheckpoint: notifications.checkpoint,
       onHalt() {
         notificationsHalted = true;
+        attention.clear();
+        cancelInspection();
         notifications.disable("Detection history changed. Reload the viewer before enabling notifications again.");
       },
     });
