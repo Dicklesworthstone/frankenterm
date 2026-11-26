@@ -3063,6 +3063,24 @@ mod tests {
         file.write_all(bytes).expect("write private test file");
     }
 
+    /// The data file's bytes while its writer is open, read through the
+    /// writer's own descriptor. On Windows the writer's exclusive lock is a
+    /// mandatory byte-range lock, so a second handle's read fails with
+    /// ERROR_LOCK_VIOLATION. Every writer operation seeks before it writes,
+    /// so moving the shared file position here cannot misplace a write.
+    fn open_writer_file_bytes(writer: &mut MmapScrollback) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        writer
+            .file
+            .seek(SeekFrom::Start(0))
+            .expect("seek writer data");
+        writer
+            .file
+            .read_to_end(&mut bytes)
+            .expect("read writer data");
+        bytes
+    }
+
     fn create_private_dir(path: &Path) {
         std::fs::create_dir_all(path).expect("create dir");
         #[cfg(unix)]
@@ -4196,7 +4214,7 @@ mod tests {
             .with_sync_every_appends(1);
         let path = config.bin_path();
         let mut writer = MmapScrollback::open(config).unwrap();
-        let before_bytes = std::fs::read(&path).unwrap();
+        let before_bytes = open_writer_file_bytes(&mut writer);
         let before_header = writer.header();
         let before_state = writer.v2_state;
 
@@ -4218,7 +4236,7 @@ mod tests {
         assert_eq!(writer.v2_state, before_state);
         assert_eq!(writer.appends_since_sync, 0);
         assert!(!writer.state_slot_dirty);
-        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        assert_eq!(open_writer_file_bytes(&mut writer), before_bytes);
         drop(writer);
 
         let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
@@ -4264,8 +4282,8 @@ mod tests {
         let dir = test_dir("replace-sidecar-after-open");
         let config =
             MmapScrollbackConfig::new(&dir, "replace-sidecar-after-open").with_cap_bytes(4096);
-        let first = MmapScrollback::open(config.clone()).unwrap();
-        let before_data = std::fs::read(config.bin_path()).unwrap();
+        let mut first = MmapScrollback::open(config.clone()).unwrap();
+        let before_data = open_writer_file_bytes(&mut first);
         let saved_lock = dir.join("saved-original-lock");
         std::fs::rename(config.lock_path(), &saved_lock).unwrap();
         write_private(&config.lock_path(), b"replacement lock");
@@ -4273,7 +4291,7 @@ mod tests {
         let error = MmapScrollback::open(config.clone()).unwrap_err();
 
         assert!(matches!(error, MmapScrollbackError::WriterBusy { .. }));
-        assert_eq!(std::fs::read(config.bin_path()).unwrap(), before_data);
+        assert_eq!(open_writer_file_bytes(&mut first), before_data);
         drop(first);
     }
 
@@ -4289,13 +4307,13 @@ mod tests {
 
         append_test_payload(&mut writer, RecordKind::Text, b"durable-zero");
         writer.sync().unwrap();
-        let generation_zero = std::fs::read(&path).unwrap();
+        let generation_zero = open_writer_file_bytes(&mut writer);
 
         for payload in [b"durable-one".as_slice(), b"durable-two", b"durable-three"] {
             let report = append_test_payload(&mut writer, RecordKind::Text, payload);
             assert!(!report.synced);
         }
-        let generation_one_dirty = std::fs::read(&path).unwrap();
+        let generation_one_dirty = open_writer_file_bytes(&mut writer);
         let first_dirty_slots = changed_v2_state_slots(&generation_zero, &generation_one_dirty);
         assert_eq!(
             first_dirty_slots.len(),
@@ -4303,7 +4321,7 @@ mod tests {
             "all unsynced publications must preserve the other state slot"
         );
         writer.sync().unwrap();
-        let generation_one = std::fs::read(&path).unwrap();
+        let generation_one = open_writer_file_bytes(&mut writer);
 
         for payload in [
             b"volatile-one".as_slice(),
@@ -4313,7 +4331,7 @@ mod tests {
             let report = append_test_payload(&mut writer, RecordKind::Osc, payload);
             assert!(!report.synced);
         }
-        let generation_two_dirty = std::fs::read(&path).unwrap();
+        let generation_two_dirty = open_writer_file_bytes(&mut writer);
         let second_dirty_slots = changed_v2_state_slots(&generation_one, &generation_two_dirty);
         assert_eq!(second_dirty_slots.len(), 1);
         assert_ne!(
@@ -4453,7 +4471,7 @@ mod tests {
         ));
         assert!(writer.pending_state_slot_repair.is_none());
         assert!(writer.write_poisoned);
-        let poisoned_bytes = std::fs::read(&path).unwrap();
+        let poisoned_bytes = open_writer_file_bytes(&mut writer);
 
         assert!(matches!(
             writer.sync(),
@@ -4466,7 +4484,7 @@ mod tests {
             ),
             Err(MmapScrollbackError::WriterPoisoned { .. })
         ));
-        assert_eq!(std::fs::read(&path).unwrap(), poisoned_bytes);
+        assert_eq!(open_writer_file_bytes(&mut writer), poisoned_bytes);
         drop(writer);
 
         let recovered = read_linear_records(&path, test_read_limits()).unwrap();
@@ -4512,12 +4530,12 @@ mod tests {
         let mut writer = MmapScrollback::open(config).unwrap();
         let pending = writer.append(RecordKind::Text, b"x").unwrap();
         assert_eq!(pending.payload_bytes, 0);
-        let before_append = std::fs::read(&path).unwrap();
+        let before_append = open_writer_file_bytes(&mut writer);
 
         let error = writer.flush_pending_redaction().unwrap_err();
 
         assert!(matches!(error, MmapScrollbackError::V2Integrity { .. }));
-        assert_eq!(std::fs::read(&path).unwrap(), before_append);
+        assert_eq!(open_writer_file_bytes(&mut writer), before_append);
     }
 
     #[test]
