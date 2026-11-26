@@ -1378,17 +1378,18 @@ impl PaneFile {
         )))
     }
 
+    /// Atomically replace `destination` with `staging`. The destination is
+    /// often still open (the live log, the base sequence journal). Windows
+    /// refuses to replace an open file through `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING`, which `tempfile`'s `persist` uses ("Access
+    /// is denied", os error 5), while `std::fs::rename` uses POSIX rename
+    /// semantics where the filesystem has them and replaces it; a native probe
+    /// showed both. On Unix both are rename(2). A failed rename leaves the
+    /// staging file in place: the caller did not authorize deleting an
+    /// unpublished recovery artifact.
     fn publish_staging_file(staging: &Path, destination: &Path) -> Result<(), MmapStoreError> {
-        let staged_path = tempfile::TempPath::try_from_path(staging.to_path_buf())?;
-        match staged_path.persist(destination) {
-            Ok(()) => Ok(()),
-            Err(mut error) => {
-                // The caller did not authorize deleting an unpublished recovery
-                // artifact. Retain it for diagnosis if atomic publication fails.
-                error.path.disable_cleanup(true);
-                Err(error.error.into())
-            }
-        }
+        std::fs::rename(staging, destination)?;
+        Ok(())
     }
 
     fn harden_open_file_permissions(file: &File) -> Result<(), MmapStoreError> {
