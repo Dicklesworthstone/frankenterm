@@ -15907,10 +15907,7 @@ mod tests {
         .unwrap();
 
         let error = cleanup_sync(db_path.as_str(), 0, 365).unwrap_err();
-        assert!(matches!(
-            error,
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, _)
-        ));
+        assert!(matches!(error, rusqlite::Error::Utf8Error(0, _)));
         assert_eq!(checkpoint_count(db_path.as_str()), 2);
     }
 

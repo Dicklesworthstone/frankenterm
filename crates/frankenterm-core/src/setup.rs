@@ -137,61 +137,13 @@ impl ShellType {
 /// (D with exit code), and current working directory (OSC 7).
 const BASH_OSC133_SNIPPET: &str = concat!(
     include_str!("shell_integration/osc7.sh"),
-    r#"# ft: OSC 133 prompt markers for deterministic state detection
-# These markers help ft detect prompt boundaries and command execution.
-__ft_prompt_start() { printf '\e]133;A\e\\'; }
-__ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
-__ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
-__ft_preexec() {
-    __ft_command_start
-}
-__ft_precmd() {
-    __ft_last_exit=$?
-    __ft_command_end
-    __ft_current_dir
-    __ft_prompt_start
-}
-# Install hooks if not already installed
-if [[ ! "${PROMPT_COMMAND:-}" =~ __ft_precmd ]]; then
-    PROMPT_COMMAND="__ft_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-fi
-if [[ ! "${BASH_PREEXEC_FUNCTIONS:-}" =~ __ft_preexec ]]; then
-    # bash-preexec compatible if available; otherwise use DEBUG trap
-    if declare -F __bp_install > /dev/null 2>&1; then
-        preexec_functions+=(__ft_preexec)
-    else
-        trap '__ft_preexec' DEBUG
-    fi
-fi"#
+    include_str!("shell_integration/prompt.bash")
 );
 
 /// OSC 133 integration snippet for Zsh
 const ZSH_OSC133_SNIPPET: &str = concat!(
     include_str!("shell_integration/osc7.sh"),
-    r#"# ft: OSC 133 prompt markers for deterministic state detection
-# These markers help ft detect prompt boundaries and command execution.
-__ft_prompt_start() { printf '\e]133;A\e\\'; }
-__ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
-__ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
-
-# Hook functions
-__ft_precmd() {
-    __ft_last_exit=$?
-    __ft_command_end
-    __ft_current_dir
-    __ft_prompt_start
-}
-__ft_preexec() {
-    __ft_command_start
-}
-
-# Install hooks if not already present
-if [[ ! "${precmd_functions:-}" =~ __ft_precmd ]]; then
-    precmd_functions+=(__ft_precmd)
-fi
-if [[ ! "${preexec_functions:-}" =~ __ft_preexec ]]; then
-    preexec_functions+=(__ft_preexec)
-fi"#
+    include_str!("shell_integration/prompt.zsh")
 );
 
 /// OSC 133 integration snippet for Fish
@@ -2506,7 +2458,7 @@ export PATH=$HOME/bin:$PATH
         let patched = fs::read_to_string(file.path()).unwrap();
         assert!(has_shell_ft_block(&patched));
         assert!(patched.contains("OSC 133"));
-        assert!(patched.contains("__ft_prompt_start"));
+        assert!(patched.contains("__ft_finish_prompt"));
         assert!(patched.contains("__ft_precmd"));
     }
 
@@ -2563,6 +2515,18 @@ export PATH=$HOME/bin:$PATH
         assert_eq!(fs::read_to_string(file.path()).unwrap(), expected);
         assert!(shell_ft_block_is_current(&expected, shell).unwrap());
         assert!(!patch_shell_rc_at(file.path(), shell).unwrap().modified);
+    }
+
+    #[test]
+    fn shell_update_refuses_markers_embedded_in_user_commands() {
+        for source in [
+            "echo '# FT-BEGIN (do not edit this block)'\nkeep_this\n# FT-END\n",
+            "# FT-BEGIN (do not edit this block)\nkeep_this\n# FT-END and more user text\n",
+        ] {
+            assert_setup_error_preserves_file(source, "standalone comment lines", |path| {
+                patch_shell_rc_at(path, ShellType::Bash)
+            });
+        }
     }
 
     #[test]
