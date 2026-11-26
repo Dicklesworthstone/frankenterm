@@ -612,7 +612,7 @@ ft tx run --contract-file refactor-tx.json      # prepare + commit deterministic
 ft tx show --include-contract                   # see the receipt + per-step audit
 ```
 
-The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. Mission planning and lifecycle metadata do not yet drive or cancel running agent tasks (`ft-majms`, `ft-xxfwy.48`). This scenario remains a product goal until that driver and crash/recovery path are qualified.
+The tx engine uses prepare/commit/compensate phases with an idempotency ledger. Compensation can fail, and an interrupted external effect can remain indeterminate; inspect the receipt before retrying. `ft mission dispatch` can execute a selected assignment through this transaction engine; see [Dispatch one assignment](#dispatch-one-assignment). Automated multi-assignment scheduling and cancellation of running agent tasks remain separate work (`ft-majms`, `ft-xxfwy.48`), so the full coordinated-refactor scenario remains a product goal.
 
 ### Scenario 3 — Reconstruct what an agent did six hours ago
 
@@ -1009,6 +1009,7 @@ The runner enforces the allowlist before any lock, audit row, or engine state is
 ```bash
 ft mission plan                                # validate mission contract + compute hash
 ft mission run                                 # advance lifecycle into execution
+ft mission dispatch a1 --expected-token "$mission_token"  # execute one selected pane action
 ft mission status                              # lifecycle + assignment summary
 ft mission explain                             # legal lifecycle transitions
 ft mission pause                               # canonical lifecycle transitions
@@ -1905,7 +1906,7 @@ ft mission objective-plan --objective "<operator goal as free text>" \
 3. Builds a read-only plan, ranking a candidate as ready work when a `--target-bead` is supplied or `--candidate-id` / `--candidate-title` describe one.
 4. Prints a deterministic plan artifact (golden-fixture-comparable). Nothing is persisted; keep the output if you need a record.
 
-The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)); today it advances the mission lifecycle only and does not dispatch into panes (`ft-majms`, `ft-xxfwy.48`).
+The planner is side-effect-free: objective-plan never spawns panes or sends input, and `--execute` is rejected. To execute an existing mission contract (`.ft/mission/active.json` by default), use `ft mission run` to advance its lifecycle, then `ft mission dispatch <assignment-id> --expected-token '<revision_token JSON>'` to execute one explicitly selected pane action through the policy-gated transaction engine. The objective-plan artifact is not automatically converted into a mission contract. See [Dispatch one assignment](#dispatch-one-assignment) for revision-token handling and the supported action scope. Autonomous multi-assignment scheduling and live agent-task cancellation remain separate work (`ft-majms`, `ft-xxfwy.48`).
 
 ---
 
@@ -3802,7 +3803,36 @@ Shape per `pub struct Mission` in `plan.rs`:
 
 Required fields: `mission_version`, `mission_id`, `generation`, `revision`, `title`, `workspace_id`, `ownership`, `created_at_ms`. Enum values are snake_case (`planning`, `running`, ...). Defaulted: `lifecycle_state`, `candidates`, `assignments`, `pause_resume_state`. Optional: `provenance`, `updated_at_ms`.
 
-`ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state.
+`ft mission plan` validates the contract and produces a planning summary. `ft mission run` advances the lifecycle into execution. `ft mission status` shows current assignment + approval state and the exact `revision_token` required by assignment dispatch.
+
+### Dispatch one assignment
+
+In default Linux and macOS builds, `ft mission dispatch` executes one existing assignment whose action is an explicit pane send or pane-bound wait. It requires the mission to be running or executing, an unsettled assignment, and eligible approval metadata. Live execution additionally checks policy, approvals, target capabilities and the persisted kill switch through the same transaction executor as `ft tx run`. Assignments requiring file reservations are refused by this path.
+
+```bash
+mission_file=".ft/mission/active.json"
+mission_token=$(ft mission status --mission-file "$mission_file" -f json |
+  jq -c '.data.revision_token')
+ft mission run --mission-file "$mission_file" --expected-token "$mission_token"
+
+# Lifecycle changes advance the revision, so obtain the current token.
+mission_token=$(ft mission status --mission-file "$mission_file" -f json |
+  jq -c '.data.revision_token')
+
+# Preview the selected assignment without publishing a transaction or sending input.
+ft mission dispatch a1 --mission-file "$mission_file" \
+  --expected-token "$mission_token" --dry-run -f json
+
+# Execute the same assignment using its exact observed revision.
+ft mission dispatch a1 --mission-file "$mission_file" \
+  --expected-token "$mission_token" -f json
+```
+
+The preview reports the pane, action kind and input byte count without echoing the input text. Its `eligible_preview` result is not live policy approval. A successful dispatch reports `action_committed`, the retained `contract_file`, and the updated revision token under `mutation.current`. Read a fresh mission status before dispatching another assignment.
+
+Each assignment incarnation owns one stable transaction under `.ft/mission-dispatch/`. If an action finishes but saving the mission outcome is interrupted, a later dispatch can recover its verified durable success without sending it again. Changing the action or assignee cannot allocate a fresh retry slot for the same assignment. Inspect a failed or indeterminate transaction with `ft tx show --contract-file <path> --include-contract`; the existing executor refuses to restart terminal failed transactions automatically.
+
+Assignment success confirms the selected pane action, such as delivery of input or satisfaction of a wait. It does not certify completion of the agent's coding task or the whole mission. Builds without `subprocess-bridge` return `mission.dispatch.feature_unavailable`.
 
 ### Tx contract (`.ft/mission/tx-active.json`)
 

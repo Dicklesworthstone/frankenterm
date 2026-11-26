@@ -6424,7 +6424,7 @@ enum MissionCommands {
         format: String,
     },
 
-    /// Advance mission lifecycle into execution state and persist updated mission
+    /// Record a run request; use dispatch to execute a selected assignment
     Run {
         /// Expected revision_token JSON from mission status; stale tokens fail closed
         #[arg(long)]
@@ -6432,6 +6432,28 @@ enum MissionCommands {
         /// Mission JSON file (default: .ft/mission/active.json)
         #[arg(long)]
         mission_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Execute one explicit pane assignment through the durable transaction executor
+    Dispatch {
+        /// Exact assignment ID from mission status or explain
+        assignment_id: String,
+
+        /// Exact revision_token JSON from mission status; stale tokens fail closed
+        #[arg(long)]
+        expected_token: String,
+
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Check assignment eligibility without publishing a transaction or executing it
+        #[arg(long)]
+        dry_run: bool,
 
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
@@ -64553,7 +64575,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         Some(Commands::Mission { command }) => {
-            handle_mission_command(command, &layout)?;
+            handle_mission_command(command, &layout, &config, resolved_config_path.as_deref())
+                .await?;
         }
 
         Some(Commands::Tx { command }) => {
@@ -83061,9 +83084,379 @@ fn run_mission_lifecycle(
     Ok((data, plain_lines))
 }
 
-fn handle_mission_command(
+#[cfg(feature = "subprocess-bridge")]
+fn mission_assignment_dispatch_error(
+    error: frankenterm_core::mission_dispatch::AssignmentDispatchError,
+) -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: error.code(),
+        message: error.to_string(),
+        hint: Some(
+            "Inspect 'ft mission status -f json' and 'ft mission explain --assignment-id <id>' before dispatching an explicit pane assignment."
+                .to_string(),
+        ),
+    }
+}
+
+/// Describe the selected action without printing pane input or pattern content.
+#[cfg(feature = "subprocess-bridge")]
+fn mission_assignment_action_summary(
+    contract: &frankenterm_core::plan::MissionTxContract,
+) -> Result<serde_json::Value, MissionCommandError> {
+    use frankenterm_core::mission_dispatch::AssignmentDispatchError;
+    use frankenterm_core::plan::{StepAction, WaitCondition};
+
+    let step = contract.plan.steps.first().ok_or_else(|| {
+        mission_assignment_dispatch_error(AssignmentDispatchError::InvalidMission)
+    })?;
+    match &step.action {
+        StepAction::SendText {
+            pane_id,
+            text,
+            paste_mode,
+        } => Ok(serde_json::json!({
+            "kind": "send_text",
+            "pane_id": pane_id,
+            "text_bytes": text.len(),
+            "paste_mode": paste_mode,
+        })),
+        StepAction::WaitFor {
+            pane_id,
+            condition,
+            timeout_ms,
+        } => {
+            let (condition_kind, condition_pane) = match condition {
+                WaitCondition::Pattern { pane_id, .. } => ("pattern", *pane_id),
+                WaitCondition::PaneIdle { pane_id, .. } => ("pane_idle", *pane_id),
+                WaitCondition::StableTail { pane_id, .. } => ("stable_tail", *pane_id),
+                WaitCondition::External { .. } => {
+                    return Err(mission_assignment_dispatch_error(
+                        AssignmentDispatchError::ActionUnsupported,
+                    ));
+                }
+            };
+            let pane_id = pane_id.or(condition_pane).ok_or_else(|| {
+                mission_assignment_dispatch_error(AssignmentDispatchError::TargetUnspecified)
+            })?;
+            Ok(serde_json::json!({
+                "kind": "wait_for",
+                "pane_id": pane_id,
+                "condition_kind": condition_kind,
+                "timeout_ms": timeout_ms,
+            }))
+        }
+        _ => Err(mission_assignment_dispatch_error(
+            AssignmentDispatchError::ActionUnsupported,
+        )),
+    }
+}
+
+#[cfg(feature = "subprocess-bridge")]
+fn mission_assignment_transaction_error(
+    mut error: MissionCommandError,
+    contract_path: &Path,
+) -> MissionCommandError {
+    let recovery_hint = format!(
+        "The assignment transaction is retained at {}. Inspect it with 'ft tx show --contract-file <path> --include-contract'; retrying the assignment reuses this transaction.",
+        contract_path.display()
+    );
+    error.hint = Some(match error.hint.take() {
+        Some(hint) => format!("{hint} {recovery_hint}"),
+        None => recovery_hint,
+    });
+    error
+}
+
+/// Use the same live policy, approvals, target lookup and durable engine as tx run.
+#[cfg(feature = "subprocess-bridge")]
+async fn execute_mission_assignment_transaction(
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config_path: Option<&Path>,
+    mission_guard: &frankenterm_core::tx_execution::MissionMutationGuard,
+    contract_lock: &frankenterm_core::tx_execution::TxContractLockGuard,
+    contract: &mut frankenterm_core::plan::MissionTxContract,
+) -> Result<RobotTxRunData, MissionCommandError> {
+    use frankenterm_core::plan::MissionKillSwitchLevel;
+
+    let (runtime, unavailable) = resolve_real_tx_runtime(
+        config,
+        layout,
+        contract,
+        config_path,
+        tx_run_probes_terminal_backend(contract, MissionKillSwitchLevel::Off, false),
+    )
+    .await;
+    let RealTxRuntime {
+        storage,
+        wezterm,
+        tx_storage,
+        pattern_engine,
+    } = runtime.ok_or_else(|| {
+        mission_tx_command_error(TxCommandExecutionError::refused_synthetic_commit(
+            unavailable.as_ref(),
+        ))
+    })?;
+    let policy_engine = std::cell::RefCell::new(
+        with_persisted_kill_switch(
+            frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety)
+                .with_tuning(&config.tuning),
+            &storage,
+            "mission.dispatch",
+        )
+        .await,
+    );
+    let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
+        Some(&storage),
+    );
+    let resolved_capabilities = resolve_tx_contract_capabilities(
+        &frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request),
+        contract,
+        &storage,
+        Some(layout.ipc_socket_path.as_path()),
+    )
+    .await;
+    let targets =
+        frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+            .with_resolved_capabilities(resolved_capabilities);
+    let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
+        layout.root.to_string_lossy().to_string(),
+    )
+    .with_actor(frankenterm_core::policy::ActorKind::Human);
+    let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
+        wezterm,
+        policy_engine,
+        approvals,
+        targets,
+        prepare_context,
+    )
+    .with_policy_storage(&storage)
+    .with_pattern_engine(pattern_engine)
+    .with_storage_adapter(tx_storage);
+
+    // Hold the mission lock throughout dispatch so a competing pause/abort
+    // cannot be acknowledged and then overwritten by this assignment.
+    let result = mission_guard
+        .verify_current()
+        .map_err(mission_store_error)
+        .and_then(|()| {
+            execute_tx_run_with_executor(
+                executor,
+                contract_lock.authoritative_path(),
+                Some(contract_lock),
+                contract,
+                MissionKillSwitchLevel::Off,
+                false,
+                None,
+                false,
+                mission_now_ms(),
+            )
+            .map_err(mission_tx_command_error)
+        });
+    let shutdown = storage.shutdown().await;
+    match (result, shutdown) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_IO,
+            error_code: "mission.dispatch.storage_shutdown_failed",
+            message: format!(
+                "The transaction finished, but its policy storage did not shut down cleanly: {error}"
+            ),
+            hint: Some(
+                "A pane action may already have completed. Inspect the durable transaction before retrying."
+                    .to_string(),
+            ),
+        }),
+        (Ok(data), Ok(())) => Ok(data),
+    }
+}
+
+/// Persist success only after independently checking the durable action outcome.
+#[cfg(feature = "subprocess-bridge")]
+fn finish_mission_assignment_dispatch(
+    mutation: frankenterm_core::tx_execution::MissionMutationGuard,
+    assignment_id: &frankenterm_core::plan::AssignmentId,
+    expected: &frankenterm_core::plan::MissionTxContract,
+    contract_lock: &frankenterm_core::tx_execution::TxContractLockGuard,
+    contract: &mut frankenterm_core::plan::MissionTxContract,
+    now_ms: i64,
+) -> Result<
+    (
+        frankenterm_core::plan::Mission,
+        frankenterm_core::tx_execution::MissionMutationReceipt,
+    ),
+    MissionCommandError,
+> {
+    mutation.verify_current().map_err(mission_store_error)?;
+    let confirmed = frankenterm_core::tx_execution::recover_mission_assignment_dispatch(
+        contract_lock,
+        expected,
+        contract,
+        now_ms,
+    )
+    .map_err(mission_store_error)?;
+    if !confirmed {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_VALIDATION,
+            error_code: "mission.dispatch.action_not_committed",
+            message: format!(
+                "The assignment action has no confirmed durable success (transaction state: {}). No assignment success was recorded.",
+                contract.lifecycle_state
+            ),
+            hint: None,
+        });
+    }
+
+    let mut mission = mutation.mission().clone();
+    let observed_at_ms = now_ms.max(mission.updated_at_ms.unwrap_or(mission.created_at_ms));
+    let assignment = mission
+        .assignments
+        .iter_mut()
+        .find(|assignment| assignment.assignment_id == *assignment_id)
+        .ok_or_else(|| {
+            mission_assignment_dispatch_error(
+                frankenterm_core::mission_dispatch::AssignmentDispatchError::AssignmentNotFound,
+            )
+        })?;
+    let completed_at_ms =
+        observed_at_ms.max(assignment.updated_at_ms.unwrap_or(assignment.created_at_ms));
+    assignment.outcome = Some(frankenterm_core::plan::Outcome::Success {
+        reason_code: "mission.assignment_action_committed".to_string(),
+        completed_at_ms,
+    });
+    assignment.updated_at_ms = Some(completed_at_ms);
+    mission.updated_at_ms = Some(completed_at_ms);
+    // A successful send acknowledges delivery of the selected pane input; it
+    // does not certify completion of the agent's task or the whole mission.
+    let receipt = mutation.commit(&mut mission).map_err(mission_store_error)?;
+    Ok((mission, receipt))
+}
+
+#[cfg(feature = "subprocess-bridge")]
+async fn run_mission_assignment_dispatch(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
+    mission_path: &Path,
+    assignment_id: &str,
+    expected_token: &str,
+    dry_run: bool,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    use frankenterm_core::mission_dispatch::compile_assignment_dispatch;
+    use frankenterm_core::plan::AssignmentId;
+
+    let mutation = acquire_mission_mutation(layout, mission_path, Some(expected_token))?;
+    let assignment_id = AssignmentId(assignment_id.to_string());
+    let expected = compile_assignment_dispatch(mutation.mission(), &assignment_id)
+        .map_err(mission_assignment_dispatch_error)?;
+    let action = mission_assignment_action_summary(&expected)?;
+    let mut data = serde_json::json!({
+        "command": "dispatch",
+        "mission_file": mission_path.display().to_string(),
+        "mission_id": mutation.mission().mission_id,
+        "assignment_id": assignment_id,
+        "lifecycle_state": mutation.mission().lifecycle_state,
+        "tx_id": expected.intent.tx_id,
+        "action": action,
+        "dry_run": dry_run,
+        "execution_scope": "single_assignment_action",
+    });
+    if dry_run {
+        mutation.verify_current().map_err(mission_store_error)?;
+        data["status"] = serde_json::json!("eligible_preview");
+        data["policy_evaluated"] = serde_json::json!(false);
+        data["transaction_published"] = serde_json::json!(false);
+        data["revision_token"] = serde_json::json!(
+            frankenterm_core::tx_execution::MissionRevisionToken::from_mission(mutation.mission())
+                .map_err(mission_store_error)?
+        );
+        let plain_lines = vec![
+            format!("Mission assignment preview: {}", assignment_id.0),
+            format!("  Mission: {}", mutation.mission().mission_id),
+            format!(
+                "  Action: {}; pane: {}",
+                action["kind"].as_str().unwrap_or("unknown"),
+                action["pane_id"]
+            ),
+            "  Status: eligible; live policy, approval and target checks run at dispatch"
+                .to_string(),
+            format!("  Transaction identity: {}", expected.intent.tx_id.0),
+        ];
+        return Ok((data, plain_lines));
+    }
+
+    let (contract_lock, mut contract) = mutation
+        .publish_assignment_dispatch(&assignment_id)
+        .map_err(mission_store_error)?;
+    let contract_path = contract_lock.authoritative_path();
+    mutation
+        .verify_current()
+        .map_err(mission_store_error)
+        .map_err(|error| mission_assignment_transaction_error(error, contract_path))?;
+    let recovered = frankenterm_core::tx_execution::recover_mission_assignment_dispatch(
+        &contract_lock,
+        &expected,
+        &mut contract,
+        mission_now_ms(),
+    )
+    .map_err(mission_store_error)
+    .map_err(|error| mission_assignment_transaction_error(error, contract_path))?;
+    let transaction_report = if recovered {
+        None
+    } else {
+        Some(
+            execute_mission_assignment_transaction(
+                config,
+                layout,
+                config_path,
+                &mutation,
+                &contract_lock,
+                &mut contract,
+            )
+            .await
+            .map_err(|error| mission_assignment_transaction_error(error, contract_path))?,
+        )
+    };
+    let (mission, receipt) = finish_mission_assignment_dispatch(
+        mutation,
+        &assignment_id,
+        &expected,
+        &contract_lock,
+        &mut contract,
+        mission_now_ms(),
+    )
+    .map_err(|error| mission_assignment_transaction_error(error, contract_path))?;
+    data["status"] = serde_json::json!("action_committed");
+    data["policy_evaluated"] = serde_json::json!(!recovered);
+    data["replayed"] = serde_json::json!(recovered);
+    data["contract_file"] = serde_json::json!(contract_path.display().to_string());
+    data["final_state"] = serde_json::json!(contract.lifecycle_state);
+    data["mutation"] = serde_json::json!(receipt);
+    data["transaction_report"] = serde_json::json!(transaction_report);
+    let plain_lines = vec![
+        format!("Mission assignment dispatched: {}", assignment_id.0),
+        format!(
+            "  Result: pane action committed{}",
+            if recovered { " (durable replay)" } else { "" }
+        ),
+        format!(
+            "  Mission: {} ({})",
+            mission.mission_id, mission.lifecycle_state
+        ),
+        format!("  Transaction: {}", contract_path.display()),
+        format!("  Revision: {}", mission.revision),
+        "  Success confirms the pane action; inspect agent output for task completion.".to_string(),
+    ];
+    Ok((data, plain_lines))
+}
+
+async fn handle_mission_command(
     command: MissionCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     match command {
         MissionCommands::ObjectivePlan { args } => {
@@ -83560,6 +83953,56 @@ fn handle_mission_command(
                 }
             }
             emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Dispatch {
+            assignment_id,
+            expected_token,
+            mission_file,
+            dry_run,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            #[cfg(feature = "subprocess-bridge")]
+            {
+                let mission_path = resolve_mission_file_path(layout, mission_file);
+                let (data, plain_lines) = run_mission_assignment_dispatch(
+                    layout,
+                    config,
+                    config_path,
+                    &mission_path,
+                    &assignment_id,
+                    &expected_token,
+                    dry_run,
+                )
+                .await
+                .unwrap_or_else(|error| emit_mission_error(output_format, error));
+                emit_mission_success(output_format, data, &plain_lines)?;
+            }
+            #[cfg(not(feature = "subprocess-bridge"))]
+            {
+                let _ = (
+                    assignment_id,
+                    expected_token,
+                    mission_file,
+                    dry_run,
+                    config,
+                    config_path,
+                );
+                emit_mission_error(
+                    output_format,
+                    MissionCommandError {
+                        exit_code: MISSION_EXIT_VALIDATION,
+                        error_code: "mission.dispatch.feature_unavailable",
+                        message: "Mission assignment dispatch is unavailable in this build."
+                            .to_string(),
+                        hint: Some(
+                            "Use a default build or enable the subprocess-bridge feature."
+                                .to_string(),
+                        ),
+                    },
+                );
+            }
         }
 
         MissionCommands::Run {
@@ -107514,6 +107957,282 @@ mod tests {
         )
         .expect("write mission fixture");
         (dir, layout, path)
+    }
+
+    #[test]
+    fn mission_dispatch_cli_requires_token_even_for_preview() {
+        for args in [
+            vec!["ft", "mission", "dispatch", "assignment:cli-a"],
+            vec!["ft", "mission", "dispatch", "assignment:cli-a", "--dry-run"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "dispatch must require an explicit revision token"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "dispatch",
+            "assignment:cli-a",
+            "--expected-token",
+            "{}",
+            "--mission-file",
+            "/tmp/mission.json",
+            "--dry-run",
+            "-f",
+            "json",
+        ])
+        .expect("explicit dispatch arguments should parse");
+        match cli.command.map(|command| *command) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Dispatch {
+                        assignment_id,
+                        expected_token,
+                        mission_file,
+                        dry_run,
+                        format,
+                    },
+            }) => {
+                assert_eq!(assignment_id, "assignment:cli-a");
+                assert_eq!(expected_token, "{}");
+                assert_eq!(mission_file, Some(PathBuf::from("/tmp/mission.json")));
+                assert!(dry_run);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected mission dispatch"),
+        }
+    }
+
+    #[cfg(all(feature = "subprocess-bridge", not(windows)))]
+    #[test]
+    fn mission_dispatch_preview_does_not_publish_or_open_runtime() {
+        run_async_test(async {
+            let (_dir, layout, path) = mission_lifecycle_fixture();
+            let mission = load_mission_from_path(&path).expect("load mission fixture");
+            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                &mission,
+            )
+            .expect("exact revision token");
+            let token = serde_json::to_string(&token).expect("serialize token");
+            let before = std::fs::read(&path).expect("read original mission");
+            let (data, lines) = run_mission_assignment_dispatch(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                &path,
+                "assignment:cli-a",
+                &token,
+                true,
+            )
+            .await
+            .expect("compile-only preview should not need a running mux");
+            assert_eq!(data["status"], "eligible_preview");
+            assert_eq!(data["policy_evaluated"], false);
+            assert_eq!(data["transaction_published"], false);
+            assert_eq!(data["action"]["kind"], "send_text");
+            assert_eq!(data["action"]["pane_id"], 7);
+            assert_eq!(data["action"]["text_bytes"], 6);
+            assert!(
+                !data.to_string().contains("/retry"),
+                "preview must not echo pane input"
+            );
+            assert!(lines.iter().any(|line| line.contains("live policy")));
+            assert_eq!(std::fs::read(&path).expect("reread mission"), before);
+            assert!(!layout.ft_dir.join("mission-dispatch").exists());
+            assert!(!layout.db_path.exists(), "preview must not open storage");
+        });
+    }
+
+    #[cfg(all(feature = "subprocess-bridge", not(windows)))]
+    #[test]
+    fn mission_dispatch_stale_token_refuses_before_publication() {
+        run_async_test(async {
+            let (_dir, layout, path) = mission_lifecycle_fixture();
+            let mission = load_mission_from_path(&path).expect("load mission fixture");
+            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                &mission,
+            )
+            .expect("exact revision token");
+            let token = serde_json::to_string(&token).expect("serialize token");
+            run_mission_lifecycle(
+                &layout,
+                &path,
+                MissionLifecycleVerb::Pause,
+                Some(&token),
+                Some("operator hold"),
+                "operator",
+            )
+            .expect("concurrent control request is accepted first");
+            let paused = std::fs::read(&path).expect("read paused mission");
+            let error = run_mission_assignment_dispatch(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                &path,
+                "assignment:cli-a",
+                &token,
+                false,
+            )
+            .await
+            .expect_err("stale dispatch authority must not supersede a pause");
+            assert_eq!(
+                error.error_code,
+                frankenterm_core::tx_execution::MissionStoreError::Conflict.code()
+            );
+            assert_eq!(std::fs::read(&path).expect("reread mission"), paused);
+            assert!(!layout.ft_dir.join("mission-dispatch").exists());
+            assert!(!layout.db_path.exists());
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_records_only_durable_assignment_action_success() {
+        run_async_test(async {
+            use frankenterm_core::plan::{
+                AssignmentId, MissionKillSwitchLevel, MissionLifecycleState, Outcome,
+            };
+
+            let (_dir, layout, path) = mission_lifecycle_fixture();
+            let before = load_mission_from_path(&path).expect("load mission fixture");
+            let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(
+                &before,
+            )
+            .expect("exact revision token");
+            let token = serde_json::to_string(&token).expect("serialize token");
+            let mutation =
+                acquire_mission_mutation(&layout, &path, Some(&token)).expect("lock mission");
+            let assignment_id = AssignmentId("assignment:cli-a".to_string());
+            let expected = frankenterm_core::mission_dispatch::compile_assignment_dispatch(
+                mutation.mission(),
+                &assignment_id,
+            )
+            .expect("compile selected assignment");
+            let (contract_lock, mut contract) = mutation
+                .publish_assignment_dispatch(&assignment_id)
+                .expect("publish durable assignment slot");
+            assert!(
+                run_mission_lifecycle(
+                    &layout,
+                    &path,
+                    MissionLifecycleVerb::Abort,
+                    Some(&token),
+                    None,
+                    "competing-operator",
+                )
+                .is_err(),
+                "an abort cannot be acknowledged while this dispatcher owns the mission"
+            );
+
+            // This unit executor proves persistence wiring, not live pane delivery.
+            execute_tx_run_with_executor(
+                frankenterm_core::tx_execution::SyntheticStepExecutor,
+                contract_lock.authoritative_path(),
+                Some(&contract_lock),
+                &mut contract,
+                MissionKillSwitchLevel::Off,
+                false,
+                None,
+                false,
+                1_800_000_000_000,
+            )
+            .expect("record unit executor's outcome in the real durable ledger");
+            let (mission, receipt) = finish_mission_assignment_dispatch(
+                mutation,
+                &assignment_id,
+                &expected,
+                &contract_lock,
+                &mut contract,
+                1_800_000_000_001,
+            )
+            .expect("verified durable action can settle the assignment");
+            assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+            assert_eq!(mission.revision, before.revision + 1);
+            assert!(receipt.changed);
+            assert_eq!(
+                receipt.owner_acknowledgement,
+                "unavailable_no_mission_driver"
+            );
+            assert!(matches!(
+                &mission.assignments[0].outcome,
+                Some(Outcome::Success { reason_code, .. })
+                    if reason_code == "mission.assignment_action_committed"
+            ));
+            assert_eq!(
+                mission.assignments[1].outcome,
+                before.assignments[1].outcome,
+                "dispatch must not alter another assignment"
+            );
+            drop(contract_lock);
+            let persisted = std::fs::read(&path).expect("read settled mission");
+            let current = serde_json::to_string(&receipt.current).expect("serialize new token");
+            let error = run_mission_assignment_dispatch(
+                &layout,
+                &frankenterm_core::config::Config::default(),
+                None,
+                &path,
+                "assignment:cli-a",
+                &current,
+                true,
+            )
+            .await
+            .expect_err("a settled assignment cannot create a second dispatch");
+            assert_eq!(error.error_code, "mission.dispatch.already_settled");
+            assert_eq!(std::fs::read(&path).expect("reread mission"), persisted);
+        });
+    }
+
+    #[cfg(all(
+        feature = "subprocess-bridge",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn mission_dispatch_terminal_json_without_ledger_never_settles_assignment() {
+        use frankenterm_core::plan::{AssignmentId, MissionTxState, TxOutcome};
+
+        let (_dir, layout, path) = mission_lifecycle_fixture();
+        let before = std::fs::read(&path).expect("read original mission");
+        let mission = load_mission_from_path(&path).expect("load mission fixture");
+        let token = frankenterm_core::tx_execution::MissionRevisionToken::from_mission(&mission)
+            .expect("exact revision token");
+        let token = serde_json::to_string(&token).expect("serialize token");
+        let mutation =
+            acquire_mission_mutation(&layout, &path, Some(&token)).expect("lock mission");
+        let assignment_id = AssignmentId("assignment:cli-a".to_string());
+        let expected = frankenterm_core::mission_dispatch::compile_assignment_dispatch(
+            mutation.mission(),
+            &assignment_id,
+        )
+        .expect("compile selected assignment");
+        let (contract_lock, mut contract) = mutation
+            .publish_assignment_dispatch(&assignment_id)
+            .expect("publish durable assignment slot");
+        contract.lifecycle_state = MissionTxState::Committed;
+        contract.outcome = TxOutcome::Committed;
+        frankenterm_core::tx_execution::save_tx_contract_atomic(
+            &contract_lock,
+            contract_lock.authoritative_path(),
+            &contract,
+        )
+        .expect("plant complete terminal JSON without authoritative dispatch evidence");
+        assert!(
+            finish_mission_assignment_dispatch(
+                mutation,
+                &assignment_id,
+                &expected,
+                &contract_lock,
+                &mut contract,
+                1_800_000_000_000,
+            )
+            .is_err(),
+            "a terminal JSON claim is not proof that an action happened"
+        );
+        assert_eq!(std::fs::read(&path).expect("reread mission"), before);
     }
 
     #[test]
