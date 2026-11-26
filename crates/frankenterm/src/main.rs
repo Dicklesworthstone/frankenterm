@@ -101933,8 +101933,9 @@ fn disk_space_diagnostic_check_from(probe: &Path, space: Option<(u64, u64)>) -> 
 const RECORDER_STORAGE_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 /// `ft doctor` row for recorder disk usage. Every captured segment is also
-/// written to the recorder, which has no rotation or retention yet
-/// (ft-w1nas), so its size only grows; surface it before it fills a disk.
+/// written to the recorder. The append log rolls within a budget (ft-w1nas);
+/// the rusqlite recorder has no retention, so its size only grows. Surface
+/// both before they fill a disk.
 fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
     const FILES: [&str; 4] = [
         "events.log",
@@ -101979,15 +101980,32 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         .map(|(name, len)| format!("{name} {}", format_bytes_human(*len)))
         .collect::<Vec<_>>()
         .join(", ");
+    // Only the append log has retention; say so per backend whose files exist
+    // (the rusqlite recorder is the default off Unix).
+    let mut retention = Vec::new();
+    if sealed_count > 0 || sizes.iter().any(|(name, _)| *name == "events.log") {
+        retention.push(format!(
+            "the watcher rolls events.log every {} and keeps {} of sealed segments",
+            format_bytes_human(
+                frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT
+                    .roll_at_bytes
+            ),
+            format_bytes_human(
+                frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT
+                    .max_total_bytes
+            ),
+        ));
+    }
+    if sizes
+        .iter()
+        .any(|(name, _)| name.starts_with("events.sqlite3"))
+    {
+        retention.push("events.sqlite3 has no retention yet and only grows".to_string());
+    }
     let detail = format!(
-        "{} total ({listing}); the watcher rolls events.log every {} and keeps {} of sealed segments",
+        "{} total ({listing}); {}",
         format_bytes_human(total),
-        format_bytes_human(
-            frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT.roll_at_bytes
-        ),
-        format_bytes_human(
-            frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT.max_total_bytes
-        ),
+        retention.join("; ")
     );
     if total >= RECORDER_STORAGE_WARN_BYTES {
         DiagnosticCheck::warning(
@@ -109272,12 +109290,30 @@ mod tests {
         let detail = rolled.detail.unwrap_or_default();
         assert!(detail.contains("sealed segments 2.0 KiB"), "{detail}");
         assert!(detail.starts_with("5.0 KiB total"), "{detail}");
+        assert!(!detail.contains("events.sqlite3"), "{detail}");
 
         // A sparse file reports its logical length without using real disk.
         let big = std::fs::File::create(dir.path().join("events.sqlite3")).unwrap();
         big.set_len(RECORDER_STORAGE_WARN_BYTES).unwrap();
         let large = recorder_storage_diagnostic_check(dir.path());
         assert!(matches!(large.status, DiagnosticStatus::Warning));
+        let detail = large.detail.unwrap_or_default();
+        assert!(detail.contains("rolls events.log every"), "{detail}");
+        assert!(
+            detail.contains("events.sqlite3 has no retention yet"),
+            "{detail}"
+        );
+
+        // A rusqlite-only recorder (the default off Unix) claims no rolling.
+        let sqlite_only = tempfile::tempdir().expect("tempdir");
+        std::fs::write(sqlite_only.path().join("events.sqlite3"), vec![0_u8; 1024]).unwrap();
+        let detail = recorder_storage_diagnostic_check(sqlite_only.path())
+            .detail
+            .unwrap_or_default();
+        assert_eq!(
+            detail,
+            "1.0 KiB total (events.sqlite3 1.0 KiB); events.sqlite3 has no retention yet and only grows"
+        );
         assert_eq!(format_bytes_human(1536), "1.5 KiB");
         assert_eq!(format_bytes_human(12), "12 B");
     }
@@ -116030,13 +116066,16 @@ reason = "overly conservative pending threshold"
         );
     }
 
+    // The append log is qualified only on Unix; elsewhere it refuses to open,
+    // so the watcher defaults to the rusqlite recorder there.
     #[test]
-    fn watcher_startup_default_backend_is_append_log() {
+    fn watcher_startup_default_backend_is_append_log_on_unix_and_rusqlite_elsewhere() {
         let config = frankenterm_core::config::Config::default();
-        assert_eq!(
-            config.storage.recorder_backend,
-            frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
-        );
+        #[cfg(unix)]
+        let expected = frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog;
+        #[cfg(not(unix))]
+        let expected = frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite;
+        assert_eq!(config.storage.recorder_backend, expected);
     }
 
     #[test]

@@ -61,6 +61,21 @@ pub enum RecorderBackendKind {
 impl RecorderBackendKind {
     /// Every stable recorder backend identity, including reserved selectors.
     pub const ALL: [Self; 3] = [Self::AppendLog, Self::Rusqlite, Self::FrankenSqlite];
+
+    /// The backend used when `storage.recorder_backend` is unset: the append
+    /// log on Unix, and the `rusqlite` recorder elsewhere. Off Unix the append
+    /// log refuses to open, because its path leases, writer lock and directory
+    /// sync are qualified only there (Windows byte-range locks would deny the
+    /// indexer's concurrent reads), so defaulting to it would stop `ft watch`
+    /// at recorder bootstrap.
+    #[must_use]
+    pub const fn platform_default() -> Self {
+        if cfg!(unix) {
+            Self::AppendLog
+        } else {
+            Self::Rusqlite
+        }
+    }
 }
 
 impl std::fmt::Display for RecorderBackendKind {
@@ -972,7 +987,7 @@ impl RecorderStorageConfig {
 impl Default for RecorderStorageConfig {
     fn default() -> Self {
         Self {
-            backend: RecorderBackendKind::AppendLog,
+            backend: RecorderBackendKind::platform_default(),
             append_log: AppendLogStorageConfig::default(),
             rusqlite: RusqliteStorageConfig::default(),
         }
@@ -1502,6 +1517,16 @@ impl AppendLogRecorderStorage {
         config.data_path = resolve_recorder_path(&config.data_path)?;
         config.state_path = resolve_recorder_path(&config.state_path)?;
         validate_recorder_paths(&config)?;
+        // Path leases, the writer lock and directory sync are qualified only
+        // on Unix (see RecorderBackendKind::platform_default). Refuse here,
+        // after read-only admission and before creating any directory.
+        if !cfg!(unix) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the append-log recorder is qualified only on Unix; set storage.recorder_backend = \"rusqlite\"",
+            )
+            .into());
+        }
         ensure_durable_parent_chain(&config.data_path)?;
         ensure_durable_parent_chain(&config.state_path)?;
         validate_recorder_paths(&config)?;
@@ -6043,6 +6068,42 @@ mod tests {
 
         let storage = bootstrap_recorder_storage(config).unwrap();
         assert_eq!(storage.backend_kind(), RecorderBackendKind::Rusqlite);
+    }
+
+    // `ft watch` bootstraps the configured backend and stops if it cannot open,
+    // so the default must open on every platform this runs on. Before the
+    // per-platform default, Windows defaulted to the append log, which refuses
+    // to open there.
+    #[test]
+    fn platform_default_backend_opens_and_appends() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let mut config = recorder_test_config(dir.path());
+            config.backend = RecorderBackendKind::platform_default();
+            assert_eq!(
+                config.backend,
+                crate::config::StorageConfig::default().recorder_backend
+            );
+            #[cfg(unix)]
+            assert_eq!(config.backend, RecorderBackendKind::AppendLog);
+            #[cfg(not(unix))]
+            assert_eq!(config.backend, RecorderBackendKind::Rusqlite);
+
+            let storage = bootstrap_recorder_storage(config).unwrap();
+            assert_eq!(
+                storage.backend_kind(),
+                RecorderBackendKind::platform_default()
+            );
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "platform-default".to_string(),
+                    events: vec![sample_event("first", 1, 0, "one")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+        });
     }
 
     #[test]

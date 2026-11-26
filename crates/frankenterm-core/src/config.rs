@@ -1751,7 +1751,9 @@ pub struct StorageConfig {
     /// Database file path (relative to workspace .ft dir if not absolute)
     pub db_path: String,
 
-    /// Recorder backend selector for startup bootstrap policy.
+    /// Recorder backend selector for startup bootstrap policy. Defaults to
+    /// `append_log` on Unix and `rusqlite` elsewhere; see
+    /// [`RecorderBackendKind::platform_default`](crate::recorder_storage::RecorderBackendKind::platform_default).
     pub recorder_backend: crate::recorder_storage::RecorderBackendKind,
 
     /// Retention period in days (0 = no retention, keep forever).
@@ -1822,7 +1824,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             db_path: "ft.db".to_string(),
-            recorder_backend: crate::recorder_storage::RecorderBackendKind::AppendLog,
+            recorder_backend: crate::recorder_storage::RecorderBackendKind::platform_default(),
             retention_days: 30,
             retention_max_mb: 0, // No size limit by default
             checkpoint_interval_secs: 60,
@@ -10182,10 +10184,11 @@ log_level = "debug"
     #[test]
     fn default_retention_tiers_exist() {
         let config = StorageConfig::default();
-        assert_eq!(
-            config.recorder_backend,
-            crate::recorder_storage::RecorderBackendKind::AppendLog
-        );
+        #[cfg(unix)]
+        let expected_backend = crate::recorder_storage::RecorderBackendKind::AppendLog;
+        #[cfg(not(unix))]
+        let expected_backend = crate::recorder_storage::RecorderBackendKind::Rusqlite;
+        assert_eq!(config.recorder_backend, expected_backend);
         assert_eq!(config.retention_tiers.len(), 3);
         assert_eq!(config.retention_tiers[0].name, "critical");
         assert_eq!(config.retention_tiers[0].retention_days, 90);
