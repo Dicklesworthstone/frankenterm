@@ -220,6 +220,40 @@ fn smoke_ft_setup_dry_run() {
 }
 
 #[test]
+fn setup_dry_run_reports_damaged_shell_markers_and_finishes() {
+    // A damaged FT block needs a hand fix. Guided setup reports it, leaves
+    // the file alone and still runs its remaining phases.
+    let home = tempfile::tempdir().expect("temp home");
+    let rc = home.path().join(".bashrc");
+    let damaged = "echo kept # FT-BEGIN (do not edit this block)\n# FT-END\n";
+    fs::write(&rc, damaged).expect("write damaged rc");
+
+    let output = wa_cmd()
+        .args(["setup", "--dry-run"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_STATE_HOME", home.path().join(".local/state"))
+        .env("XDG_RUNTIME_DIR", home.path().join("run"))
+        .env("SHELL", "/bin/bash")
+        .output()
+        .expect("ft setup --dry-run should execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Repair the FT markers by hand"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Next steps:"), "stdout:\n{stdout}");
+    assert_eq!(fs::read_to_string(&rc).expect("read rc"), damaged);
+}
+
+#[test]
 fn smoke_ft_robot_quick_start() {
     let output = wa_cmd()
         .args(["robot", "quick-start"])
