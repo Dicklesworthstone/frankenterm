@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreTransferable
 import Observation
 import VisionKit
 import AVFoundation
@@ -1184,6 +1185,21 @@ final class MobileWorkspaceModel {
         scanSaveGeneration = generation; scanSaveIdentity = session.review.identity
         scanCadence = .init(receivedParts: session.review.receivedParts, verifiedPages: session.review.verifiedPages)
         scanLastSaved = .now; publishSavedScan(session.review)
+    }
+
+    /// A single user-selected export is independent of the phone's opt-in
+    /// recovery cache. The restore actor takes one atomic ciphertext snapshot.
+    func portableScanProgress(generation: UUID) async throws -> Data {
+        guard active, showRestore, !busy, !offlineModeBlocked, let restore, let current = state,
+              current.generation == generation, current.source == .optical, !current.isSuspended,
+              [.collecting, .locked, .review].contains(current.phase) else { throw FTError.stale }
+        guard current.receivedParts > 0 else { throw OpticalRecordingRecoveryError.noProgress }
+        let ticket = epoch
+        let bytes = try await restore.exportDecoderCheckpoint(generation: generation)
+        try Task.checkCancellation()
+        guard active, showRestore, epoch == ticket, state?.generation == generation,
+              state?.isSuspended == false else { throw FTError.stale }
+        return bytes
     }
 
     func saveScanProgress(generation: UUID, identity: OpticalFrame.Identity,
@@ -3208,6 +3224,17 @@ struct MobileWorkspaceRoot: View {
     }
 }
 
+/// The system file picker receives only the immutable FTDC bytes.
+private struct PortableScanFile: Transferable {
+    static let contentType = UTType(exportedAs: "org.frankenterm.qr-progress")
+    let bytes: Data
+    let generation: UUID
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: contentType) { file in file.bytes }
+    }
+}
+
 @MainActor
 struct OfflineRestoreSheet: View {
     @Bindable var model: MobileWorkspaceModel
@@ -3215,6 +3242,9 @@ struct OfflineRestoreSheet: View {
     @State private var repairPage = 0
     @State private var showPageRepair = false
     @State private var chooseFile = false
+    @State private var progressExportRequest: UUID?
+    @State private var progressFile: PortableScanFile?
+    @State private var exportingProgress = false
     private enum RestoreDecision {
         case save(generation: UUID, identity: OpticalFrame.Identity, replacing: OpticalDecoderRecoveryReview?)
         case discard(SavedOpticalScan)
@@ -3390,15 +3420,40 @@ struct OfflineRestoreSheet: View {
             case .failure(let error): model.report(error)
             }
         }
+        .task(id: progressExportRequest) {
+            guard let generation = progressExportRequest else { return }
+            defer { if progressExportRequest == generation { progressExportRequest = nil } }
+            do {
+                let bytes = try await model.portableScanProgress(generation: generation)
+                try Task.checkCancellation()
+                progressFile = PortableScanFile(bytes: bytes, generation: generation)
+                exportingProgress = true
+            } catch {
+                if !Task.isCancelled, model.active, model.state?.generation == generation { model.report(error) }
+            }
+        }
+        .fileExporter(isPresented: $exportingProgress, item: progressFile,
+                      contentTypes: [PortableScanFile.contentType], defaultFilename: "FrankenTerm-Recovery") { result in
+            let generation = progressFile?.generation
+            progressFile = nil
+            guard model.active, model.showRestore, let generation, model.state?.generation == generation else { return }
+            switch result {
+            case .success:
+                model.scanProgressMessage = "QR progress saved. On your Mac, choose Open Saved Recovery in FrankenTerm Export."
+            case .failure(let error): model.report(error)
+            }
+        } onCancellation: { progressFile = nil }
         .onChange(of: model.active) { _, active in
             if !active {
                 code = ""
                 restoreDecision = nil
+                progressExportRequest = nil
             }
         }
         .onDisappear {
             code = ""; model.cameraRequested = false
-            restoreDecision = nil
+            restoreDecision = nil; progressExportRequest = nil
+            exportingProgress = false; progressFile = nil
         }
     }
 
@@ -3424,6 +3479,12 @@ struct OfflineRestoreSheet: View {
         if state.source == .optical, [.collecting, .locked, .review].contains(state.phase),
            !state.isSuspended, !state.requiresRecipientResume, let identity = state.identity {
             VStack(alignment: .leading, spacing: 10) {
+                if state.receivedParts > 0 {
+                    Button("Export QR Progress to Files…") { progressExportRequest = state.generation }
+                        .disabled(progressExportRequest != nil || exportingProgress)
+                    Text("Choose a destination for the current encrypted pieces. Open the file on a Mac or iPhone to continue recovery. Unlocking still needs the original code or matching phone request.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 if model.canRetryScanSave {
                     Label("Saving needs your attention", systemImage: "externaldrive.badge.exclamationmark").font(.headline)
                     Button("Retry Saving") { model.retryScanSave() }

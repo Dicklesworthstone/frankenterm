@@ -97,6 +97,46 @@ final class MobileOpticalRestoreTests: XCTestCase {
         return (restore, state, persistence, network, sender)
     }
 
+    func testExportedPhoneScanFinishesInMacRecoveryWithoutChangingThePhoneScan() async throws {
+        let (restore, partial, persistence, network, sender) = try await partialScan()
+        let model = MobileWorkspaceModel(restore: restore)
+        let priorBookmark = UserDefaults.standard.data(forKey: "live-screen")
+        defer {
+            model.active = false; model.showRestore = false
+            if let priorBookmark { UserDefaults.standard.set(priorBookmark, forKey: "live-screen") }
+        }
+        model.active = true; model.showRestore = true; model.state = partial
+        let bytes = try await model.portableScanProgress(generation: partial.generation)
+        let crypto = AppleCryptography()
+        var mac = OpticalRecordingRecovery()
+        try mac.resumeCheckpoint(bytes, using: crypto)
+        XCTAssertEqual(mac.progress.identity, partial.identity)
+        XCTAssertEqual(mac.progress.verifiedPages, 1)
+        XCTAssertEqual(mac.progress.receivedParts, partial.receivedParts)
+        let recording = try mac.beginRecording()
+        for sequence in 2...(try sender.sourcePartCount(page: 1)) {
+            let text = try sender.frame(page: 1, sequence: UInt32(sequence), using: crypto)
+            try mac.observe([text], recording: recording, using: crypto)
+        }
+        mac.endRecording(recording)
+        let complete = try mac.envelope(using: crypto)
+        XCTAssertEqual(crypto.sha256(complete), sender.identity.envelopeDigest)
+        XCTAssertEqual(try FTAGHeader(envelope: complete).mode, .recipient)
+        let current = await restore.status()
+        XCTAssertEqual(current.phase, .collecting)
+        XCTAssertEqual(current.receivedParts, partial.receivedParts)
+        XCTAssertEqual(current.recipientRequest, partial.recipientRequest)
+        XCTAssertFalse(model.isSavingScanProgress)
+        XCTAssertThrowsError(try network.beginConnection())
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertNil(persistence.bytes(.journal))
+
+        model.state = try await restore.resetIncompletePage(1, generation: current.generation)
+        do {
+            _ = try await model.portableScanProgress(generation: partial.generation)
+            XCTFail("A previous scan generation must not export the repaired decoder.")
+        } catch { XCTAssertEqual(error as? FTError, .stale) }
+    }
+
     func testCameraFailureOffersRetryWithoutDiscardingCiphertextOrOfflineExclusion() async throws {
         let (restore, progress, persistence, network, _) = try await partialScan()
         let model = MobileWorkspaceModel(restore: restore)
