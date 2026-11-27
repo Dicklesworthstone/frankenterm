@@ -355,8 +355,7 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
     };
 
     // Write the modified content
-    fs::write(rc_path, &new_content)
-        .map_err(|e| Error::SetupError(format!("Failed to write {}: {}", rc_path.display(), e)))?;
+    replace_file_atomically(rc_path, &new_content)?;
 
     let action = if bounds.is_some() { "Updated" } else { "Added" };
     let message = match &backup_path {
@@ -559,8 +558,7 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
 
     let new_content = format!("{}{}", &content[..start], &content[end_idx..]);
 
-    fs::write(rc_path, &new_content)
-        .map_err(|e| Error::SetupError(format!("Failed to write {}: {}", rc_path.display(), e)))?;
+    replace_file_atomically(rc_path, &new_content)?;
 
     let message = format!(
         "Removed ft-managed block from {}. Backup saved to {}",
@@ -1043,10 +1041,18 @@ fn create_ft_block() -> String {
 
 /// Create a backup of the config file
 ///
-/// Backup is named `<original>.bak.<timestamp>`
+/// Backup is named `<original>.bak.<timestamp>`, with `.1`, `.2`, ... added
+/// when that name is taken. The timestamp has one-second resolution and
+/// `fs::copy` replaces an existing file, so a second change in the same second
+/// (a patch then an unpatch, or a script running setup twice) used to
+/// overwrite the backup of the original with the already patched file. Each
+/// name is now claimed with `create_new` before the copy.
 fn create_backup(config_path: &Path) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S");
-    let backup_name = format!(
+    create_backup_at(config_path, &Utc::now().format("%Y%m%d%H%M%S").to_string())
+}
+
+fn create_backup_at(config_path: &Path, timestamp: &str) -> Result<PathBuf> {
+    let base = format!(
         "{}.bak.{}",
         config_path
             .file_name()
@@ -1054,17 +1060,96 @@ fn create_backup(config_path: &Path) -> Result<PathBuf> {
             .to_string_lossy(),
         timestamp
     );
-    let backup_path = config_path.with_file_name(backup_name);
+    for attempt in 0..1000_u32 {
+        let backup_name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}.{attempt}")
+        };
+        let backup_path = config_path.with_file_name(backup_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(Error::SetupError(format!(
+                    "Failed to create backup at {}: {}",
+                    backup_path.display(),
+                    e
+                )));
+            }
+        }
+        if let Err(e) = fs::copy(config_path, &backup_path) {
+            // Remove the empty name this call claimed, so no backup that
+            // looks complete is left behind.
+            let _ = fs::remove_file(&backup_path);
+            return Err(Error::SetupError(format!(
+                "Failed to create backup at {}: {}",
+                backup_path.display(),
+                e
+            )));
+        }
+        return Ok(backup_path);
+    }
+    Err(Error::SetupError(format!(
+        "Failed to create backup of {}: every backup name for this second is taken",
+        config_path.display()
+    )))
+}
 
-    fs::copy(config_path, &backup_path).map_err(|e| {
-        Error::SetupError(format!(
-            "Failed to create backup at {}: {}",
-            backup_path.display(),
-            e
-        ))
-    })?;
+/// Replace a user's rc or config file without ever leaving it half written.
+///
+/// `fs::write` truncates in place, so a full disk or a kill part way through
+/// left a partial `~/.bashrc` that broke every new shell. The atomic writer
+/// syncs a temporary file beside the target and renames it over, keeping the
+/// existing permission bits. It refuses symlinks, and dotfile managers
+/// symlink rc files or their directories, so the write goes to the resolved
+/// file and the links stay as they are.
+fn replace_file_atomically(path: &Path, content: &str) -> Result<()> {
+    let target = resolve_write_target(path)?;
+    // A rename needs only a writable directory, so it would replace a file
+    // made read-only to protect it, which `fs::write` refused to open.
+    if fs::metadata(&target).is_ok_and(|meta| meta.permissions().readonly()) {
+        return Err(Error::SetupError(format!(
+            "{} is read-only, so it was left unchanged",
+            path.display()
+        )));
+    }
+    crate::lock::write_file_atomic_with_policy(
+        &target,
+        content.as_bytes(),
+        crate::lock::AtomicWritePolicy::default().with_unix_mode(0o644),
+    )
+    .map(|_| ())
+    .map_err(|e| Error::SetupError(format!("Failed to write {}: {e}", path.display())))
+}
 
-    Ok(backup_path)
+/// The file a write to `path` must replace: `path` with every symlink
+/// resolved, or for a file that does not exist yet, its resolved directory
+/// joined with its name. A dangling symlink is an error, not a new file in
+/// whatever place it points to.
+fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+    let resolve_error =
+        |e: std::io::Error| Error::SetupError(format!("Failed to resolve {}: {e}", path.display()));
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() =>
+        {
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::SetupError(format!("{} has no file name", path.display())))?;
+            let parent = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            Ok(fs::canonicalize(parent).map_err(resolve_error)?.join(name))
+        }
+        Err(e) => Err(resolve_error(e)),
+    }
 }
 
 /// Idempotently patch the WezTerm config with FrankenTerm's user-var forwarding snippet.
@@ -1151,9 +1236,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     let new_content = insert_ft_block(&content, &ft_block);
 
     // Write the modified content
-    fs::write(config_path, &new_content).map_err(|e| {
-        Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
-    })?;
+    replace_file_atomically(config_path, &new_content)?;
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
@@ -1215,9 +1298,7 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
             )
         };
 
-        fs::write(config_path, &new_content).map_err(|e| {
-            Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
-        })?;
+        replace_file_atomically(config_path, &new_content)?;
 
         let backup_display = backup_path.display().to_string();
         let message = format!(
@@ -1238,9 +1319,7 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
     let new_content = insert_ft_block(&content, normalized_block);
 
-    fs::write(config_path, &new_content).map_err(|e| {
-        Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
-    })?;
+    replace_file_atomically(config_path, &new_content)?;
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
@@ -1286,9 +1365,7 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 
     let new_content = format!("{}{}", &content[..start], &content[end_idx..]);
 
-    fs::write(config_path, &new_content).map_err(|e| {
-        Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
-    })?;
+    replace_file_atomically(config_path, &new_content)?;
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
@@ -1545,13 +1622,7 @@ impl SetupWizard {
                         })?;
                     }
                 }
-                fs::write(path, &toml_str).map_err(|e| {
-                    Error::SetupError(format!(
-                        "Failed to write config to {}: {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
+                replace_file_atomically(path, &toml_str)?;
                 Some(path.to_path_buf())
             } else {
                 None
@@ -2492,6 +2563,75 @@ export PATH=$HOME/bin:$PATH
         let patched = fs::read_to_string(file.path()).unwrap();
         assert_eq!(patched.matches(FT_BEGIN_MARKER_SHELL).count(), 1);
         assert_eq!(patched.matches(FT_END_MARKER_SHELL).count(), 1);
+    }
+
+    #[test]
+    fn backups_in_the_same_second_never_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        fs::write(&rc, "original\n").unwrap();
+        let first = create_backup_at(&rc, "20261127120000").unwrap();
+        fs::write(&rc, "patched\n").unwrap();
+        let second = create_backup_at(&rc, "20261127120000").unwrap();
+        assert_eq!(fs::read_to_string(&first).unwrap(), "original\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "patched\n");
+        assert_eq!(second.file_name().unwrap(), ".bashrc.bak.20261127120000.1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_patch_writes_through_symlinks_and_keeps_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        fs::create_dir(&dotfiles).unwrap();
+        fs::create_dir_all(home.join(".config")).unwrap();
+
+        // A linked rc file: the link stays and its target gets the block.
+        let real = dotfiles.join("bashrc");
+        fs::write(&real, "export EDITOR=vim\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        let rc = home.join(".bashrc");
+        symlink(&real, &rc).unwrap();
+        assert!(patch_shell_rc_at(&rc, ShellType::Bash).unwrap().modified);
+        assert!(fs::symlink_metadata(&rc).unwrap().file_type().is_symlink());
+        let patched = fs::read_to_string(&real).unwrap();
+        assert!(patched.starts_with("export EDITOR=vim\n"));
+        assert_eq!(patched.matches(FT_BEGIN_MARKER_SHELL).count(), 1);
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        // A linked directory, as dotfile managers often do for fish.
+        let fish_dir = dotfiles.join("fish");
+        fs::create_dir(&fish_dir).unwrap();
+        fs::write(fish_dir.join("config.fish"), "set -gx EDITOR vim\n").unwrap();
+        symlink(&fish_dir, home.join(".config/fish")).unwrap();
+        let fish_rc = home.join(".config/fish/config.fish");
+        assert!(
+            patch_shell_rc_at(&fish_rc, ShellType::Fish)
+                .unwrap()
+                .modified
+        );
+        let linked = fs::symlink_metadata(home.join(".config/fish")).unwrap();
+        assert!(linked.file_type().is_symlink());
+        let patched = fs::read_to_string(fish_dir.join("config.fish")).unwrap();
+        assert_eq!(patched.matches(FT_BEGIN_MARKER_SHELL).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_patch_leaves_a_read_only_rc_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        fs::write(&rc, "export EDITOR=vim\n").unwrap();
+        fs::set_permissions(&rc, fs::Permissions::from_mode(0o444)).unwrap();
+        let error = patch_shell_rc_at(&rc, ShellType::Zsh).unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(fs::read_to_string(&rc).unwrap(), "export EDITOR=vim\n");
     }
 
     #[test]
