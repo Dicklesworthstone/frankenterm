@@ -47,6 +47,7 @@ pub(crate) struct FcpDeliverySession {
     poll_cursor: usize,
     pending_admission: Option<(i64, Vec<crate::connector_reliability::ConnectorOutboxEntry>)>,
     kill_switch_freshness: crate::policy_kill_switch_state::KillSwitchFreshness,
+    lifecycle_state_observed: bool,
     dispatch_cursor: Option<(i64, String)>,
     dispatch_scanned: usize,
 }
@@ -119,6 +120,7 @@ impl FcpDeliverySession {
             poll_cursor: 0,
             pending_admission: None,
             kill_switch_freshness: Default::default(),
+            lifecycle_state_observed: false,
             dispatch_cursor: None,
             dispatch_scanned: 0,
         })
@@ -172,6 +174,69 @@ impl FcpDeliverySession {
         {
             return Err(FcpDeliveryError::State("connector_kill_switch_paused"));
         }
+        Ok(fence)
+    }
+
+    /// Bind every provider request to the current administrative inventory as
+    /// well as the global stop state. The CLI holds this same workspace fence
+    /// from its lifecycle read through persistence, so an acknowledged disable
+    /// cannot be overtaken by an invocation admitted from an older snapshot.
+    ///
+    /// A workspace without a lifecycle snapshot uses its explicit transport
+    /// configuration. Once present, the snapshot is authoritative: unknown or
+    /// non-runnable identities pause, and corrupt or disappearing authority
+    /// refuses effects. Queue admission remains separate so enable can resume
+    /// already-admitted work without changing its identity or replaying sends.
+    async fn fence_connector_effect(
+        &mut self,
+        cx: &crate::cx::Cx,
+        action: crate::policy::ActionKind,
+        operation: &FcpOperation,
+    ) -> DeliveryResult<crate::policy_kill_switch_state::KillSwitchFence> {
+        use crate::robot_connector_handler::{
+            CONNECTOR_LIFECYCLE_STATE_KEY, decode_connector_state,
+        };
+
+        let fence = self.fence_transport_effect(cx, action).await?;
+        let raw = self
+            .storage
+            .get_config_value_with_cx(cx, CONNECTOR_LIFECYCLE_STATE_KEY)
+            .await
+            .map_err(|_| FcpDeliveryError::State("connector_lifecycle_state_unavailable"))?;
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
+        let Some(raw) = raw else {
+            return if self.lifecycle_state_observed {
+                Err(FcpDeliveryError::State(
+                    "connector_lifecycle_state_unavailable",
+                ))
+            } else {
+                Ok(fence)
+            };
+        };
+        self.lifecycle_state_observed = true;
+        let connectors = decode_connector_state(&raw)
+            .map_err(|_| FcpDeliveryError::State("connector_lifecycle_state_unavailable"))?;
+        let runnable = connectors
+            .iter()
+            .find(|connector| connector.connector_id == operation.connector_id)
+            .is_some_and(|connector| {
+                connector.admin_state.can_start()
+                    && connector.trust_level.allows_install()
+                    && connector.granted_capabilities.contains(&operation.capability)
+                    // Install/enable records Stopped; restart records Starting.
+                    // These may proceed to independent host health discovery,
+                    // while known degraded/failed state requires recovery.
+                    && matches!(
+                        connector.runtime_phase,
+                        ConnectorLifecyclePhase::Stopped
+                            | ConnectorLifecyclePhase::Starting
+                            | ConnectorLifecyclePhase::Running
+                    )
+            });
+        if !runnable {
+            return Err(FcpDeliveryError::State("connector_lifecycle_paused"));
+        }
+        cx.checkpoint().map_err(|_| FcpTransportError::Cancelled)?;
         Ok(fence)
     }
 
@@ -549,11 +614,13 @@ impl FcpDeliverySession {
                 continue;
             }
             let effect_fence = match self
-                .fence_transport_effect(cx, entry.action_kind.policy_action())
+                .fence_connector_effect(cx, entry.action_kind.policy_action(), &entry.invoke)
                 .await
             {
                 Ok(fence) => fence,
-                Err(FcpDeliveryError::State("connector_kill_switch_paused")) => continue,
+                Err(FcpDeliveryError::State(
+                    "connector_kill_switch_paused" | "connector_lifecycle_paused",
+                )) => continue,
                 Err(error) => return Err(error),
             };
             let deadline = self.client.operation_deadline()?;
@@ -680,12 +747,15 @@ impl FcpDeliverySession {
         use crate::connector_reliability::{
             ConnectorStorageMutation as Mutation, ConnectorStorageOutcome as Outcome,
         };
+        let mut operation = self.config.inbound[index].invoke.clone();
         let effect_fence = match self
-            .fence_transport_effect(cx, crate::policy::ActionKind::ReadOutput)
+            .fence_connector_effect(cx, crate::policy::ActionKind::ReadOutput, &operation)
             .await
         {
             Ok(fence) => fence,
-            Err(FcpDeliveryError::State("connector_kill_switch_paused")) => return Ok(()),
+            Err(FcpDeliveryError::State(
+                "connector_kill_switch_paused" | "connector_lifecycle_paused",
+            )) => return Ok(()),
             Err(error) => return Err(error),
         };
         let subscription = &self.config.inbound[index];
@@ -697,7 +767,6 @@ impl FcpDeliverySession {
             .storage
             .connector_ingress_cursor_with_cx(cx, &key)
             .await?;
-        let mut operation = subscription.invoke.clone();
         *operation
             .input
             .pointer_mut(&subscription.cursor_input_pointer)
@@ -2850,6 +2919,67 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn delivery_lifecycle_fixture_engine() -> crate::policy::PolicyEngine {
+        use crate::robot_connector_handler::{
+            ConnectorAction, ConnectorActionOutcome, handle_connector_action,
+        };
+
+        let mut engine = crate::policy::PolicyEngine::permissive();
+        let installed = handle_connector_action(
+            &mut engine,
+            ConnectorAction::Install {
+                manifest: Box::new(crate::connector_registry::ConnectorManifest {
+                    schema_version: 1,
+                    package_id: "fcp.sqlite".into(),
+                    version: "1.0.0".into(),
+                    display_name: "Delivery fixture".into(),
+                    description: "test connector".into(),
+                    author: "test-publisher".into(),
+                    min_ft_version: None,
+                    sha256_digest: "a".repeat(64),
+                    required_capabilities: vec![ConnectorCapability::ReadState],
+                    publisher_signature: Some("test-signature".into()),
+                    transparency_token: None,
+                    created_at_ms: 1_000,
+                    metadata: Default::default(),
+                }),
+                dry_run: false,
+            },
+            1_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            installed,
+            ConnectorActionOutcome::Mutated(result) if result.success
+        ));
+        engine
+    }
+
+    #[cfg(unix)]
+    async fn persist_delivery_fixture_lifecycle(
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        connectors: &[crate::connector_lifecycle::ManagedConnector],
+    ) {
+        use crate::robot_connector_handler::{
+            CONNECTOR_LIFECYCLE_STATE_KEY, encode_connector_state,
+        };
+
+        let _fence = crate::policy_kill_switch_state::acquire_kill_switch_fence(
+            std::path::Path::new(storage.db_path()),
+        )
+        .unwrap();
+        storage
+            .set_config_value_with_cx(
+                cx,
+                CONNECTOR_LIFECYCLE_STATE_KEY,
+                &encode_connector_state(connectors).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn delivery_sessions_reconcile_admission_conflicts_without_replacing_committed_plans() {
         use crate::connector_reliability::ConnectorDeliveryState as State;
@@ -3369,6 +3499,248 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn delivery_session_live_disable_pauses_queued_work_and_ingress_until_enable() {
+        use crate::connector_reliability::ConnectorDeliveryState as State;
+        use crate::robot_connector_handler::{
+            ConnectorAction, ConnectorActionOutcome, handle_connector_action,
+        };
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, safety, storage, mut session) =
+                delivery_session_fixture(&endpoint, 100).await;
+            let cx = crate::cx::for_request();
+            record_delivery_fixture_event(&storage).await;
+            session.admit_events(&cx).await.unwrap();
+            let admitted = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0].state, State::Admitted);
+
+            // Use the actual operator handler after the transport has started
+            // and queued work. Only its durable snapshot grants authority.
+            let mut engine = delivery_lifecycle_fixture_engine();
+            let disabled = handle_connector_action(
+                &mut engine,
+                ConnectorAction::Disable {
+                    connector_id: "fcp.sqlite".into(),
+                    reason: "maintenance".into(),
+                    dry_run: false,
+                },
+                2_000,
+            )
+            .unwrap();
+            assert!(matches!(
+                disabled,
+                ConnectorActionOutcome::Mutated(result) if result.success
+            ));
+            persist_delivery_fixture_lifecycle(
+                &cx,
+                &storage,
+                &engine.lifecycle_manager().managed_connectors(),
+            )
+            .await;
+            session.dispatch_pending(&cx).await.unwrap();
+            session.poll_ingress(&cx, 0).await.unwrap();
+
+            // A watcher restart cannot turn a persisted disable into traffic.
+            let mut restarted = FcpDeliverySession::open(
+                &cx,
+                &safety,
+                storage.clone(),
+                std::sync::Arc::new(crate::events::EventBus::new(8)),
+            )
+            .await
+            .unwrap();
+            restarted.dispatch_pending(&cx).await.unwrap();
+            restarted.poll_ingress(&cx, 0).await.unwrap();
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            let paused = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&paused).unwrap(),
+                serde_json::to_value(&admitted).unwrap(),
+                "a lifecycle pause must preserve the admitted effect and its revision",
+            );
+
+            let enabled = handle_connector_action(
+                &mut engine,
+                ConnectorAction::Enable {
+                    connector_id: "fcp.sqlite".into(),
+                    dry_run: false,
+                },
+                3_000,
+            )
+            .unwrap();
+            assert!(matches!(
+                enabled,
+                ConnectorActionOutcome::Mutated(result) if result.success
+            ));
+            persist_delivery_fixture_lifecycle(
+                &cx,
+                &storage,
+                &engine.lifecycle_manager().managed_connectors(),
+            )
+            .await;
+            // The deliberately silent endpoint is a positive control: enabling
+            // resumes real discovery, while no invocation can complete here.
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(listener.accept().is_ok(), "enable must resume preflight");
+            assert!(restarted.poll_ingress(&cx, 0).await.is_err());
+            assert!(listener.accept().is_ok(), "enable must resume polling");
+            let resumed = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(resumed[0].key, admitted[0].key);
+            assert_eq!(resumed[0].invoke.input, admitted[0].invoke.input);
+            assert_eq!(resumed[0].state, State::Admitted);
+            assert!(resumed[0].revision > admitted[0].revision);
+            drop(restarted);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_session_lifecycle_inventory_fails_closed_before_provider_io() {
+        use crate::connector_lifecycle::AdminState;
+        use crate::connector_registry::TrustLevel;
+        use crate::robot_connector_handler::{
+            CONNECTOR_LIFECYCLE_STATE_KEY, encode_connector_state,
+        };
+
+        crate::storage::run_storage_async_test(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let (_temp, _safety, storage, mut session) =
+                delivery_session_fixture(&endpoint, 100).await;
+            let cx = crate::cx::for_request();
+            record_delivery_fixture_event(&storage).await;
+            session.admit_events(&cx).await.unwrap();
+            let admitted = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            let engine = delivery_lifecycle_fixture_engine();
+            let installed = engine.lifecycle_manager().managed_connectors();
+            let mut blocked = Vec::new();
+            for admin_state in [
+                AdminState::Disabled,
+                AdminState::Upgrading,
+                AdminState::Uninstalling,
+            ] {
+                let mut connector = installed[0].clone();
+                connector.admin_state = admin_state;
+                blocked.push(vec![connector]);
+            }
+            for runtime_phase in [
+                ConnectorLifecyclePhase::Degraded,
+                ConnectorLifecyclePhase::Failed,
+            ] {
+                let mut connector = installed[0].clone();
+                connector.runtime_phase = runtime_phase;
+                blocked.push(vec![connector]);
+            }
+            for trust_level in [TrustLevel::Untrusted, TrustLevel::Blocked] {
+                let mut connector = installed[0].clone();
+                connector.trust_level = trust_level;
+                blocked.push(vec![connector]);
+            }
+            let mut revoked = installed[0].clone();
+            revoked.granted_capabilities = vec![ConnectorCapability::Invoke];
+            blocked.push(vec![revoked]);
+            let mut unrelated = installed[0].clone();
+            unrelated.connector_id = "fcp.other".into();
+            blocked.push(vec![unrelated]);
+            blocked.push(Vec::new());
+            for connectors in blocked {
+                persist_delivery_fixture_lifecycle(&cx, &storage, &connectors).await;
+                session.dispatch_pending(&cx).await.unwrap();
+                session.poll_ingress(&cx, 0).await.unwrap();
+            }
+
+            let duplicate =
+                encode_connector_state(&[installed[0].clone(), installed[0].clone()]).unwrap();
+            for invalid in ["{broken", duplicate.as_str()] {
+                storage
+                    .set_config_value_with_cx(&cx, CONNECTOR_LIFECYCLE_STATE_KEY, invalid)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    session.dispatch_pending(&cx).await,
+                    Err(FcpDeliveryError::State(
+                        "connector_lifecycle_state_unavailable"
+                    ))
+                ));
+                assert!(matches!(
+                    session.poll_ingress(&cx, 0).await,
+                    Err(FcpDeliveryError::State(
+                        "connector_lifecycle_state_unavailable"
+                    ))
+                ));
+            }
+            // Removing previously observed authority cannot re-enable the
+            // configuration-only path within a running transport owner.
+            let backend = crate::storage_backend_trait::RusqliteBackend::open(
+                storage.db_path(),
+                &crate::storage_backend_trait::OpenConfig {
+                    wal_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            use crate::storage_backend_trait::StorageBackend as _;
+            backend
+                .execute_batch("DELETE FROM config WHERE key = 'connector_lifecycle_state_v1'")
+                .unwrap();
+            assert!(matches!(
+                session.dispatch_pending(&cx).await,
+                Err(FcpDeliveryError::State(
+                    "connector_lifecycle_state_unavailable"
+                ))
+            ));
+            assert!(matches!(
+                session.poll_ingress(&cx, 0).await,
+                Err(FcpDeliveryError::State(
+                    "connector_lifecycle_state_unavailable"
+                ))
+            ));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            let refused = storage
+                .get_connector_outbox_with_cx(&cx, &session.generation, false, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&refused).unwrap(),
+                serde_json::to_value(&admitted).unwrap(),
+            );
+
+            persist_delivery_fixture_lifecycle(&cx, &storage, &installed).await;
+            session.dispatch_pending(&cx).await.unwrap();
+            assert!(listener.accept().is_ok(), "repaired authority must recover");
+            drop(backend);
+            drop(session);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn delivery_session_live_stop_preserves_work_and_reset_resumes_preflight() {
         use crate::connector_reliability::ConnectorDeliveryState as State;
         use crate::policy::ActionKind;
@@ -3669,6 +4041,14 @@ mod tests {
             let endpoint = format!("http://{}/", listener.local_addr().unwrap());
             let (_temp, safety, storage, mut session) =
                 delivery_session_fixture(&endpoint, 5_000).await;
+            let cx = crate::cx::for_request();
+            let lifecycle = delivery_lifecycle_fixture_engine();
+            persist_delivery_fixture_lifecycle(
+                &cx,
+                &storage,
+                &lifecycle.lifecycle_manager().managed_connectors(),
+            )
+            .await;
             let config = safety.connector_transport.as_ref().unwrap();
             for (path, bytes) in [
                 (
@@ -3825,7 +4205,6 @@ mod tests {
                 observed
             });
 
-            let cx = crate::cx::for_request();
             record_delivery_fixture_event(&storage).await;
             session.admit_events(&cx).await.unwrap();
             let result = session.dispatch_pending(&cx).await;
