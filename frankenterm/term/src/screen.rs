@@ -7387,28 +7387,43 @@ impl Screen {
         let limit = self
             .physical_rows
             .saturating_add(self.hot_scrollback_size());
+        let excess = self.lines.len().saturating_sub(limit);
+        if excess == 0 {
+            return DeferredScrollbackTrim::Settled { moved: false };
+        }
         let mut moved = 0usize;
         let mut columns = 0usize;
-        while self.lines.len() > limit {
-            let next_columns = self.lines.front().map_or(0, |line| line.len().max(1));
-            if moved > 0
-                && (moved >= MAX_ROWS || next_columns > MAX_COLUMNS.saturating_sub(columns))
-            {
-                return DeferredScrollbackTrim::Yielded;
+        let result = loop {
+            if moved == excess {
+                break DeferredScrollbackTrim::Settled { moved: true };
             }
-            let Some(line) = self.lines.pop_front() else {
-                break;
-            };
-            let stable_row = self.stable_row_index_for_removed_top(0);
-            if !self.record_scrollback_spill(stable_row, &line, seqno) {
-                self.lines.push_front(line);
-                return DeferredScrollbackTrim::AdmissionBlocked { moved: moved > 0 };
+            if moved == MAX_ROWS {
+                break DeferredScrollbackTrim::Yielded;
             }
-            self.advance_stable_row_index_offset(1);
+            let width = self
+                .lines
+                .page()
+                .map_or_else(|| self.lines[moved].len(), |rows| rows.row_len(moved))
+                .max(1);
+            if moved > 0 && width > MAX_COLUMNS.saturating_sub(columns) {
+                break DeferredScrollbackTrim::Yielded;
+            }
+            let line = self.lines[moved].clone_content();
+            let stable_row = self.stable_row_index_for_removed_top(moved);
+            // The prior pop-then-offer path counted the offered row in this
+            // retention estimate. Offer first and keep refused rows in place.
+            let rows_left = self.lines.len() - moved;
+            if !self.record_scrollback_spill_leaving(stable_row, &line, seqno, rows_left) {
+                break DeferredScrollbackTrim::AdmissionBlocked { moved: moved > 0 };
+            }
             moved += 1;
-            columns = columns.saturating_add(line.len().max(1));
+            columns = columns.saturating_add(width);
+        };
+        if moved > 0 {
+            self.lines.discard_prefix(moved);
+            self.advance_stable_row_index_offset(moved);
         }
-        DeferredScrollbackTrim::Settled { moved: moved > 0 }
+        result
     }
 
     /// Force all warm-tier residency into cold-tier accounting.
@@ -18063,6 +18078,86 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn deferred_page_trim_retries_the_first_refused_row_without_converting_the_grid() {
+        let sink = Arc::new(TestColdScrollbackSink {
+            requires_flush: true,
+            refuse_from: Some(3),
+            ..TestColdScrollbackSink::default()
+        });
+        let mut screen = test_screen_with_config(
+            1,
+            16,
+            96,
+            TestTermConfig {
+                scrollback: 100,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                grid_engine: Some(GridEngine::Page),
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.lines.truncate_for_resize(0);
+        for row in 0..24 {
+            screen.lines.push_for_resize(Line::from_text(
+                &format!("row-{row}"),
+                &CellAttributes::blank(),
+                1,
+                None,
+            ));
+        }
+        screen.lines[3] = Line::from_text(
+            "edited beyond the page width",
+            &CellAttributes::blank(),
+            2,
+            None,
+        );
+        sink.refuse_admission.store(true, Ordering::Relaxed);
+        assert_eq!(
+            screen.trim_deferred_scrollback(3),
+            DeferredScrollbackTrim::AdmissionBlocked { moved: true }
+        );
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        assert_eq!(screen.stable_row_index_offset, 3);
+        assert_eq!(screen.lines[0].as_str(), "edited beyond the page width");
+        assert_eq!(screen.cached_page_views(), 1);
+        assert_eq!(
+            screen.trim_deferred_scrollback(4),
+            DeferredScrollbackTrim::AdmissionBlocked { moved: false }
+        );
+        assert_eq!(sink.rows.lock().unwrap().len(), 3);
+        sink.refuse_admission.store(false, Ordering::Relaxed);
+        assert_eq!(
+            screen.trim_deferred_scrollback(5),
+            DeferredScrollbackTrim::Yielded
+        );
+        assert_eq!(screen.stable_row_index_offset, 19);
+        assert_eq!(
+            screen.trim_deferred_scrollback(6),
+            DeferredScrollbackTrim::Settled { moved: true }
+        );
+        assert_eq!(screen.cached_page_views(), 0);
+        assert_eq!(screen.lines.len(), 2);
+        assert_eq!(screen.stable_row_index_offset, 22);
+        let list = screen.lines.page().expect("trim retained PageGrid").list();
+        assert_eq!(list.first_stable(), 22);
+        list.check_invariants().unwrap();
+        assert_eq!(sink.revision.load(Ordering::Relaxed), 22);
+        let stored = sink.rows.lock().unwrap();
+        for row in 0..22 {
+            let expected = if row == 3 {
+                "edited beyond the page width".into()
+            } else {
+                format!("row-{row}")
+            };
+            assert_eq!(stored[&row].as_str(), expected);
+        }
+    }
+
+    #[test]
     fn deferred_trim_bounds_geometry_slices_and_preserves_refused_rows() {
         for cols in [80, 1024, 4096] {
             let sink = Arc::new(TestColdScrollbackSink {
@@ -18148,6 +18243,7 @@ pub(crate) mod tests {
         single_reads: AtomicU64,
         force_busy_probe: AtomicBool,
         refuse_admission: AtomicBool,
+        refuse_from: Option<StableRowIndex>,
         omit_admission_receipt: AtomicBool,
         fail_clear: AtomicBool,
         fail_replace: AtomicBool,
@@ -18221,7 +18317,10 @@ pub(crate) mod tests {
             max_retained_rows: usize,
         ) -> crate::config::ScrollbackLineAdmission {
             use crate::config::ScrollbackLineAdmission;
-            if max_retained_rows == 0 || self.refuse_admission.load(Ordering::Relaxed) {
+            if max_retained_rows == 0
+                || (self.refuse_admission.load(Ordering::Relaxed)
+                    && self.refuse_from.is_none_or(|first| stable_row >= first))
+            {
                 return ScrollbackLineAdmission::Refused;
             }
 
