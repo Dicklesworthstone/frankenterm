@@ -161,6 +161,79 @@ fn complete_graphemes_styles_wide_continuations_and_reference_ids_round_trip() {
 }
 
 #[test]
+fn state_only_deltas_preserve_snapshot_and_resource_bounds() {
+    let mut patch = wide_patch();
+    patch.lines = BoundedVec::new();
+    patch.hyperlinks = BoundedVec::new();
+    patch.cursor.column = 1;
+    let delta = Delta {
+        scope: scope(),
+        base_sequence: WireU64(10),
+        sequence: WireU64(11),
+        modes: modes(),
+        patch: patch.clone(),
+    };
+    let state_frame = frame(ServerMessage::Delta(delta.clone()));
+    let bytes = encode_server(&state_frame).unwrap();
+    assert_eq!(decode_server(&bytes).unwrap(), state_frame);
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"lines\":[]")
+    );
+
+    assert_eq!(patch.validate(), Err(WireError::InvalidBounds));
+    assert_eq!(
+        ServerMessage::SnapshotChunk(SnapshotChunk {
+            scope: scope(),
+            snapshot_id: WireU64(1),
+            sequence: WireU64(11),
+            index: 0,
+            chunks: 1,
+            patch,
+        })
+        .validate(),
+        Err(WireError::InvalidBounds),
+        "state-only support must not admit an empty snapshot chunk"
+    );
+
+    let mut invalid = delta.clone();
+    invalid.patch.cursor.column = invalid.patch.dimensions.columns;
+    assert_eq!(
+        ServerMessage::Delta(invalid).validate(),
+        Err(WireError::InvalidBounds)
+    );
+    let mut invalid = delta.clone();
+    invalid.patch.hyperlinks = wide_patch().hyperlinks;
+    assert_eq!(
+        ServerMessage::Delta(invalid).validate(),
+        Err(WireError::InvalidState),
+        "a state-only update cannot introduce unreferenced hyperlinks"
+    );
+    let mut invalid = delta.clone();
+    invalid.patch.images = vec![ImageReference {
+        id: WireU64(1),
+        digest: Sha256::new(&"a".repeat(64)).unwrap(),
+        pixel_width: 1,
+        pixel_height: 1,
+        media_type: Text::new("image/png").unwrap(),
+    }]
+    .try_into()
+    .unwrap();
+    assert_eq!(
+        ServerMessage::Delta(invalid).validate(),
+        Err(WireError::InvalidState),
+        "a state-only update cannot introduce unreferenced images"
+    );
+    let mut invalid = delta;
+    invalid.sequence = WireU64(12);
+    assert_eq!(
+        ServerMessage::Delta(invalid).validate(),
+        Err(WireError::StaleSequence)
+    );
+}
+
+#[test]
 fn snapshot_declarations_reject_impossible_totals_without_allocating_a_screen() {
     let snapshot = SnapshotStart {
         scope: scope(),

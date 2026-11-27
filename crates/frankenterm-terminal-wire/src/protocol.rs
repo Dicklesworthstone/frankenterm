@@ -18,6 +18,8 @@ macro_rules! record {
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     TerminalState,
+    /// Opt in to rowless cursor/mode deltas, in addition to TerminalState.
+    StateDeltas,
     Input,
     Resize,
     Control,
@@ -531,10 +533,24 @@ impl GridPatch {
     }
 
     pub fn validate(&self) -> Result<(), WireError> {
+        self.validate_rows(false)
+    }
+
+    /// Deltas can update cursor/modes without retransmitting unchanged rows.
+    /// Snapshot chunks remain nonempty, and a rowless delta cannot introduce
+    /// resources that no cell in this publication references.
+    fn validate_delta(&self) -> Result<(), WireError> {
+        self.validate_rows(true)
+    }
+
+    fn validate_rows(&self, allow_empty: bool) -> Result<(), WireError> {
         self.dimensions.validate()?;
         validate_cursor(&self.cursor, &self.dimensions)?;
-        if self.lines.is_empty() || self.cell_count() > MAX_CHUNK_CELLS {
+        if (!allow_empty && self.lines.is_empty()) || self.cell_count() > MAX_CHUNK_CELLS {
             return Err(WireError::InvalidBounds);
+        }
+        if self.lines.is_empty() && (!self.hyperlinks.is_empty() || !self.images.is_empty()) {
+            return Err(WireError::InvalidState);
         }
         for (index, link) in self.hyperlinks.as_slice().iter().enumerate() {
             if link.id.0 == 0
@@ -859,7 +875,7 @@ impl ServerMessage {
                 if value.sequence != value.base_sequence.next()? {
                     return Err(WireError::StaleSequence);
                 }
-                value.patch.validate()?;
+                value.patch.validate_delta()?;
             }
             Self::InputReceipt(value) => {
                 if value.effect.lease_fence.0 == 0

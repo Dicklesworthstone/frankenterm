@@ -109,6 +109,37 @@ fn bytes(message: ServerMessage) -> Vec<u8> {
     encode_server(&ServerFrame::new(Some(id("session")), message).unwrap()).unwrap()
 }
 
+fn state_delta(scope: &Scope, dimensions: &Dimensions, base: u64) -> Delta {
+    Delta {
+        scope: scope.clone(),
+        base_sequence: WireU64(base),
+        sequence: WireU64(base).next().unwrap(),
+        modes: modes(),
+        patch: GridPatch {
+            dimensions: dimensions.clone(),
+            cursor: cursor(),
+            lines: BoundedVec::new(),
+            hyperlinks: BoundedVec::new(),
+            images: BoundedVec::new(),
+        },
+    }
+}
+
+fn title_event(scope: &Scope, title: &str) -> ServerMessage {
+    ServerMessage::PaneEvent(PaneEvent {
+        scope: scope.clone(),
+        event: PaneEventKind::TitleChanged,
+        title: Some(Text::new(title).unwrap()),
+        dimensions: None,
+    })
+}
+
+fn screen_title(client: &TerminalClient, scope: &Scope) -> String {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&client.screen_metadata_json(&json(scope)).unwrap()).unwrap();
+    metadata["title"].as_str().unwrap().to_owned()
+}
+
 struct Fixture {
     server: ServerSession,
     client: TerminalClient,
@@ -121,6 +152,7 @@ impl Fixture {
         let dimensions = dims(columns, rows);
         let caps = Capabilities::try_from(vec![
             Capability::TerminalState,
+            Capability::StateDeltas,
             Capability::ResourceReferences,
             Capability::Control,
             Capability::Input,
@@ -679,6 +711,338 @@ fn delta_preserves_untouched_rows_and_reclaims_only_unused_resources() {
             .take_applied_ack(&json(&fixture.scope))
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn cursor_and_mode_deltas_preserve_rich_rows_and_ack_exact_sequence() {
+    let mut fixture = Fixture::new(4, 2);
+    let mut snapshot = frozen(&fixture.scope, &fixture.dimensions, 1, 9);
+    snapshot.lines = BoundedVec::try_from(vec![
+        line(0, 4, "e\u{301}", Some(1)),
+        line(1, 4, "Ω", Some(2)),
+    ])
+    .unwrap();
+    snapshot.hyperlinks = BoundedVec::try_from(vec![link(1, "one"), link(2, "two")]).unwrap();
+    let frames = fixture
+        .server
+        .encode_snapshot(snapshot)
+        .unwrap()
+        .into_frames();
+    fixture.apply(&frames, 0);
+    fixture
+        .server
+        .record_delivery(&fixture.scope, WireU64(0), WireU64(9))
+        .unwrap();
+    let initial_ack = fixture
+        .client
+        .take_applied_ack(&json(&fixture.scope))
+        .unwrap()
+        .unwrap();
+    fixture.server.decode_request(&initial_ack).unwrap();
+    let before = fixture.text();
+    let rows = fixture
+        .client
+        .model()
+        .screen(&fixture.scope)
+        .unwrap()
+        .unwrap()
+        .lines()
+        .to_vec();
+
+    let mut delta = state_delta(&fixture.scope, &fixture.dimensions, 9);
+    delta.patch.cursor.column = 3;
+    delta.patch.cursor.row = 1;
+    delta.patch.cursor.visible = false;
+    delta.patch.cursor.blink = true;
+    delta.patch.cursor.shape = CursorShape::Block;
+    let cursor_bytes = fixture
+        .server
+        .encode_response(ServerMessage::Delta(delta.clone()))
+        .unwrap();
+    assert_eq!(
+        fixture.client.ingest_server(&cursor_bytes, 1).unwrap(),
+        ApplyOutcome::Applied {
+            scope: fixture.scope.clone(),
+            sequence: WireU64(10)
+        }
+    );
+    fixture
+        .server
+        .record_delivery(&fixture.scope, WireU64(9), WireU64(10))
+        .unwrap();
+    let ack = fixture
+        .client
+        .take_applied_ack(&json(&fixture.scope))
+        .unwrap()
+        .unwrap();
+    let ClientMessage::AppliedAck(ack) = fixture.server.decode_request(&ack).unwrap().message
+    else {
+        panic!("applied ack");
+    };
+    assert_eq!(ack.sequence, WireU64(10));
+    assert!(matches!(
+        fixture.client.ingest_server(&cursor_bytes, 2).unwrap(),
+        ApplyOutcome::Duplicate {
+            sequence: WireU64(10),
+            ..
+        }
+    ));
+    assert!(
+        fixture
+            .client
+            .take_applied_ack(&json(&fixture.scope))
+            .unwrap()
+            .is_none()
+    );
+
+    delta.base_sequence = WireU64(10);
+    delta.sequence = WireU64(11);
+    delta.modes.mouse_tracking = true;
+    delta.modes.bracketed_paste = false;
+    let mode_bytes = fixture
+        .server
+        .encode_response(ServerMessage::Delta(delta.clone()))
+        .unwrap();
+    fixture.client.ingest_server(&mode_bytes, 3).unwrap();
+    fixture
+        .server
+        .record_delivery(&fixture.scope, WireU64(10), WireU64(11))
+        .unwrap();
+    let screen = fixture
+        .client
+        .model()
+        .screen(&fixture.scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(screen.sequence(), WireU64(11));
+    assert_eq!(screen.cursor(), &delta.patch.cursor);
+    assert_eq!(screen.modes(), &delta.modes);
+    assert_eq!(screen.lines(), rows.as_slice());
+    assert_eq!(screen.hyperlinks().get(&1), Some(&link(1, "one")));
+    assert_eq!(screen.hyperlinks().get(&2), Some(&link(2, "two")));
+    assert_eq!(fixture.text(), before);
+    let ack = fixture
+        .client
+        .take_applied_ack(&json(&fixture.scope))
+        .unwrap()
+        .unwrap();
+    let ClientMessage::AppliedAck(ack) = fixture.server.decode_request(&ack).unwrap().message
+    else {
+        panic!("applied ack");
+    };
+    assert_eq!(ack.sequence, WireU64(11));
+}
+
+#[test]
+fn state_only_deltas_require_a_complete_contiguous_matching_baseline() {
+    for scenario in ["missing", "gap", "alternate", "no_op", "pending"] {
+        let mut fixture = Fixture::new(2, 2);
+        if scenario != "missing" {
+            let frames = fixture.publish(1, 10);
+            fixture.apply(&frames, 0);
+            fixture
+                .client
+                .take_applied_ack(&json(&fixture.scope))
+                .unwrap();
+        }
+        if scenario == "pending" {
+            let frames = fixture.publish(2, 12);
+            fixture.client.ingest_server(&frames[0], 1).unwrap();
+        }
+        let before = fixture
+            .client
+            .screen_metadata_json(&json(&fixture.scope))
+            .unwrap();
+        let mut delta = state_delta(&fixture.scope, &fixture.dimensions, 10);
+        delta.patch.cursor.column = 1;
+        let expected = match scenario {
+            "missing" => WireError::SnapshotIncomplete,
+            "gap" => {
+                delta.base_sequence = WireU64(11);
+                delta.sequence = WireU64(12);
+                WireError::StaleSequence
+            }
+            "alternate" => {
+                delta.modes.alternate_screen = true;
+                WireError::StaleScope
+            }
+            "no_op" => {
+                delta.patch.cursor = cursor();
+                WireError::InvalidState
+            }
+            "pending" => WireError::StaleSequence,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            fixture
+                .client
+                .ingest_server(&bytes(ServerMessage::Delta(delta)), 2),
+            Err(expected),
+            "{scenario}"
+        );
+        let old: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let current: serde_json::Value = serde_json::from_str(
+            &fixture
+                .client
+                .screen_metadata_json(&json(&fixture.scope))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            current["applied_sequence"], old["applied_sequence"],
+            "{scenario}"
+        );
+        assert_eq!(current["cursor"], old["cursor"], "{scenario}");
+        assert_eq!(current["modes"], old["modes"], "{scenario}");
+        assert!(
+            fixture
+                .client
+                .take_applied_ack(&json(&fixture.scope))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .client
+                .take_recovery_request(&json(&fixture.scope), "recover", 3)
+                .unwrap()
+                .is_some(),
+            "{scenario} must retain a bounded recovery path"
+        );
+        let recovered = fixture.publish(3, 13);
+        fixture.apply(&recovered, 4);
+        assert_eq!(
+            fixture
+                .client
+                .model()
+                .applied_sequence(&fixture.scope)
+                .unwrap(),
+            Some(WireU64(13))
+        );
+        assert!(
+            fixture
+                .client
+                .model()
+                .recovery_reason(&fixture.scope)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn title_events_update_live_metadata_and_survive_an_inflight_snapshot() {
+    let mut fixture = Fixture::new(4, 65);
+    let initial = fixture.publish(1, 10);
+    fixture.apply(&initial, 0);
+    fixture
+        .client
+        .take_applied_ack(&json(&fixture.scope))
+        .unwrap();
+    let before = fixture.text();
+    fixture
+        .client
+        .ingest_server(&bytes(title_event(&fixture.scope, "working 🦀")), 1)
+        .unwrap();
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "working 🦀");
+    assert_eq!(
+        fixture
+            .client
+            .model()
+            .applied_sequence(&fixture.scope)
+            .unwrap(),
+        Some(WireU64(10))
+    );
+    assert!(
+        fixture
+            .client
+            .take_applied_ack(&json(&fixture.scope))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.text(), before);
+
+    let next = fixture.publish(2, 11);
+    fixture.client.ingest_server(&next[0], 2).unwrap();
+    fixture.client.ingest_server(&next[1], 3).unwrap();
+    for (tick, title) in [(4, "compiling \"demo\" 🦀"), (5, "ready")] {
+        fixture
+            .client
+            .ingest_server(&bytes(title_event(&fixture.scope, title)), tick)
+            .unwrap();
+        assert_eq!(screen_title(&fixture.client, &fixture.scope), title);
+    }
+    assert!(matches!(
+        fixture.client.ingest_server(&next[0], 6).unwrap(),
+        ApplyOutcome::Staged { received: 1, .. }
+    ));
+    fixture.apply(&next[2..], 7);
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "ready");
+    assert_eq!(
+        fixture
+            .client
+            .model()
+            .applied_sequence(&fixture.scope)
+            .unwrap(),
+        Some(WireU64(11))
+    );
+
+    let mut foreign = fixture.scope.clone();
+    foreign.epoch = WireU64(2);
+    assert_eq!(
+        fixture
+            .client
+            .ingest_server(&bytes(title_event(&foreign, "foreign")), 8),
+        Err(WireError::StaleScope)
+    );
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "ready");
+    fixture
+        .client
+        .ingest_server(&bytes(title_event(&fixture.scope, "")), 9)
+        .unwrap();
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "");
+
+    // A later Start contains newer authoritative metadata. The override is
+    // scoped to its transfer and cannot pin an old title for the session.
+    let later = fixture.publish(3, 12);
+    fixture.apply(&later, 10);
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "terminal");
+}
+
+#[test]
+fn title_event_before_initial_snapshot_commit_does_not_create_a_baseline() {
+    let mut fixture = Fixture::new(2, 2);
+    let frames = fixture.publish(1, 10);
+    fixture.client.ingest_server(&frames[0], 0).unwrap();
+    fixture
+        .client
+        .ingest_server(&bytes(title_event(&fixture.scope, "started")), 1)
+        .unwrap();
+    assert!(
+        fixture
+            .client
+            .model()
+            .screen(&fixture.scope)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .client
+            .take_applied_ack(&json(&fixture.scope))
+            .unwrap()
+            .is_none()
+    );
+    fixture.apply(&frames[1..], 2);
+    assert_eq!(screen_title(&fixture.client, &fixture.scope), "started");
+    assert_eq!(
+        fixture
+            .client
+            .model()
+            .applied_sequence(&fixture.scope)
+            .unwrap(),
+        Some(WireU64(10))
     );
 }
 

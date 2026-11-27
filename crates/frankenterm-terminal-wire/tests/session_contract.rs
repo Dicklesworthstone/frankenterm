@@ -251,6 +251,52 @@ fn negotiation_requires_requested_capabilities_and_pins_the_session() {
 }
 
 #[test]
+fn state_only_deltas_require_explicit_capability_on_both_session_boundaries() {
+    let ServerMessage::Delta(mut update) = delta(80, 10, 11) else {
+        panic!("delta");
+    };
+    update.patch.lines = BoundedVec::new();
+    update.patch.cursor.column = 1;
+    let message = ServerMessage::Delta(update);
+    let frame = ServerFrame::new(Some(id("session-a")), message.clone()).unwrap();
+    let encoded = encode_server(&frame).unwrap();
+
+    let (mut server, mut browser) = pair(vec![Capability::TerminalState]);
+    bind(&mut server, &mut browser, 10);
+    assert_eq!(
+        server.encode_response(message.clone()),
+        Err(WireError::UnsupportedCapability)
+    );
+    assert_eq!(
+        browser.decode_response(&encoded),
+        Err(WireError::UnsupportedCapability)
+    );
+    assert!(server.encode_response(delta(80, 10, 11)).is_ok());
+
+    let (mut server, mut browser) = pair(vec![Capability::TerminalState, Capability::StateDeltas]);
+    bind(&mut server, &mut browser, 10);
+    let response = server.encode_response(message).unwrap();
+    assert_eq!(browser.decode_response(&response).unwrap(), frame);
+    assert_eq!(
+        server.decode_request(&request(ack(11))),
+        Err(WireError::StaleSequence),
+        "encoding a metadata delta is not delivery or application"
+    );
+
+    let (mut server, mut browser) = pair(vec![Capability::StateDeltas]);
+    bind(&mut server, &mut browser, 10);
+    assert_eq!(
+        server.encode_response(frame.message.clone()),
+        Err(WireError::UnsupportedCapability),
+        "state_deltas does not replace terminal_state"
+    );
+    assert_eq!(
+        browser.decode_response(&encoded),
+        Err(WireError::UnsupportedCapability)
+    );
+}
+
+#[test]
 fn every_scoped_request_rejects_a_stale_epoch_before_it_can_be_dispatched() {
     let (mut server, mut browser) = pair(capabilities());
     bind(&mut server, &mut browser, 10);

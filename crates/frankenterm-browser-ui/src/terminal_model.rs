@@ -96,6 +96,9 @@ impl TerminalScreen {
 #[derive(Debug)]
 struct PendingSnapshot {
     start: SnapshotStart,
+    /// Events after Start supersede its frozen title without changing Start's
+    /// identity, duplicate comparison, or chunk byte declaration.
+    title_override: Option<Text<4096>>,
     deadline_at_ms: u64,
     raw_bytes: usize,
     reserved_bytes: usize,
@@ -322,6 +325,58 @@ impl TerminalModel {
         Ok(())
     }
 
+    fn update_title(&mut self, scope: &Scope, title: &Text<4096>) -> Result<(), WireError> {
+        let index = self.index(scope)?;
+        let pane = &self.panes[index];
+        let title_bytes = measure(title)?;
+        let screen_bytes = pane
+            .screen
+            .as_ref()
+            .map(|screen| {
+                replace_charge(screen.charged_bytes, measure(&screen.title)?, title_bytes)
+            })
+            .transpose()?;
+        if screen_bytes.is_some_and(|bytes| bytes > MAX_SNAPSHOT_BYTES as usize) {
+            return Err(WireError::LimitExceeded);
+        }
+        let pending_bytes = pane
+            .pending
+            .as_ref()
+            .map(|pending| {
+                let old_override_bytes =
+                    pending.title_override.as_ref().map(measure).transpose()?;
+                replace_charge(
+                    pending.reserved_bytes,
+                    old_override_bytes.unwrap_or(0),
+                    title_bytes,
+                )
+            })
+            .transpose()?;
+        let bytes = screen_bytes
+            .unwrap_or(0)
+            .checked_add(pending_bytes.unwrap_or(0))
+            .ok_or(WireError::LimitExceeded)?;
+        let cells = pane
+            .screen
+            .as_ref()
+            .map_or(0, |screen| screen.dimensions.cell_count() as usize)
+            + pane
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.start.total_cells as usize);
+        self.budget(Some(index), Some(index), bytes, cells)?;
+        let pane = &mut self.panes[index];
+        if let (Some(screen), Some(charged_bytes)) = (&mut pane.screen, screen_bytes) {
+            screen.title = title.clone();
+            screen.charged_bytes = charged_bytes;
+        }
+        if let (Some(pending), Some(reserved_bytes)) = (&mut pane.pending, pending_bytes) {
+            pending.title_override = Some(title.clone());
+            pending.reserved_bytes = reserved_bytes;
+        }
+        Ok(())
+    }
+
     fn recovery_ready(&self, scope: &Scope) -> Result<bool, WireError> {
         let pane = &self.panes[self.index(scope)?];
         Ok(pane.recovery.is_some()
@@ -537,6 +592,10 @@ impl TerminalModel {
                         &value.scope,
                         value.dimensions.clone().ok_or(WireError::InvalidState)?,
                     )?,
+                    PaneEventKind::TitleChanged => self.update_title(
+                        &value.scope,
+                        value.title.as_ref().ok_or(WireError::InvalidState)?,
+                    )?,
                     PaneEventKind::Gap => self.require_recovery(&value.scope, ResyncReason::Gap)?,
                     _ => {
                         self.index(&value.scope)?;
@@ -635,6 +694,7 @@ impl TerminalModel {
         pane.last_snapshot = Some(start.clone());
         pane.pending = Some(PendingSnapshot {
             start,
+            title_override: None,
             deadline_at_ms,
             raw_bytes: frame_bytes,
             reserved_bytes,
@@ -824,7 +884,10 @@ impl TerminalModel {
             dimensions: &pending.start.dimensions,
             cursor: &pending.start.cursor,
             modes: &pending.start.modes,
-            title: &pending.start.title,
+            title: pending
+                .title_override
+                .as_ref()
+                .unwrap_or(&pending.start.title),
             cwd: &pending.start.cwd,
             lines: &rows,
             hyperlinks: &links,
@@ -859,7 +922,7 @@ impl TerminalModel {
             dimensions: start.dimensions,
             cursor: start.cursor,
             modes: start.modes,
-            title: start.title,
+            title: pending.title_override.unwrap_or(start.title),
             cwd: start.cwd,
             lines: assembled_lines,
             hyperlinks,
@@ -904,6 +967,9 @@ impl TerminalModel {
             || delta.modes.alternate_screen != screen.modes.alternate_screen
         {
             return Err(WireError::StaleScope);
+        }
+        if delta.patch.lines.is_empty() {
+            return self.state_delta(index, delta);
         }
         let replacements: BTreeMap<u16, &Line> = delta
             .patch
@@ -981,6 +1047,60 @@ impl TerminalModel {
         }
         screen.hyperlinks.retain(|id, _| used_links.contains(id));
         screen.images.retain(|id, _| used_images.contains(id));
+        screen.sequence = delta.sequence;
+        screen.cursor = delta.patch.cursor;
+        screen.modes = delta.modes;
+        screen.charged_bytes = charged_bytes;
+        pane.previous_watermark = pane.watermark;
+        pane.watermark = delta.sequence;
+        pane.ack_pending = Some(delta.sequence);
+        Ok(ApplyOutcome::Applied {
+            scope: delta.scope,
+            sequence: delta.sequence,
+        })
+    }
+
+    /// A cursor/mode update charges only the changed metadata. Visiting or
+    /// serializing every unchanged cell would make cursor motion scale with
+    /// the entire screen even though no row crosses the wire.
+    fn state_delta(&mut self, index: usize, delta: Delta) -> Result<ApplyOutcome, WireError> {
+        let screen = self.panes[index]
+            .screen
+            .as_ref()
+            .ok_or(WireError::SnapshotIncomplete)?;
+        if delta.patch.cursor == screen.cursor && delta.modes == screen.modes {
+            return Err(WireError::InvalidState);
+        }
+        #[derive(Serialize)]
+        struct StateMeasure<'a> {
+            sequence: WireU64,
+            cursor: &'a Cursor,
+            modes: &'a TerminalModes,
+        }
+        let charged_bytes = replace_charge(
+            screen.charged_bytes,
+            measure(&StateMeasure {
+                sequence: screen.sequence,
+                cursor: &screen.cursor,
+                modes: &screen.modes,
+            })?,
+            measure(&StateMeasure {
+                sequence: delta.sequence,
+                cursor: &delta.patch.cursor,
+                modes: &delta.modes,
+            })?,
+        )?;
+        if charged_bytes > MAX_SNAPSHOT_BYTES as usize {
+            return Err(WireError::LimitExceeded);
+        }
+        self.budget(
+            Some(index),
+            None,
+            charged_bytes,
+            screen.dimensions.cell_count() as usize,
+        )?;
+        let pane = &mut self.panes[index];
+        let screen = pane.screen.as_mut().ok_or(WireError::InvalidState)?;
         screen.sequence = delta.sequence;
         screen.cursor = delta.patch.cursor;
         screen.modes = delta.modes;
@@ -1114,6 +1234,13 @@ fn transfer_bytes(previous: usize, next: usize) -> Result<usize, WireError> {
     previous
         .checked_add(next)
         .filter(|total| *total <= MAX_SNAPSHOT_BYTES as usize)
+        .ok_or(WireError::LimitExceeded)
+}
+
+fn replace_charge(total: usize, previous: usize, next: usize) -> Result<usize, WireError> {
+    total
+        .checked_sub(previous)
+        .and_then(|remaining| remaining.checked_add(next))
         .ok_or(WireError::LimitExceeded)
 }
 

@@ -265,6 +265,9 @@ impl SessionState {
         }
         match &frame.message {
             ServerMessage::Delta(value) => {
+                if value.patch.lines.is_empty() {
+                    self.require(Some(Capability::StateDeltas))?;
+                }
                 if value.base_sequence != self.binding(&value.scope)?.delivered {
                     return Err(WireError::StaleSequence);
                 }
