@@ -7,6 +7,72 @@ import UIKit
 /// Physical QR capture remains part of device qualification.
 @MainActor
 final class MobileOpticalRestoreTests: XCTestCase {
+    func testFilesOpensMacRecordingProgressAndContinuesTheSameOfflineTransfer() async throws {
+        let crypto = AppleCryptography(), persistence = StoreTestPersistence(), network = WorkspaceNetworkActivity()
+        let restore = OfflineRestore(using: crypto,
+            store: WorkspaceStore(persistence: persistence, vault: AppleWorkspaceVault()), networkActivity: network)
+        let idle = await restore.status()
+        let ready = try await restore.createRecipientRequest(generation: idle.generation)
+        let envelope = try FTAG.sealArchiveBytes(Data(repeating: 7, count: 100),
+            recipient: XCTUnwrap(ready.recipientRequest), transferID: Data(repeating: 2, count: 16),
+            compress: false, using: crypto)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        var mac = OpticalRecordingRecovery()
+        let recording = try mac.beginRecording()
+        let first = try sender.frame(page: 0, sequence: 1, using: crypto)
+        try mac.observe([first], recording: recording, using: crypto)
+        mac.endRecording(recording)
+        let bytes = try mac.decoderCheckpoint(using: crypto)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("ftqrprogress")
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let model = MobileWorkspaceModel(restore: restore)
+        let priorBookmark = UserDefaults.standard.data(forKey: "live-screen")
+        defer {
+            model.setRestoreVisible(false); model.active = false
+            if let priorBookmark { UserDefaults.standard.set(priorBookmark, forKey: "live-screen") }
+        }
+        model.active = true; model.state = ready
+        func openSelectedFile() async throws {
+            model.importFile(file)
+            await model.restoreSettled()
+            for _ in 0..<200 where model.busy || model.hasPendingImport {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertFalse(model.busy); XCTAssertFalse(model.hasPendingImport)
+        }
+
+        // Damaged checkpoints cannot select a source or consume its recipient key.
+        var damaged = bytes
+        damaged[damaged.count - 1] ^= 1
+        try damaged.write(to: file)
+        try await openSelectedFile()
+        XCTAssertNotNil(model.message)
+        XCTAssertEqual(model.state?.phase, .idle); XCTAssertEqual(model.state?.recipientRequest, ready.recipientRequest)
+
+        try bytes.write(to: file, options: .atomic)
+        try await openSelectedFile()
+        let partial = try XCTUnwrap(model.state)
+        XCTAssertEqual(partial.phase, .collecting); XCTAssertEqual(partial.source, .optical)
+        XCTAssertEqual(partial.identity, sender.identity); XCTAssertEqual(partial.receivedParts, 1)
+        XCTAssertEqual(partial.recipientRequest, ready.recipientRequest)
+        XCTAssertFalse(model.cameraRequested); XCTAssertFalse(model.isSavingScanProgress)
+        XCTAssertNil(partial.review); XCTAssertNil(partial.receipt)
+
+        model.importFile(file)
+        XCTAssertFalse(model.hasPendingImport); XCTAssertEqual(model.state?.generation, partial.generation)
+        var current = partial
+        for sequence in 2...(try sender.sourcePartCount(page: 0)) {
+            let text = try sender.frame(page: 0, sequence: UInt32(sequence), using: crypto)
+            current = try await restore.observeRecordingFrame([text], generation: current.generation)
+        }
+        XCTAssertEqual(current.phase, .locked); XCTAssertTrue(current.canUnlockRecipient)
+        XCTAssertEqual(current.verifiedBytes, envelope.count); XCTAssertNil(current.review)
+        XCTAssertThrowsError(try network.beginConnection())
+        XCTAssertNil(persistence.bytes(.catalog)); XCTAssertNil(persistence.bytes(.journal))
+    }
+
     private func partialScan() async throws
         -> (OfflineRestore<AppleCryptography>, OfflineRestoreStatus, StoreTestPersistence, WorkspaceNetworkActivity, OpticalSender) {
         let crypto = AppleCryptography(), persistence = StoreTestPersistence(), network = WorkspaceNetworkActivity()

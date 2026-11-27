@@ -2727,6 +2727,14 @@ final class MobileWorkspaceModel {
         guard url.isFileURL else { report(FTError.malformed("file.local_url_required")); return }
         guard !busy else { message = "Finish the current operation before opening another file."; return }
         documentRetryURL = nil
+        if url.pathExtension.lowercased() == "ftqrprogress" {
+            if let state, ![.idle, .complete].contains(state.phase) {
+                message = "Finish the current restore or choose Start Over before opening saved QR progress."
+                return
+            }
+            importWorkspaceFile(url)
+            return
+        }
         if OpticalRecordingLimits.accepts(url) { importWorkspaceFile(url); return }
         // A public result JSON is not a workspace. Identify it before entering
         // offline restore, which may otherwise ask to end unrelated sessions.
@@ -2848,14 +2856,20 @@ final class MobileWorkspaceModel {
                     return
                 }
                 let bytes: Data
+                let isCheckpoint = selected.url.pathExtension.lowercased() == "ftqrprogress"
                 if let inspected = selected.bytes { bytes = inspected }
-                else { bytes = try await Self.readSelectedDocument(selected.url, limit: FTLimit.envelope) }
+                else {
+                    bytes = try await Self.readSelectedDocument(selected.url,
+                        limit: isCheckpoint ? OpticalReceiver.decoderCheckpointByteLimit : FTLimit.envelope)
+                }
                 guard self.active, self.epoch == ticket, self.pendingImport?.id == selected.id else {
                     self.markPendingImportInterrupted(selected.id)
                     return
                 }
                 let result: OfflineRestoreStatus
-                if bytes.starts(with: Data("FTAG".utf8)) {
+                if isCheckpoint {
+                    result = try await restore.acceptDecoderCheckpoint(bytes, generation: ready.generation)
+                } else if bytes.starts(with: Data("FTAG".utf8)) {
                     result = try await restore.acceptEncryptedFile(bytes, generation: ready.generation)
                 } else {
                     submittedDocument = true
@@ -3526,8 +3540,8 @@ struct OfflineRestoreSheet: View {
                 Button(state.recipientRequest == nil ? "Open a Workspace File" : "Open an Encrypted File") {
                     chooseFile = true
                 }
-                Button("Restore from QR Recording") { chooseFile = true }
-                Text("Read an already-local MP4 or animated PNG. Keep its transfer code separately; a recording alone cannot unlock the workspace.")
+                Button("Open QR Recording or Saved Progress") { chooseFile = true }
+                Text("Choose a local MP4, animated PNG, or .ftqrprogress file saved by FrankenTerm Export. Continue a partial transfer with the camera or another recording. Unlocking still requires the original code or matching phone request.")
                     .font(.footnote).foregroundStyle(.secondary)
             }.padding(.top, 8)
         }
