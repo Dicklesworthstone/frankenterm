@@ -87,10 +87,16 @@ function mountAttentionQueue(doc, inspect, now) {
     if (row?.target.paneUuid) inspect(row.target);
   });
   return {
-    detection(target, detectedAt) {
+    // detectedAt and sentAt (the frame's ts_ms) are both server wall-clock
+    // times. Their difference is the item's age when the server sent it, which
+    // this tab's clock can count on from arrival, so a browser clock that runs
+    // ahead or behind the server's no longer mislabels the item.
+    detection(target, detectedAt, sentAt = null) {
       if (!needsAttention(target)) return;
       const key = target.epoch + ":" + target.id;
-      items.unshift({ key, target, detectedAt, reviewed: false });
+      const localDetectedAt = detectedAt === null || sentAt === null
+        ? detectedAt : now() - Math.max(0, sentAt - detectedAt);
+      items.unshift({ key, target, detectedAt: localDetectedAt, reviewed: false });
       if (items.length > limit) { items.pop(); dropped += 1; }
       dirty = true;
     },
@@ -545,7 +551,8 @@ export function createFleetStream(viewer, {
                 ? event.detection.severity : null,
               eventType: typeof event.detection?.event_type === "string" && event.detection.event_type.length <= 128
                 ? event.detection.event_type : null,
-            }, Number.isSafeInteger(frame.data.detected_at) && frame.data.detected_at >= 0 ? frame.data.detected_at : null);
+            }, Number.isSafeInteger(frame.data.detected_at) && frame.data.detected_at >= 0 ? frame.data.detected_at : null,
+            Number.isSafeInteger(frame.ts_ms) && frame.ts_ms >= 0 ? frame.ts_ms : null);
           }
         } else if (nextCursor) onCheckpoint({ epoch: nextCursor.epoch, id: nextCursor.decimal });
       } catch (_) { /* Optional system notifications cannot reject an admitted frame. */ }
@@ -1086,6 +1093,9 @@ export function mountFleetApp({
     const { target, fromQueue } = inspection;
     const admitted = () => fromQueue ? attention.contains(target) : notifications.isEnabled();
     if (!admitted()) return;
+    // The result goes to the fleet view and the pane form, which pinned focus
+    // mode hides. This runs only for an explicit click, so leave focus mode.
+    pinnedOutputs.showAll();
     const report = (message) => fromQueue ? attention.report(message) : notifications.report(message);
     inspection = null;
     const expected = ++inspectionGeneration;
@@ -1326,8 +1336,8 @@ export function mountFleetApp({
       reportError: snapshots.reportError,
     }, {
       apiRoot, EventSourceImpl, setTimer, clearTimer, onResync: refresh,
-      onDetection(target, detectedAt) {
-        attention.detection(target, detectedAt);
+      onDetection(target, detectedAt, sentAt) {
+        attention.detection(target, detectedAt, sentAt);
         notifications.detection(target);
       },
       onCheckpoint: notifications.checkpoint,

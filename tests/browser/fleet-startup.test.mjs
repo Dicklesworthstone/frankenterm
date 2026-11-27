@@ -610,9 +610,11 @@ function notificationReady(source) {
   source.message("ready", { schema: "ft.stream.v1", stream: "events", kind: "ready",
     data: { channel: "all", pane_id: null, durable_detections: true, cursor } }, cursor);
 }
-function emitNotificationDetection(source, id = "1", paneUuid = "pane-original", { detectedAt = 1000, severity = "warning", eventType = "usage" } = {}) {
+function emitNotificationDetection(source, id = "1", paneUuid = "pane-original", { detectedAt = 1000, severity = "warning", eventType = "usage", sentAt = null } = {}) {
   source.emit("event", {
-    data: '{"schema":"ft.stream.v1","stream":"events","kind":"event","data":{"delivery":"durable","detected_at":'
+    data: '{"schema":"ft.stream.v1","stream":"events","kind":"event",'
+      + (sentAt === null ? "" : '"ts_ms":' + JSON.stringify(sentAt) + ",")
+      + '"data":{"delivery":"durable","detected_at":'
       + JSON.stringify(detectedAt) + ',"event":{"type":"pattern_detected","event_id":' + id + ',"pane_id":18446744073709551615,"pane_uuid":' + JSON.stringify(paneUuid)
       + ',"detection":{"severity":' + JSON.stringify(severity) + ',"event_type":' + JSON.stringify(eventType)
       + ',"matched_text":"secret terminal text"}}}}',
@@ -707,6 +709,21 @@ test("notification clicks cannot resolve a reused pane or outlive session retire
   assert.match(reused.get("fleet-notifications-status").textContent, /identity changed/);
 });
 
+test("a notification click leaves pinned focus so its result can be seen", async (t) => {
+  const f = fixture(t, { notifications: true,
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  f.openPane("7"); f.get("pane-output-pin").emit("click");
+  pinnedTile(f).focus.emit("click");
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "true");
+  emitNotificationDetection(feed); f.notifications[0].onclick(); await flush();
+  assert.equal(f.get("workspace").dataset.pinnedFocus, "false", "focus mode hides the fleet view and the pane form");
+  assert.match(f.get("fleet-notifications-status").textContent, /identity was verified/);
+  assert.equal(f.get("pane-output-id").value, "18446744073709551615");
+});
+
 test("notification click refuses a detection the server could not attribute to a pane lifetime", async (t) => {
   // ft-ddxotx: durable frames carry pane_uuid null when the detection's
   // segment has no capture provenance (older events, or no segment at all).
@@ -775,6 +792,28 @@ test("attention triages admitted warnings and input requests without notificatio
   assert.equal(f.notifications.length, 0);
   f.app.dispose();
   assert.deepEqual(select.children, []);
+});
+
+test("attention ages a detection by server time, whether this browser's clock runs ahead or behind", async (t) => {
+  for (const start of [50_000_000, 10]) {
+    let time = start;
+    const f = fixture(t, { now: () => time });
+    await f.app.ready; await flush();
+    const feed = f.fleetSources()[0]; notificationReady(feed);
+    const select = f.get("attention-items");
+    // Sent 1 s after detection: recent for 29 s more by this tab's clock.
+    emitNotificationDetection(feed, "1", null, { detectedAt: 1_000_000, sentAt: 1_001_000 });
+    // Sent a minute after detection, as a replayed backlog is: older on arrival.
+    emitNotificationDetection(feed, "2", null, { detectedAt: 1_000_000, sentAt: 1_060_000 });
+    f.frame();
+    assert.match(select.children[1].textContent, /^Unread · recent · warning.* #1$/, "clock " + start);
+    assert.match(select.children[0].textContent, /^Unread · older · warning.* #2$/, "clock " + start);
+    time += 28_999; f.frame();
+    assert.match(select.children[1].textContent, /recent/, "clock " + start);
+    time += 1; f.frame();
+    assert.match(select.children[1].textContent, /older/, "clock " + start);
+    f.app.dispose();
+  }
 });
 
 test("attention evicts a selected item without acting on its replacement", async (t) => {
