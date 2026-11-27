@@ -221,7 +221,7 @@ jq -e '
 live_e2e="$(git ls-files tests/e2e | awk '/\.sh$/ { count++ } END { print count + 0 }')"
 grep -q "<!--count:e2e_scripts-->${live_e2e}<!--/count-->" README.md \
   || fail "README stamped E2E count stale; expected ${live_e2e}"
-grep -q "# ${live_e2e} shell E2E scripts" README.md \
+grep -qF "# <!--count:e2e_scripts-->${live_e2e}<!--/count--> shell E2E scripts" README.md \
   || fail "README tree E2E count stale; expected ${live_e2e}"
 
 case_count="$(jq -r '.cases | length' "${FIXTURE}")"

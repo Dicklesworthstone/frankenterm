@@ -351,7 +351,7 @@ git_ls_files = IO.popen(["git", "ls-files", "tests/e2e"], &:read)
 fail!("failed to enumerate tracked E2E scripts") unless $?.success?
 live_e2e = git_ls_files.lines.count { |path| path.chomp.end_with?(".sh") }
 fail!("README stamped E2E count stale") unless readme.include?("<!--count:e2e_scripts-->#{live_e2e}<!--/count-->")
-fail!("README tree E2E count stale") unless readme.include?("# #{live_e2e} shell E2E scripts")
+fail!("README tree E2E count stale") unless readme.include?("# <!--count:e2e_scripts-->#{live_e2e}<!--/count--> shell E2E scripts")
 
 puts "rch worker storage inventory contract: static verifier passed (#{fixture_paths.length} fixtures, #{EXPECTED_FORBIDDEN.length} forbidden actions, #{live_e2e} E2E scripts)"
 RUBY

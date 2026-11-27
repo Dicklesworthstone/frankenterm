@@ -533,13 +533,14 @@ begin
     expected: scripts.length,
     actual: readme[/<!--count:e2e_scripts-->(\d+)<!--\/count-->/, 1],
   )
+  readme_tree_line = "# <!--count:e2e_scripts-->#{scripts.length}<!--/count--> shell E2E scripts"
   StaticAttestation.assert!(
-    readme.include?("# #{scripts.length} shell E2E scripts"),
+    readme.include?(readme_tree_line),
     "README tree E2E script count is stale",
     check: "e2e_script_contract.readme_tree_count",
     input_path: "README.md",
-    expected: "#{scripts.length} shell E2E scripts",
-    actual: readme.include?("# #{scripts.length} shell E2E scripts") ? "present" : "missing",
+    expected: readme_tree_line,
+    actual: readme.include?(readme_tree_line) ? "present" : "missing",
   )
 
   counts_snapshot_path = "docs/attestations/doctrine/agents-md-counts.json"
