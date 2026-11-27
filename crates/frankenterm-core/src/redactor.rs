@@ -2,6 +2,7 @@
 
 use aho_corasick::AhoCorasick;
 use regex::{Regex, RegexSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -215,8 +216,10 @@ static STREAMING_ANCHOR_AUTOMATON: LazyLock<AhoCorasick> = LazyLock::new(|| {
 /// keyed `key=value` match is already complete once the value reaches its
 /// minimum length. The armoured blocks are different: `SSH_PRIVATE_KEY` and the
 /// PGP patterns only match once the closing `-----END …-----` line arrives, so
-/// an armoured block is undetectable for as long as it is unterminated. Those
-/// occurrences are exempt from the retention floor; everything else is not.
+/// an armoured block is undetectable for as long as it is unterminated. Such
+/// an occurrence is exempt from the retention floor while it opens a sensitive
+/// block that is still unterminated ([`armour_anchor_is_open`]); every other
+/// occurrence is not.
 const UNBOUNDED_SPAN_ANCHORS: &[&str] = &["-----BEGIN "];
 
 fn anchor_span_is_unbounded(anchor: &str) -> bool {
@@ -230,8 +233,9 @@ struct AnchorOccurrence {
     start: usize,
     /// Byte length of the matched anchor.
     len: usize,
-    /// Whether the pattern this anchor opens can span unbounded text
-    /// (see [`UNBOUNDED_SPAN_ANCHORS`]).
+    /// Whether this occurrence opens an armoured secret that is still
+    /// unterminated (see [`UNBOUNDED_SPAN_ANCHORS`] and
+    /// [`armour_anchor_is_open`]).
     unbounded_span: bool,
 }
 
@@ -242,13 +246,21 @@ struct AnchorOccurrence {
 /// same byte, and a missed occurrence would let the emit boundary advance past
 /// a partial secret.
 fn streaming_anchor_occurrences(pending: &str) -> Vec<AnchorOccurrence> {
+    let mut footers = None;
     let mut occurrences: Vec<AnchorOccurrence> = STREAMING_ANCHOR_AUTOMATON
         .find_overlapping_iter(pending)
         .map(|found| AnchorOccurrence {
             start: found.start(),
             len: found.end() - found.start(),
+            // Only an open sensitive block is unbounded. Any other
+            // `-----BEGIN ` used to pin retention for good, so a certificate
+            // followed by enough output dropped the rest of the stream.
             unbounded_span: anchor_span_is_unbounded(
                 STREAMING_SECRET_ANCHORS[found.pattern().as_usize()],
+            ) && armour_anchor_is_open(
+                pending,
+                found.start(),
+                footers.get_or_insert_with(|| armoured_footer_starts(pending)),
             ),
         })
         .collect();
@@ -1720,27 +1732,88 @@ static STREAMING_ARMOURED_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("streaming armoured header regex")
 });
 
-fn armoured_terminator(label: &str) -> Option<String> {
+/// Every footer an [`armoured_terminator`] can name.
+static STREAMING_ARMOURED_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"-----END (?P<label>[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK|PGP PUBLIC KEY BLOCK|PGP MESSAGE|PGP SIGNATURE)-----",
+    )
+    .expect("streaming armoured footer regex")
+});
+
+fn armoured_footer_label(label: &str) -> Option<&str> {
     if label.len() > 128 {
         return None;
     }
-    let label = if label == "PGP SIGNED MESSAGE" {
+    Some(if label == "PGP SIGNED MESSAGE" {
         "PGP SIGNATURE"
     } else {
         label
-    };
-    Some(format!("-----END {label}-----"))
+    })
+}
+
+fn armoured_terminator(label: &str) -> Option<String> {
+    armoured_footer_label(label).map(|label| format!("-----END {label}-----"))
+}
+
+/// The last start of each footer label in `text`, from one pass. Searching
+/// the rest of the text once per header was quadratic in the header count.
+/// Two footers sharing their dashes count once, which keeps that block open:
+/// the conservative direction.
+fn armoured_footer_starts(text: &str) -> HashMap<&str, usize> {
+    let mut last = HashMap::new();
+    for footer in STREAMING_ARMOURED_FOOTER.captures_iter(text) {
+        if let (Some(whole), Some(label)) = (footer.get(0), footer.name("label")) {
+            last.insert(label.as_str(), whole.start());
+        }
+    }
+    last
+}
+
+fn armoured_block_is_closed(
+    label: &str,
+    header_end: usize,
+    footers: &HashMap<&str, usize>,
+) -> bool {
+    armoured_footer_label(label)
+        .and_then(|label| footers.get(label))
+        .is_some_and(|&start| start >= header_end)
 }
 
 fn unclosed_armoured_secret(text: &str) -> Option<usize> {
-    for header in STREAMING_ARMOURED_HEADER.captures_iter(text) {
-        let whole = header.get(0)?;
-        let terminator = armoured_terminator(header.name("label")?.as_str());
-        if terminator.is_none_or(|terminator| !text[whole.end()..].contains(terminator.as_str())) {
-            return Some(whole.start());
-        }
+    let footers = armoured_footer_starts(text);
+    STREAMING_ARMOURED_HEADER
+        .captures_iter(text)
+        .find_map(|header| {
+            let whole = header.get(0)?;
+            let label = header.name("label")?.as_str();
+            (!armoured_block_is_closed(label, whole.end(), &footers)).then_some(whole.start())
+        })
+}
+
+/// Whether the `-----BEGIN ` anchor at `start` opens a sensitive armoured
+/// block whose footer has not arrived, or may still become one because its
+/// header is cut off by the end of `text`. A complete header with any other
+/// label (a certificate, a public key, prose) never becomes a catalog secret,
+/// and neither does a closed block, so those are ordinary bounded anchors.
+fn armour_anchor_is_open(text: &str, start: usize, footers: &HashMap<&str, usize>) -> bool {
+    const BEGIN: &str = "-----BEGIN ";
+    // The anchor matches case-insensitively; the catalog's armour does not.
+    if !text[start..].starts_with(BEGIN) {
+        return false;
     }
-    None
+    let label_start = start + BEGIN.len();
+    let label_end = label_start
+        + text[label_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b' ')
+            .count();
+    let after_label = &text[label_end..];
+    if !after_label.starts_with("-----") {
+        return "-----".starts_with(after_label);
+    }
+    let header = &text[start..label_end + "-----".len()];
+    STREAMING_ARMOURED_HEADER.is_match(header)
+        && !armoured_block_is_closed(&text[label_start..label_end], header.len() + start, footers)
 }
 
 impl StreamingRedactor {
@@ -1803,7 +1876,12 @@ impl StreamingRedactor {
     /// behavior; internal processing windows never introduce additional seams.
     #[must_use]
     pub fn redact_chunk(&mut self, mut bytes: &[u8]) -> RedactionResult {
-        let mut result = self.drain_ready();
+        // Every call leaves the buffer settled, so only new input can make
+        // more of it emittable. Draining first repeated a full catalog scan.
+        let mut result = RedactionResult {
+            bytes: Vec::new(),
+            evidence: BytesRedactionEvidence::default(),
+        };
         while !bytes.is_empty() {
             // Lossy decoding expands one invalid source byte to at most three
             // bytes. The extra three source bytes preserve UTF-8 chunk seams.
@@ -2030,11 +2108,18 @@ impl StreamingRedactor {
             // started before the floor is either already a complete detection
             // (the detection rules handle those, unclamped) or can no longer be
             // completed by bytes that have not arrived yet.
-            if !occurrence.unbounded_span {
-                let scan_start = floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
-                if occurrence.start < scan_start || occurrence.start < retention_floor {
-                    continue;
-                }
+            if occurrence.unbounded_span {
+                // An open block retains even inside another complete
+                // detection. A `TLS_SECRET=` or `password=` value match ends
+                // at the header, and the key body after it matches nothing
+                // until the footer arrives, so counting the anchor as covered
+                // emitted that body in plaintext.
+                boundary = occurrence.start;
+                continue;
+            }
+            let scan_start = floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
+            if occurrence.start < scan_start || occurrence.start < retention_floor {
+                continue;
             }
 
             let covered_by_complete_detection = detections.iter().any(|(_, det_start, det_end)| {
@@ -2830,6 +2915,78 @@ mod tests {
                         as u64
                 );
             }
+        }
+    }
+
+    #[test]
+    fn streaming_certificates_public_keys_and_closed_blocks_never_pin_retention() {
+        // Only an open sensitive block is unbounded. Any other `-----BEGIN `
+        // used to pin retention at its start, so later output reached the cap
+        // and the rest of the stream was suppressed until finish.
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+        for opener in [
+            "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYI\n-----END PUBLIC KEY-----\n",
+            "grep for -----BEGIN in the bundle\n",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+        ] {
+            // Like the defaults (64 KiB tail, 8 MiB cap), the tail window is
+            // far below the cap, so an ordinary anchor is released once a
+            // window of output follows it; an unbounded one never is.
+            let mut streaming = StreamingRedactor::new()
+                .with_tail_bytes(256)
+                .with_max_pending_bytes(4096);
+            let mut result = streaming.redact_chunk(opener.as_bytes());
+            for line in 0..2_000 {
+                let chunk = format!("ordinary build line {line}\n");
+                result = super::merge_redaction_results(
+                    result,
+                    streaming.redact_chunk(chunk.as_bytes()),
+                );
+            }
+            result = super::merge_redaction_results(result, streaming.finish());
+            let rendered = String::from_utf8(result.bytes).expect("utf8 output");
+            let head = &rendered[..rendered.len().min(240)];
+            assert!(
+                rendered.contains("ordinary build line 0\n"),
+                "{opener:?}: {head:?}"
+            );
+            assert!(
+                rendered.ends_with("ordinary build line 1999\n"),
+                "{opener:?}: {head:?}"
+            );
+            assert!(!rendered.contains("MIIEowIBAAKCAQEA"), "{opener:?}");
+        }
+        assert_eq!(super::streaming_redactor_pending_overflow_count(), 0);
+    }
+
+    #[test]
+    fn streaming_keyed_value_that_opens_armour_never_releases_the_key_body() {
+        // A `*_SECRET=` or `password=` match ends at the header. It used to
+        // count the open block as covered, so the body chunks went out raw.
+        let body = "MIIEowIBAAKCAQEAsensitivebody\n";
+        for (opener, footer) in [
+            (
+                "TLS_SECRET=-----BEGIN RSA PRIVATE KEY-----\n",
+                "-----END RSA PRIVATE KEY-----\n",
+            ),
+            (
+                "password=-----BEGIN PRIVATE KEY-----\n",
+                "-----END PRIVATE KEY-----\n",
+            ),
+        ] {
+            let mut streaming = StreamingRedactor::new();
+            let mut emitted = Vec::new();
+            for chunk in [opener, body, body, footer, "after!\n"] {
+                emitted.extend(streaming.redact_chunk(chunk.as_bytes()).bytes);
+                let so_far = String::from_utf8_lossy(&emitted);
+                assert!(!so_far.contains("sensitivebody"), "{opener:?}: {so_far:?}");
+            }
+            emitted.extend(streaming.finish().bytes);
+            let rendered = String::from_utf8(emitted).expect("utf8 output");
+            assert!(!rendered.contains("sensitivebody"), "{rendered:?}");
+            assert!(rendered.ends_with("after!\n"), "{rendered:?}");
         }
     }
 
@@ -4330,9 +4487,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_redactor_pending_overflow_does_not_drop_secrets_within_emitted_window() {
-        // Complete, safely delimited secrets still use ordinary redaction.
-        // Unresolved prefixes that cannot fit are withheld rather than leaked.
+    fn streaming_redactor_overflow_withholds_a_complete_secret_behind_open_armour() {
+        // An open private key pins retention, so the next chunk pushes the
+        // buffer past the cap with a complete secret inside it. The whole
+        // unresolved buffer goes behind one marker, text emitted before the
+        // key is unchanged, and output resumes after the footer.
         let _guard = streaming_overflow_test_lock();
         super::reset_streaming_redactor_pending_overflow_count_for_test();
 
@@ -4341,31 +4500,30 @@ mod tests {
             .with_tail_bytes(64)
             .with_max_pending_bytes(TEST_CAP);
 
-        // Force overflow first.
-        let filler = "x".repeat(2000);
-        let r1 = streaming.redact_chunk(filler.as_bytes());
-        // A clearly-complete secret embedded inside the next chunk
-        // that pushes us past the cap. The complete pattern should
-        // be redacted regardless of overflow path.
+        let before = format!("{}\n", "x".repeat(1000));
+        let r1 =
+            streaming.redact_chunk(format!("{before}-----BEGIN PRIVATE KEY-----\n").as_bytes());
         let chunk_with_secret = format!(
-            "more filler {} sk-1234567890abcdef1234567890abcdef and tail {}",
-            "y".repeat(800),
-            "z".repeat(800)
+            "{} sk-1234567890abcdef1234567890abcdef {}\n",
+            "y".repeat(1200),
+            "z".repeat(1200)
         );
         let r2 = streaming.redact_chunk(chunk_with_secret.as_bytes());
-        let r3 = streaming.finish();
+        assert_eq!(
+            super::streaming_redactor_pending_overflow_count(),
+            1,
+            "the retained buffer must pass the cap"
+        );
+        let r3 = streaming.redact_chunk(b"-----END PRIVATE KEY-----\nafter!\n");
+        let r4 = streaming.finish();
 
         let mut all = r1.bytes;
         all.extend(r2.bytes);
         all.extend(r3.bytes);
-        let rendered = String::from_utf8_lossy(&all);
-
-        // The complete sk-... pattern must NOT survive in cleartext.
-        assert!(
-            !rendered.contains("sk-1234567890abcdef1234567890abcdef"),
-            "br-ft-4socw: complete secret patterns within the \
-             forced-emit window must still be redacted"
-        );
+        all.extend(r4.bytes);
+        let rendered = String::from_utf8(all).expect("utf8 output");
+        assert!(!rendered.contains("sk-1234567890abcdef1234567890abcdef"));
+        assert_eq!(rendered, format!("{before}[REDACTED]\nafter!\n"));
     }
 
     /// br-ft-8nd26: bare JWT in a log line (not preceded by
