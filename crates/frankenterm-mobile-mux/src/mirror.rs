@@ -400,15 +400,27 @@ impl PaneMirror {
             });
         if self.visible {
             let viewport = target.viewport();
+            // Resizing an alternate-screen program can reflow the primary
+            // screen behind it. Its old stable-row coordinates stay invalid
+            // even if the program resizes back before returning. Remember
+            // this at observation time, including while a read delays paint.
+            let across_alt = target.alt
+                || self.shown.alt.is_some()
+                || self.target.as_ref().is_some_and(|previous| previous.alt);
+            if across_alt && (target.rows(), target.dims.cols) != (self.shown.rows, self.shown.cols)
+            {
+                self.shown.primary = None;
+            }
             if !target.alt
-                && self.shown.primary.is_some_and(|old_top| {
+                && self.shown.painted
+                && self.shown.primary.is_none_or(|old_top| {
                     target.dims.scrollback_top > offset(old_top, self.shown.rows)
                 })
             {
-                // There is a hole between the last displayed screen and the
-                // oldest surviving row. Start a fresh stream from retained
-                // history. Never splice unrelated rows into the phone's history
-                // or wait for a fenced read the server must always refuse.
+                // Only join rows to the old primary screen when its layout is
+                // still known and there is no hole before retained history.
+                // Resetting the phone clears its old scrollback and exits the
+                // alternate screen before replaying the surviving primary.
                 self.shown = Shown::default();
                 self.drawn = None;
                 self.shown_palette = None;
@@ -1110,5 +1122,43 @@ mod tests {
             assert!(painted.contains(&format!("row-{row}")));
         }
         assert!(mirror.is_drawable());
+    }
+
+    #[test]
+    fn alternate_resize_invalidates_the_old_primary_even_before_paint_or_after_resizing_back() {
+        for paint_alternate in [false, true] {
+            for return_cols in [16, 32] {
+                let mut mirror = PaneMirror::new(true);
+                mirror.apply_changes(head(3), Some(entries(0..5))).unwrap();
+                mirror.render();
+
+                let mut editor = head(0);
+                editor.alt_screen_active = true;
+                editor.dimensions.cols = 16;
+                mirror.apply_changes(editor, Some(entries(0..2))).unwrap();
+                if paint_alternate {
+                    assert!(!mirror.render().is_empty());
+                }
+
+                let mut shell = head(4);
+                shell.dimensions.cols = return_cols;
+                mirror.apply_changes(shell, Some(entries([5]))).unwrap();
+                let wanted = mirror.wanted();
+                assert_eq!(
+                    wanted,
+                    vec![0..5],
+                    "the primary's reflowed history is needed"
+                );
+                mirror.set_fetching(&wanted);
+                mirror.apply_lines(entries(0..5), &wanted);
+                let output = mirror.render();
+                assert_eq!(output.len(), 2);
+                assert!(
+                    output[0].bytes.starts_with(b"\x1bc"),
+                    "clear the old local history"
+                );
+                assert!(output[1].complete);
+            }
+        }
     }
 }

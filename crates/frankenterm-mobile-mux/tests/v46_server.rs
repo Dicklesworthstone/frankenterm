@@ -187,6 +187,27 @@ fn a_full_screen_program_takes_over_and_gives_the_screen_back() {
     assert_eq!(phone[..history.len() - 6], history[..history.len() - 6]);
 }
 
+#[test]
+fn leaving_a_resized_editor_rebuilds_the_shells_reflowed_history() {
+    let mut harness = Harness::new(4, 20);
+    for n in 0..16 {
+        harness.quiet_output(format!("shell line {n}: a long wrapped command\r\n").as_bytes());
+    }
+    harness.attach();
+    harness.output(b"\x1b[?1049h\x1b[Heditor");
+    harness.server.term.resize(support::size(8, 12));
+    harness.push();
+    assert_mirrored(&mut harness);
+
+    harness.output(b"\x1b[?1049l\r\nreturned to shell");
+    assert_mirrored(&mut harness);
+    assert_eq!(
+        all_text(&mut harness.phone),
+        all_text(&mut harness.server.term)
+    );
+    assert_eq!(wraps(&mut harness.phone), wraps(&mut harness.server.term));
+}
+
 /// The phone's rows wrap where the remote's do, on screen and in its
 /// scrollback, however they are drawn: so a copied line or a tapped address
 /// runs on across them, and a row that only fills its width does not.
