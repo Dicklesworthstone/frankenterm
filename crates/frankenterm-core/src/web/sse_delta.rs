@@ -313,6 +313,7 @@ impl DeltaStreamState {
                 return false;
             }
             self.observed_high_water = page.snapshot.max_segment_id;
+            let capture_uuids = page.capture_uuids;
             for segment in segments {
                 if !self
                     .emit(
@@ -323,6 +324,10 @@ impl DeltaStreamState {
                         json!({
                             "segment_id": segment.id,
                             "pane_id": segment.pane_id,
+                            // The capture this segment belongs to, or null
+                            // when its producer recorded none. A reused pane
+                            // ID continues seq but not this (ft-tje6dm).
+                            "pane_uuid": capture_uuids.get(&segment.id),
                             "seq": segment.seq,
                             "captured_at": segment.captured_at,
                             "content_len": segment.content_len,
@@ -673,6 +678,7 @@ mod tests {
                 tail_segment_id: segments.iter().map(|segment| segment.id).max().unwrap_or(0),
             },
             segments,
+            capture_uuids: std::collections::HashMap::new(),
         }
     }
 
@@ -1145,6 +1151,42 @@ mod tests {
             let payload = frames[0].data.as_deref().unwrap();
             assert!(payload.contains("visible-marker"));
             assert!(!payload.contains(&secret));
+        });
+    }
+
+    #[test]
+    fn delta_frames_name_the_capture_each_segment_belongs_to() {
+        // ft-tje6dm: a reused pane ID continues seq, so a viewer following
+        // one capture tells captures apart by this, and null means unknown.
+        run_async(|| async {
+            let cx = crate::cx::for_request();
+            let mut state = state();
+            let first_uuid = crate::ingest::generate_pane_uuid("local", 7, 1);
+            let mut rows = page(vec![segment(1), segment(2)]);
+            rows.capture_uuids.insert(1, first_uuid.clone());
+            let mut rows = Some(rows);
+            let (tx, rx) = mpsc::channel(2);
+            assert!(
+                state
+                    .catch_up(
+                        &cx,
+                        // A full page asks for the next one, which is empty.
+                        |_| std::future::ready(Ok(rows.take().unwrap_or_else(|| page(Vec::new())))),
+                        &Redactor::new(),
+                        &tx
+                    )
+                    .await
+            );
+            drop(tx);
+            let uuids = drain(rx)
+                .iter()
+                .map(|frame| {
+                    let value: serde_json::Value =
+                        serde_json::from_str(frame.data.as_deref().unwrap()).unwrap();
+                    value["data"]["pane_uuid"].clone()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(uuids, [json!(first_uuid), serde_json::Value::Null]);
         });
     }
 

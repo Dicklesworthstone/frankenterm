@@ -10,6 +10,15 @@ function unsigned(value, maximum) {
   return integer <= maximum ? integer.toString() : null;
 }
 
+// A delta's capture UUID, or null when the server knows none (older servers
+// omit the field). Anything else is invalid provenance, not "unknown".
+function captureUuidOf(data) {
+  const value = data.pane_uuid;
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && /^[0-9a-f]{32}$/.test(value)) return value;
+  throw new Error("invalid delta capture provenance");
+}
+
 // JSON.parse converts numeric u64/i64 identities to rounded Numbers. Validate
 // the original JSON first, then quote integer tokens OUTSIDE strings. Parsing
 // the original is important: quoting alone would accept invalid {1:2} JSON.
@@ -68,6 +77,9 @@ export function createPaneOutput({
   let captureTimer = null;
   let capture = null;
   let followFromSegment = null;
+  // The capture UUID of the admitted historical segment, kept while
+  // following it: a reused pane ID continues seq but gets a new UUID.
+  let captureProvenance = null;
   let capturePending = false;
   let generation = 0;
   let retryMs = 1000;
@@ -266,6 +278,7 @@ export function createPaneOutput({
               || typeof data.seq !== "number" || sequence === null || typeof data.content !== "string") {
             throw new Error("invalid delta identity or content");
           }
+          const paneUuid = captureUuidOf(data);
           if (receivedCursor === null || incoming.epoch !== receivedCursor.epoch) {
             halt("output capture database changed");
             return;
@@ -288,6 +301,7 @@ export function createPaneOutput({
             received = segment;
             receivedCursor = incoming;
             receivedSequence = sequence;
+            captureProvenance = paneUuid;
             settleCapture(null, true);
             return;
           }
@@ -296,6 +310,13 @@ export function createPaneOutput({
           if (received !== null && BigInt(segment) <= BigInt(received)) {
             status = "connected";
             dirty = true;
+            return;
+          }
+          // A reused pane ID continues the per-pane seq, so only the capture
+          // UUID shows that later output came from another terminal. An
+          // unknown UUID on either side differs from a known one.
+          if (followFromSegment !== null && paneUuid !== captureProvenance) {
+            halt("another capture reused this pane ID after the selected segment");
             return;
           }
           // Global segment ids interleave panes; only this pane's stored seq
@@ -416,6 +437,7 @@ export function createPaneOutput({
     pane = selected;
     capture = target;
     followFromSegment = null;
+    captureProvenance = null;
     capturePending = target !== null;
     history = Boolean(retainedHistory);
     paused = false;
@@ -514,6 +536,7 @@ export function createPaneOutput({
       pane = null;
       capture = null;
       followFromSegment = null;
+      captureProvenance = null;
       capturePending = false;
       received = null;
       receivedCursor = null;

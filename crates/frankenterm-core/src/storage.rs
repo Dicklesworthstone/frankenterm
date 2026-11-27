@@ -12350,6 +12350,11 @@ pub struct SegmentStreamSnapshot {
 pub struct SegmentStreamPage {
     pub segments: Vec<Segment>,
     pub snapshot: SegmentStreamSnapshot,
+    /// The capture UUID of each segment in the page whose producer recorded
+    /// one for the same pane, from the same statement. A numeric pane ID can
+    /// be reused, and its per-pane `seq` continues; this tells the captures
+    /// apart (ft-tje6dm). Segments without provenance are absent.
+    pub capture_uuids: HashMap<i64, String>,
 }
 
 /// Maximum number of retained rows in one authoritative output-stream page.
@@ -36440,12 +36445,17 @@ fn query_segments_stream_page_backend(
              SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
              FROM output_segments{where_clause} ORDER BY id ASC LIMIT ?{limit_param}
          ), stream_snapshot AS ({snapshot_sql})
-         SELECT 0 AS row_kind, id, pane_id, seq, content, content_len, content_hash, captured_at,
-                NULL AS cursor_epoch, NULL AS max_segment_id, NULL AS tail_segment_id
-         FROM segment_page
+         SELECT 0 AS row_kind, page.id AS id, page.pane_id, page.seq, page.content,
+                page.content_len, page.content_hash, page.captured_at,
+                NULL AS cursor_epoch, NULL AS max_segment_id, NULL AS tail_segment_id,
+                binding.capture_uuid AS capture_uuid
+         FROM segment_page AS page
+         LEFT JOIN output_segment_captures AS captured ON captured.segment_id = page.id
+         LEFT JOIN pane_capture_bindings AS binding
+             ON binding.capture_uuid = captured.capture_uuid AND binding.pane_id = page.pane_id
          UNION ALL
          SELECT 1 AS row_kind, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                cursor_epoch, max_segment_id, tail_segment_id
+                cursor_epoch, max_segment_id, tail_segment_id, NULL
          FROM stream_snapshot
          ORDER BY row_kind ASC, id ASC"
     );
@@ -36453,9 +36463,11 @@ fn query_segments_stream_page_backend(
         .query_map_cells(&sql, &params)
         .map_err(|err| storage_backend_error("Query segment stream page", err))?;
     let mut segments = Vec::new();
+    let mut capture_uuids = HashMap::new();
     let mut snapshot = None;
     for row in &rows {
-        let kind = CellRowReader::new(row)
+        let reader = CellRowReader::new(row);
+        let kind = reader
             .i64(0)
             .map_err(|err| storage_backend_error("Read segment stream row kind", err))?;
         match kind {
@@ -36463,7 +36475,14 @@ fn query_segments_stream_page_backend(
                 let cells = row.get(1..8).ok_or_else(|| {
                     StorageError::Database("invalid segment stream row".to_string())
                 })?;
-                segments.push(segment_from_backend_cells(cells)?);
+                let segment = segment_from_backend_cells(cells)?;
+                if let Some(capture_uuid) = reader
+                    .optional_string(11)
+                    .map_err(|err| storage_backend_error("Read segment capture UUID", err))?
+                {
+                    capture_uuids.insert(segment.id, capture_uuid);
+                }
+                segments.push(segment);
             }
             1 if snapshot.is_none() => {
                 snapshot = Some(segment_stream_snapshot_from_cells(row, 8)?);
@@ -36497,7 +36516,11 @@ fn query_segments_stream_page_backend(
         }
         previous_id = segment.id;
     }
-    Ok(SegmentStreamPage { segments, snapshot })
+    Ok(SegmentStreamPage {
+        segments,
+        snapshot,
+        capture_uuids,
+    })
 }
 
 fn build_segment_scan_backend_where(

@@ -83,10 +83,17 @@ function beginDelivery(source) {
   if (!source.serverReady) control(source, "ready", { pane_id: source.url.searchParams.get("pane_id") });
 }
 
+// The server's capture UUID for a delta; left out unless a test names one,
+// as older servers send it.
+function paneUuidField(overrides) {
+  return overrides.paneUuid === undefined ? "" : `,"pane_uuid":${JSON.stringify(overrides.paneUuid)}`;
+}
+
 function delta(source, id, content, pane = "7", overrides = {}) {
   beginDelivery(source);
   const payload = `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":` +
-    `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id},"content":${JSON.stringify(content)}}}`;
+    `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id}${paneUuidField(overrides)},` +
+    `"content":${JSON.stringify(content)}}}`;
   source.lastDelta = id;
   source.lastEpoch = overrides.epoch ?? OUTPUT_EPOCH;
   source.emit("delta", overrides.payload ?? payload, overrides.cursor ?? deltaCursor(id, pane, source.lastEpoch));
@@ -1246,6 +1253,7 @@ function capturedDelta(source, hit, content, overrides = {}) {
   beginDelivery(source);
   const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +
     '{"pane_id":' + hit.paneId + ',"segment_id":' + hit.segmentId + ',"seq":' + (overrides.sequence ?? '0') +
+    paneUuidField(overrides) +
     ',"captured_at":' + hit.capturedAt + ',"content_len":' + hit.contentLength +
     ',"content":' + JSON.stringify(content) + '}}';
   source.emit("delta", overrides.payload ?? payload,
@@ -1692,5 +1700,41 @@ test("following a search hit stops before showing another epoch or a discontinuo
     assert.equal(f.output.snapshot().resumeCursor, deltaCursor(hit.segmentId));
     assert.equal(f.output.snapshot().terminal, true);
     assert.equal(f.timers.size, 0);
+  }
+});
+
+test("following a search hit stops when a reused pane ID continues the sequence for another capture", () => {
+  // ft-tje6dm: a new terminal that reuses the pane ID continues its seq, so
+  // only the capture UUID tells it apart. Unknown on one side is a change.
+  const first = "0123456789abcdef0123456789abcdef";
+  const second = "fedcba9876543210fedcba9876543210";
+  for (const [historical, later] of [[first, second], [first, null], [undefined, first]]) {
+    const label = `${historical} then ${later}`;
+    const f = fixture();
+    const hit = captureHit();
+    f.output.selectCapture(hit);
+    capturedDelta(f.latest(), hit, "verified\n", { sequence: "48", paneUuid: historical });
+    assert.equal(f.output.followCapture(), true, label);
+    const next = f.latest();
+    delta(next, "19", "same capture\n", hit.paneId, { sequence: "49", paneUuid: historical });
+    assert.equal(f.output.snapshot().text, "verified\nsame capture\n", label);
+    delta(next, "20", "other terminal", hit.paneId, { sequence: "50", paneUuid: later });
+    assert.equal(next.closed, true, label);
+    assert.equal(f.output.snapshot().text, "verified\nsame capture\n", label);
+    assert.equal(f.output.snapshot().terminal, true, label);
+    assert.match(f.output.snapshot().error, /another capture reused this pane ID/, label);
+  }
+});
+
+test("a delta whose capture UUID is not one is rejected, not treated as unknown", () => {
+  for (const paneUuid of ["ABCDEF0123456789ABCDEF0123456789", "abc", 7, {}]) {
+    const f = fixture();
+    f.output.select("7");
+    delta(f.latest(), "9", "kept\n");
+    const source = f.latest();
+    delta(source, "10", "rejected", "7", { paneUuid });
+    assert.equal(source.closed, true, JSON.stringify(paneUuid));
+    assert.equal(f.output.snapshot().text, "kept\n");
+    assert.equal(f.output.snapshot().cursor, "9");
   }
 });

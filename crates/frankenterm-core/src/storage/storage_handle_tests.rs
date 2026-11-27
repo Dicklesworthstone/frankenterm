@@ -575,6 +575,80 @@ fn storage_handle_segment_capture_identities_keep_each_lifetime_of_a_reused_pane
 }
 
 #[test]
+fn storage_handle_segment_stream_page_names_each_segments_capture() {
+    // ft-tje6dm: a reused pane ID continues its per-pane seq, so the output
+    // stream carries each segment's capture UUID, read by the page's own
+    // statement. Provenance bound to another pane is never attributed.
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        let cx = crate::cx::for_testing();
+        let mut uuids = Vec::new();
+        for (pane_id, created_at) in [(7, 1), (7, 2), (8, 1)] {
+            let uuid = crate::ingest::generate_pane_uuid("local", pane_id, created_at);
+            let mut lifetime = test_pane(pane_id);
+            lifetime.pane_uuid = Some(uuid.clone());
+            handle
+                .prepare_pane_capture_with_cx(&cx, lifetime, None, false)
+                .await
+                .unwrap();
+            uuids.push(uuid);
+        }
+        let first = handle.append_segment(7, "first", None).await.unwrap();
+        let second = handle.append_segment(7, "second", None).await.unwrap();
+        let foreign = handle.append_segment(7, "foreign", None).await.unwrap();
+        let unbound = handle.append_segment(7, "unbound", None).await.unwrap();
+        // As in the test above, bind the rows directly. The third binding
+        // names pane 8, which no production append would record.
+        let conn = Connection::open(&db_path).unwrap();
+        for (segment_id, capture_uuid) in [
+            (first.id, &uuids[0]),
+            (second.id, &uuids[1]),
+            (foreign.id, &uuids[2]),
+        ] {
+            conn.execute(
+                "INSERT INTO output_segment_captures (segment_id, capture_uuid) VALUES (?1, ?2)",
+                rusqlite::params![segment_id, capture_uuid],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let page = handle
+            .get_segments_stream_page_with_cx(
+                &cx,
+                SegmentScanQuery {
+                    after_id: Some(0),
+                    pane_id: Some(7),
+                    since: None,
+                    until: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.segments
+                .iter()
+                .map(|segment| segment.id)
+                .collect::<Vec<_>>(),
+            [first.id, second.id, foreign.id, unbound.id],
+            "provenance never adds or removes rows"
+        );
+        assert_eq!(
+            page.capture_uuids,
+            std::collections::HashMap::from([
+                (first.id, uuids[0].clone()),
+                (second.id, uuids[1].clone()),
+            ])
+        );
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
 fn query_panes_by_ids_chunks_large_unsorted_duplicate_sets() {
     let backend = memory_pane_backend();
     let pane_count = u64::try_from(PANE_IDS_PER_QUERY).unwrap() + 1;

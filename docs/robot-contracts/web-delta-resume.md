@@ -35,9 +35,17 @@ For example, a pane-7 message for persisted segment 9001 has:
 ```text
 event: delta
 id: delta-v2:0123456789abcdef0123456789abcdef:pane:7:9001
-data: {"schema":"ft.stream.v1","stream":"deltas","kind":"delta","seq":2,"ts_ms":123,"data":{"segment_id":9001,"pane_id":7,"seq":31,"captured_at":100,"content_len":5,"content":"hello"}}
+data: {"schema":"ft.stream.v1","stream":"deltas","kind":"delta","seq":2,"ts_ms":123,"data":{"segment_id":9001,"pane_id":7,"pane_uuid":"0123456789abcdef0123456789abcdef","seq":31,"captured_at":100,"content_len":5,"content":"hello"}}
 
 ```
+
+`data.pane_uuid` names the capture the segment belongs to: 32 lowercase
+hexadecimal characters, or `null` when its producer recorded none (output
+stored before capture provenance existed). A numeric pane ID can be reused by
+a new terminal, and the pane-local `data.seq` continues across that reuse, so
+a client following one capture must stop when `pane_uuid` changes. The
+browser viewer's follow mode does, and treats `null` on one side and a UUID on
+the other as a change.
 
 A reconnecting EventSource supplies that id in `Last-Event-ID`. A nonempty,
 valid header takes precedence over the original URL's `cursor` and `since_id`, so an
