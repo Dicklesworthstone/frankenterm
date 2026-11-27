@@ -1325,8 +1325,7 @@ mod tests {
                 "fresh DB must have no incomplete workflows"
             );
         });
-        drop(runtime);
-        let _ = std::panic::catch_unwind(crate::runtime_async::clear_runtime_handle);
+        crate::runtime_async::test_support::finish_test_runtime(runtime, Ok(()));
     }
 
     // ========================================================================

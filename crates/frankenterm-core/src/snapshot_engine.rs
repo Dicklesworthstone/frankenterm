@@ -19311,17 +19311,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
@@ -19340,15 +19330,7 @@ mod tests {
                 let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(f());
                 }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(runtime);
-                }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::runtime_async::clear_runtime_handle();
-                }));
-                if let Err(payload) = test_result {
-                    std::panic::resume_unwind(payload);
-                }
+                crate::runtime_async::test_support::finish_test_runtime(runtime, test_result);
             })
             .expect("failed to spawn isolated test thread")
             .join();

@@ -25,15 +25,7 @@ where
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(future);
     }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(runtime);
-    }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::runtime_async::clear_runtime_handle();
-    }));
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
+    crate::runtime_async::test_support::finish_test_runtime(runtime, result);
 }
 
 async fn fresh_storage(suffix: &str) -> (StorageHandle, std::path::PathBuf) {

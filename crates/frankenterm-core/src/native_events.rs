@@ -2572,13 +2572,7 @@ mod transport_roundtrip_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
@@ -3218,17 +3212,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {

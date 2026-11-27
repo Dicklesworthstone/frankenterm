@@ -6829,16 +6829,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             CompatRuntime::block_on(&runtime, future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     // br-ft-x2oyy: function-level test-server close notification contract.
@@ -7070,15 +7061,7 @@ mod tests {
                 let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     CompatRuntime::block_on(&runtime, f());
                 }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(runtime);
-                }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::runtime_async::clear_runtime_handle();
-                }));
-                if let Err(payload) = test_result {
-                    std::panic::resume_unwind(payload);
-                }
+                crate::runtime_async::test_support::finish_test_runtime(runtime, test_result);
             })
             .expect("failed to spawn isolated test thread")
             .join();

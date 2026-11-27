@@ -347,13 +347,7 @@ where
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(future);
     }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        frankenterm_core::runtime_async::clear_runtime_handle();
-    }));
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
+    frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result);
 }
 
 /// retention (ft-rrqhm): `storage.retention_max_mb` is honored behaviorally —

@@ -1090,15 +1090,7 @@ mod tests {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.block_on(make_future());
             }));
-            let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::runtime_async::clear_runtime_handle();
-            }));
-            for result in [outcome, teardown, cleanup] {
-                if let Err(payload) = result {
-                    std::panic::resume_unwind(payload);
-                }
-            }
+            crate::runtime_async::test_support::finish_test_runtime(runtime, outcome);
         })
         .join();
         if let Err(payload) = joined {
@@ -1392,13 +1384,7 @@ mod tests {
                 assert_eq!(legacy.shell.shell_type, cx_first.shell.shell_type);
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     #[test]

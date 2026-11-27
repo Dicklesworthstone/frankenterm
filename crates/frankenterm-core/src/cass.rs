@@ -1967,10 +1967,7 @@ mod tests {
             client.search_with_cx(&cx, "test", &options).await
         });
 
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
+        crate::runtime_async::test_support::finish_test_runtime(runtime, Ok(()));
 
         // Invalid binary must surface an IO-shaped error. The exact
         // variant (NotFound/SpawnFailure) depends on how the OS
@@ -2031,12 +2028,8 @@ mod tests {
                 (outcome, elapsed)
             })
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
         let (outcome, elapsed) =
-            result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            crate::runtime_async::test_support::finish_test_runtime(runtime, result);
         assert!(
             matches!(outcome, Err(CassError::Timeout { timeout_secs: 20 })),
             "a cancelled cass call reports the timeout: {outcome:?}"
@@ -2097,13 +2090,7 @@ mod tests {
                 let _ = std::fs::remove_file(&tmp);
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     /// ft-xbnl0.2.3 Cx-first: `export_sessions_with_cx` with a
@@ -2148,12 +2135,6 @@ mod tests {
                 let _ = std::fs::remove_file(&tmp);
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 }

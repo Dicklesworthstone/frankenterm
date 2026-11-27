@@ -4608,13 +4608,7 @@ mod transport_roundtrip_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     #[test]
@@ -5537,13 +5531,7 @@ mod tests {
                 assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     /// ft-xbnl0.2.3 Cx-first: `ping_with_cx` must match the
@@ -5604,13 +5592,7 @@ mod tests {
                 }
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     fn build_auth(token: &str, scopes: Vec<IpcScope>, expires_at_ms: Option<u64>) -> IpcAuth {
@@ -6393,17 +6375,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     #[test]

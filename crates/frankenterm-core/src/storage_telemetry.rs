@@ -1302,10 +1302,7 @@ mod tests {
                 );
             }
         });
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
+        crate::runtime_async::test_support::finish_test_runtime(runtime, Ok(()));
     }
 
     #[test]
@@ -1890,10 +1887,7 @@ mod tests {
                 Instant::now(),
             ))
             .unwrap_err();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
+        crate::runtime_async::test_support::finish_test_runtime(runtime, Ok(()));
         assert!(matches!(
             error,
             RecorderStorageError::BackendIdentityMismatch {
@@ -2067,13 +2061,7 @@ mod tests {
                 assert_eq!(telem.registry().counter_value(&backend_batches), 1);
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     /// Once append work has produced an outcome, later caller cancellation
@@ -2176,13 +2164,7 @@ mod tests {
                 assert_eq!(telem.registry().counter_value(&backend_overload), 1);
             });
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     // Batch: DarkBadger wa-1u90p.7.1

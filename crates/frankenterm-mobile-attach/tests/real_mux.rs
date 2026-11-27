@@ -10,7 +10,6 @@
 #![cfg(unix)]
 
 use std::io::Write;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -223,15 +222,12 @@ impl Probe {
             .expect("write to the test's own pane");
     }
 
-    /// Drop the client before its runtime, then the runtime the way the
-    /// project's harnesses do, so thread teardown cannot abort the test.
+    /// Drop the client before its runtime, then finish the runtime with the
+    /// shared teardown check, so a teardown panic fails the test (ft-upcfpm).
     fn close(self) {
         let Self { client, runtime } = self;
         drop(client);
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(move || drop(runtime)));
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(
-            frankenterm_core::runtime_async::clear_runtime_handle,
-        ));
+        frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, Ok(()));
     }
 
     fn spawn_window(&mut self) -> u64 {

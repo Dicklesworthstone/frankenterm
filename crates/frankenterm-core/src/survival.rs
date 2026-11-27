@@ -2058,15 +2058,7 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::runtime_async::CompatRuntime::block_on(&runtime, runner.run());
             }));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop(runtime);
-            }));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::runtime_async::clear_runtime_handle();
-            }));
-            if let Err(payload) = result {
-                std::panic::resume_unwind(payload);
-            }
+            crate::runtime_async::test_support::finish_test_runtime(runtime, result);
         });
 
         std::thread::sleep(Duration::from_millis(200));

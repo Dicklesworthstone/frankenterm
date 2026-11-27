@@ -5325,13 +5325,7 @@ mod tests {
         let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        crate::runtime_async::clear_runtime_handle();
-        if let Err(payload) = test_result {
-            std::panic::resume_unwind(payload);
-        }
+        crate::runtime_async::test_support::finish_test_runtime(runtime, test_result);
     }
 
     #[test]

@@ -9505,6 +9505,140 @@ pub async fn oneshot_recv_with_cx<T>(
     received.map_err(|error| error.to_string())
 }
 
+/// Test support shared by every crate's async test helpers (ft-upcfpm).
+///
+/// Not part of the runtime API, and nothing outside tests calls it. It is
+/// public and built in every configuration, because integration tests and
+/// dependent crates cannot see `#[cfg(test)]` items. They need the same
+/// teardown check as this crate's unit tests.
+#[doc(hidden)]
+pub mod test_support {
+    use super::clear_runtime_handle;
+
+    std::thread_local! {
+        static TEARDOWN_PANIC: std::cell::RefCell<TeardownRecorder> =
+            const { std::cell::RefCell::new(TeardownRecorder::Idle) };
+    }
+
+    /// The teardown recorder's state on one thread.
+    enum TeardownRecorder {
+        /// No test runtime is being torn down on this thread.
+        Idle,
+        /// `finish_test_runtime` is tearing a test runtime down; no panic yet.
+        Armed,
+        /// The first panic raised during that teardown.
+        Caught(TeardownPanic),
+    }
+
+    /// A panic raised while a test runtime is torn down. asupersync 0.6
+    /// catches a local task's destructor panic in `LocalTaskStore::drop` and
+    /// records it as that task's retirement instead of unwinding through
+    /// `Runtime::drop`, and nothing observes the retirement of a task whose
+    /// handle was dropped. The recorder keeps that failure from passing
+    /// silently.
+    enum TeardownPanic {
+        Static(&'static str),
+        Owned(String),
+    }
+
+    impl TeardownPanic {
+        fn into_payload(self) -> Box<dyn std::any::Any + Send> {
+            match self {
+                Self::Static(message) => Box::new(message),
+                Self::Owned(message) => Box::new(message),
+            }
+        }
+    }
+
+    fn install_teardown_panic_recorder_once() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                // An audited recovery boundary is not a teardown failure. The
+                // try_ accessors keep a panic from a TLS destructor, or one
+                // raised while the slot is borrowed, from panicking again.
+                if !frankenterm_sigpipe::is_recoverable_panic() {
+                    let _ = TEARDOWN_PANIC.try_with(|slot| {
+                        if let Ok(mut slot) = slot.try_borrow_mut()
+                            && matches!(*slot, TeardownRecorder::Armed)
+                        {
+                            let payload = info.payload();
+                            *slot = TeardownRecorder::Caught(
+                                if let Some(message) =
+                                    payload.downcast_ref::<&'static str>().copied()
+                                {
+                                    TeardownPanic::Static(message)
+                                } else if let Some(message) = payload.downcast_ref::<String>() {
+                                    TeardownPanic::Owned(message.clone())
+                                } else {
+                                    TeardownPanic::Static(
+                                        "runtime teardown panicked with a non-string payload",
+                                    )
+                                },
+                            );
+                        }
+                    });
+                }
+                previous(info);
+            }));
+        });
+    }
+
+    /// Finish an async test: drop its runtime, clear this thread's runtime
+    /// handle, then return the body's value or fail the test.
+    ///
+    /// `body` is the test body's result, usually `std::panic::catch_unwind`
+    /// around `runtime.block_on(..)`. Both cleanup steps always run. The test
+    /// then fails with the first of: the body's panic, a panic that unwound
+    /// out of the runtime's drop, a panic from clearing the handle, and a
+    /// panic the runtime caught and isolated while it dropped (a task
+    /// destructor's, for example). Later failures are disposed of without
+    /// replacing the first.
+    ///
+    /// # Panics
+    ///
+    /// Resumes the first failure described above.
+    pub fn finish_test_runtime<R, T>(runtime: R, body: std::thread::Result<T>) -> T {
+        // These are test failure boundaries, not production recovery: every
+        // failure must still fail the test, after both cleanup steps run.
+        install_teardown_panic_recorder_once();
+        TEARDOWN_PANIC.with(|slot| *slot.borrow_mut() = TeardownRecorder::Armed);
+        let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_runtime_handle));
+        let isolated = TEARDOWN_PANIC.with(|slot| {
+            match std::mem::replace(&mut *slot.borrow_mut(), TeardownRecorder::Idle) {
+                TeardownRecorder::Caught(isolated) => Some(isolated),
+                TeardownRecorder::Idle | TeardownRecorder::Armed => None,
+            }
+        });
+        // A teardown panic the runtime caught and isolated fails the test too,
+        // unless a panic already unwound out of teardown or cleanup.
+        let teardown = match (teardown, &cleanup, isolated) {
+            (Ok(()), Ok(()), Some(isolated)) => Err(isolated.into_payload()),
+            (teardown, _, _) => teardown,
+        };
+        let mut later = [teardown, cleanup].into_iter().filter_map(Result::err);
+        let first_failure = match body {
+            Ok(value) => match later.next() {
+                None => return value,
+                Some(payload) => payload,
+            },
+            Err(payload) => payload,
+        };
+        for payload in later {
+            // The test already fails with the earlier payload. Even a later
+            // payload's destructor must not replace that failure or abort a
+            // resumed unwind.
+            let _ = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
+                std::panic::AssertUnwindSafe(|| drop(payload)),
+            );
+        }
+        std::panic::resume_unwind(first_failure)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10032,6 +10166,51 @@ mod tests {
         assert_runtime_teardown_failure(false, true, true);
     }
 
+    /// Helpers whose body returns a value use `finish_test_runtime` too
+    /// (ft-upcfpm): the value comes back only after a clean teardown.
+    #[test]
+    fn finish_test_runtime_returns_the_body_value_only_after_a_clean_teardown() {
+        clear_runtime_handle();
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for async test");
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async { 7_u32 })
+        }));
+        assert_eq!(test_support::finish_test_runtime(runtime, body), 7);
+        assert!(current_runtime_handle().is_none());
+
+        let body_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for async test");
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                park_runtime_teardown_probe(
+                    Arc::clone(&body_finished),
+                    Arc::clone(&dropped),
+                    true,
+                    false,
+                )
+                .await;
+                7_u32
+            })
+        }));
+        assert_eq!(body.as_ref().ok(), Some(&7), "the body itself succeeded");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            test_support::finish_test_runtime(runtime, body)
+        }));
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(current_runtime_handle().is_none());
+        let payload =
+            result.expect_err("a teardown failure must fail a body that returned a value");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("runtime-owned teardown failure")
+        );
+    }
+
     #[test]
     #[cfg(all(feature = "asupersync-runtime", unix))]
     fn runtime_teardown_failure_is_propagated_from_isolated_helper() {
@@ -10158,118 +10337,7 @@ mod tests {
         let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        finish_async_test(runtime, test_result);
-    }
-
-    std::thread_local! {
-        static TEARDOWN_PANIC: std::cell::RefCell<TeardownRecorder> =
-            const { std::cell::RefCell::new(TeardownRecorder::Idle) };
-    }
-
-    /// The teardown recorder's state on one thread.
-    enum TeardownRecorder {
-        /// No test runtime is being torn down on this thread.
-        Idle,
-        /// `finish_async_test` is tearing a test runtime down; no panic yet.
-        Armed,
-        /// The first panic raised during that teardown.
-        Caught(TeardownPanic),
-    }
-
-    /// A panic raised while a test runtime is torn down. asupersync 0.6
-    /// catches a local task's destructor panic in `LocalTaskStore::drop` and
-    /// records it as that task's retirement instead of unwinding through
-    /// `Runtime::drop`, and nothing observes the retirement of a task whose
-    /// handle was dropped. The recorder keeps that failure from passing
-    /// silently.
-    enum TeardownPanic {
-        Static(&'static str),
-        Owned(String),
-    }
-
-    impl TeardownPanic {
-        fn into_payload(self) -> Box<dyn std::any::Any + Send> {
-            match self {
-                Self::Static(message) => Box::new(message),
-                Self::Owned(message) => Box::new(message),
-            }
-        }
-    }
-
-    fn install_teardown_panic_recorder_once() {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            let previous = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                // An audited recovery boundary is not a teardown failure. The
-                // try_ accessors keep a panic from a TLS destructor, or one
-                // raised while the slot is borrowed, from panicking again.
-                if !frankenterm_sigpipe::is_recoverable_panic() {
-                    let _ = TEARDOWN_PANIC.try_with(|slot| {
-                        if let Ok(mut slot) = slot.try_borrow_mut()
-                            && matches!(*slot, TeardownRecorder::Armed)
-                        {
-                            let payload = info.payload();
-                            *slot = TeardownRecorder::Caught(
-                                if let Some(message) =
-                                    payload.downcast_ref::<&'static str>().copied()
-                                {
-                                    TeardownPanic::Static(message)
-                                } else if let Some(message) = payload.downcast_ref::<String>() {
-                                    TeardownPanic::Owned(message.clone())
-                                } else {
-                                    TeardownPanic::Static(
-                                        "runtime teardown panicked with a non-string payload",
-                                    )
-                                },
-                            );
-                        }
-                    });
-                }
-                previous(info);
-            }));
-        });
-    }
-
-    fn finish_async_test(runtime: Runtime, test_result: std::thread::Result<()>) {
-        // These are test failure boundaries, not production recovery: every
-        // failure must still fail the test, after both cleanup steps run.
-        install_teardown_panic_recorder_once();
-        TEARDOWN_PANIC.with(|slot| *slot.borrow_mut() = TeardownRecorder::Armed);
-        let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_runtime_handle));
-        let isolated = TEARDOWN_PANIC.with(|slot| {
-            match std::mem::replace(&mut *slot.borrow_mut(), TeardownRecorder::Idle) {
-                TeardownRecorder::Caught(isolated) => Some(isolated),
-                TeardownRecorder::Idle | TeardownRecorder::Armed => None,
-            }
-        });
-        // A teardown panic the runtime caught and isolated fails the test too,
-        // unless a panic already unwound out of teardown or cleanup.
-        let teardown = match (teardown, &cleanup, isolated) {
-            (Ok(()), Ok(()), Some(isolated)) => Err(isolated.into_payload()),
-            (teardown, _, _) => teardown,
-        };
-        let mut first_failure = None;
-        for payload in [test_result, teardown, cleanup]
-            .into_iter()
-            .filter_map(Result::err)
-        {
-            if first_failure.is_none() {
-                first_failure = Some(payload);
-            } else {
-                // The test already fails with the earlier payload. Even
-                // a secondary payload's destructor must not replace that
-                // failure or abort a resumed unwind.
-                let _ = frankenterm_sigpipe::catch_recoverable(
-                    frankenterm_sigpipe::RecoverablePanicSite::CoreAsyncTaskJoin,
-                    std::panic::AssertUnwindSafe(|| drop(payload)),
-                );
-            }
-        }
-        if let Some(payload) = first_failure {
-            std::panic::resume_unwind(payload);
-        }
+        test_support::finish_test_runtime(runtime, test_result);
     }
 
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
@@ -10289,7 +10357,7 @@ mod tests {
                 let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(f());
                 }));
-                finish_async_test(runtime, test_result);
+                test_support::finish_test_runtime(runtime, test_result);
             })
             .expect("failed to spawn isolated test thread")
             .join();

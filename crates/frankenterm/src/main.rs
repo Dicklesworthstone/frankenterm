@@ -36951,13 +36951,7 @@ mod watch_events_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            frankenterm_core::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
+        frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     fn watch_claim_query(after_id: i64) -> frankenterm_core::storage::EventStreamQuery {
@@ -44385,13 +44379,7 @@ fn endpoint_local_webhook_timeout_does_not_stop_two_endpoint_fanout() {
             assert_eq!(records[1].status_code, 204);
         });
     }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        frankenterm_core::runtime_async::clear_runtime_handle();
-    }));
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
+    frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result);
 }
 
 #[cfg(test)]
@@ -44569,16 +44557,7 @@ fn asupersync_webhook_send_with_cx_short_circuits_exact_cancelled_caller() {
             assert!(!format!("{result:?}").contains("SECRET"));
         });
     }));
-    // Runtime::block_on intentionally retains its ambient handle. Test
-    // teardown must drop the runtime first and then clear that TLS slot under
-    // containment; otherwise a destructor panic can leak into a later test.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        frankenterm_core::runtime_async::clear_runtime_handle();
-    }));
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
+    frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result);
 }
 
 const WATCHER_CRASH_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -105797,15 +105776,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            frankenterm_core::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
+        frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result);
     }
 
     #[test]

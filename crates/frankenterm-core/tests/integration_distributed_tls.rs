@@ -177,14 +177,7 @@ where
     let runtime = RuntimeBuilder::current_thread().enable_all().build()?;
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        frankenterm_core::runtime_async::clear_runtime_handle();
-    }));
-    match result {
-        Ok(inner) => inner,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    frankenterm_core::runtime_async::test_support::finish_test_runtime(runtime, result)
 }
 
 async fn assert_tls_accept_fails(server_task: task::JoinHandle<TestResult<bool>>) -> TestResult {

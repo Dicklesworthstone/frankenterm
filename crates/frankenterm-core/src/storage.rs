@@ -40996,10 +40996,10 @@ fn prepared_plan_query_rejects_negative_pane_id() {
 // [ft-upvjr / ft-3tvvt] The lighter-weight `run_async_test` was removed
 // — every `#[test]` in `storage.rs` and the four sibling test files
 // (storage_handle_tests, queue_depth_tests, backpressure_integration_tests,
-// timeline_integration_tests) now routes through the panic-catching +
-// runtime-drop-absorbing `run_storage_async_test` below. Centralizing on
-// the robust helper means a TLS destructor panic during runtime drop no
-// longer leaks across `#[test]` boundaries on asupersync.
+// timeline_integration_tests) now routes through `run_storage_async_test`
+// below. It finishes the runtime with the shared teardown check
+// (runtime_async::test_support::finish_test_runtime, ft-upcfpm): a panic
+// while the runtime drops is contained to its own test and fails that test.
 
 #[cfg(test)]
 pub fn run_storage_async_test<F>(future: F)
@@ -41014,15 +41014,7 @@ where
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(future);
     }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(runtime);
-    }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::runtime_async::clear_runtime_handle();
-    }));
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
+    crate::runtime_async::test_support::finish_test_runtime(runtime, result);
 }
 
 #[test]
@@ -41679,8 +41671,8 @@ fn v35_fts_version_upgrade_repairs_historical_stale_rowid_postings() {
 /// [ft-iq339 / ft-3tvvt] Multi-thread sibling of
 /// [`run_storage_async_test`] for proptest cases that need the
 /// multi-thread runtime (writer + reader concurrency under
-/// proptest-driven load). Same panic-catching + runtime-drop-absorbing
-/// envelope, but the body returns the future's value so the proptest
+/// proptest-driven load). Same panic-catching body and shared teardown
+/// check, but the body returns the future's value so the proptest
 /// can `prop_assert_*` on the verification results outside the
 /// async block. Replaces the ad-hoc `RuntimeBuilder::multi_thread()
 /// .build().expect(...).block_on(...)` boilerplate in
@@ -41696,16 +41688,7 @@ where
         .expect("failed to build storage proptest runtime");
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(runtime);
-    }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::runtime_async::clear_runtime_handle();
-    }));
-    match result {
-        Ok(value) => value,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    crate::runtime_async::test_support::finish_test_runtime(runtime, result)
 }
 
 /// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must

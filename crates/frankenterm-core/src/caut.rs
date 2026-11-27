@@ -760,12 +760,8 @@ mod tests {
                 (outcome, elapsed)
             })
         }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
         let (outcome, elapsed) =
-            result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            crate::runtime_async::test_support::finish_test_runtime(runtime, result);
         assert!(
             matches!(outcome, Err(CautError::Timeout { timeout_secs: 20 })),
             "a cancelled caut call reports the timeout: {outcome:?}"
