@@ -3535,7 +3535,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
             "frankenterm-gui",
             // FT_RESOURCE_SNAPSHOT_INTERVAL_MS overrides it (ft-yccm0.1.4).
             frankenterm_alloc::resource_ledger::resource_snapshot_interval(
-                std::time::Duration::from_secs(2),
+                RESOURCE_SNAPSHOT_DEFAULT_INTERVAL,
             ),
             collect_resource_snapshot,
         ) {
@@ -3672,6 +3672,21 @@ pub(crate) fn shaping_snapshot() -> frankenterm_alloc::resource_ledger::ShapingS
         bypassed_cluster_shapes_total: totals.bypassed_cluster_shapes,
     }
 }
+
+/// How often the GUI collects its resource snapshot and republishes it when it
+/// changed. FT_RESOURCE_SNAPSHOT_INTERVAL_MS overrides it.
+///
+/// The snapshot carries counters (frames presented, shapes, latency totals)
+/// that move on every frame, so a rendering GUI republishes at this interval:
+/// a fresh file and a rename each time. At 2 s that was about 43,000
+/// replacements a day, and macOS logged a "disk writes" resource event for
+/// the GUI every day (2 GiB of file-backed memory dirtied in 16-24 h, 25-37
+/// KB/s against its 24.86 KB/s daily limit; the write stack was this
+/// publisher). Readers do not need 2 s: `ft doctor` treats a snapshot as fresh
+/// for 90 s, scripts/mac-gui-footprint.sh copies it once per capture, and the
+/// throughput harness and repaint e2e set their own interval. Each collection
+/// also takes every pane's terminal lock briefly.
+const RESOURCE_SNAPSHOT_DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
 /// publisher thread; each pane's tier status and writer backlog take that

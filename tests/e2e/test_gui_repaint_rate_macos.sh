@@ -75,7 +75,10 @@ counter() { # json-key-path
 launch() { # mode [unfocused_max_fps]
     rm -rf -- "${E:?}/home"
     mkdir -p "$E/home"
+    # The fps check reads frames.presented_total at two publication times, so
+    # pin the cadence it was written against rather than the GUI's default.
     open -g -n --env HOME="$E/home" --env FT_RR_HOME="$E/home" --env FT_RR_MODE="$1" \
+        --env FT_RESOURCE_SNAPSHOT_INTERVAL_MS=2000 \
         --env FT_RR_X="$FT_RR_X" --env FT_RR_Y="$FT_RR_Y" ${2:+--env "FT_RR_UNFOCUSED=$2"} \
         --env FRANKENTERM_LUA_CONFIG=1 --stderr "$E/home/gui.err" \
         -a "$APP" --args --config-file "$E/gui.lua" start
