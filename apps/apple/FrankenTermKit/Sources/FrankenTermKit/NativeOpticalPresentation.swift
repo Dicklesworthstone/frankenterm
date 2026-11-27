@@ -106,30 +106,54 @@ public struct OpticalExportSession: Sendable, CustomDebugStringConvertible {
 /// Finite recordings contain every source symbol plus the planned repair set.
 /// When the existing frame budget permits, fresh repair symbols extend the
 /// schedule to a prime loop length, breaking periodic capture aliasing across
-/// loops. At capacity the complete original schedule is preserved. Replaying
-/// either schedule cannot create new fountain information or overcome arbitrary
+/// loops. When the next prime exceeds the budget, a composite loop can still
+/// break aliasing for common capture strides. Replay cannot overcome arbitrary
 /// permanent losses; slow playback and live page repair remain available.
 public struct OpticalAnimationPlan: Sendable {
     public struct Address: Sendable, Equatable { public let page: Int, sequence: UInt32 }
     public let addresses: [Address]
+
+    private static func recordingLength(required: Int, maximum: Int) -> Int {
+        if let prime = OpticalCadence.primeLength(atLeast: required, atMost: maximum) {
+            return prime
+        }
+        // Every candidate here is composite. Any stride smaller than its
+        // first factor visits every position as the recording loops. Prefer
+        // the widest guarantee, and the shortest recording on a tie.
+        var best = required, bestFactor = 1
+        for length in required...maximum {
+            var divisor = 2
+            while !length.isMultiple(of: divisor) { divisor += 1 }
+            if divisor > bestFactor {
+                best = length
+                bestFactor = divisor
+            }
+        }
+        return best
+    }
+
     public init(sender: OpticalSender, maximumFrames: Int = 4096) throws {
         guard maximumFrames > 0, maximumFrames <= 4096 else { throw FTError.limit("animation.frames") }
-        let counts = try (0..<sender.identity.pageCount).map { page in
-            let n = try sender.sourcePartCount(page: page)
-            return n == 1 ? 1 : n + (n + 1) / 2 + 16
-        }
+        let sources = try (0..<sender.identity.pageCount).map { try sender.sourcePartCount(page: $0) }
+        let counts = sources.map { n in n == 1 ? 1 : n + (n + 1) / 2 + 16 }
         let total = counts.reduce(0, +)
         guard total <= maximumFrames else { throw FTError.limit("animation.use_live_transfer") }
         let repairPages = counts.indices.filter { counts[$0] > 1 }
         let paddedTotal = repairPages.isEmpty ? total
-            : OpticalCadence.primeLength(atLeast: total, atMost: maximumFrames) ?? total
+            : Self.recordingLength(required: total, maximum: maximumFrames)
         var positions = Array(repeating: 0, count: counts.count), result: [Address] = []
         result.reserveCapacity(paddedTotal)
-        while result.count < total {
-            for page in counts.indices {
-                for _ in 0..<min(8, counts[page] - positions[page]) {
-                    positions[page] += 1
-                    result.append(.init(page: page, sequence: UInt32(positions[page])))
+        // A clean capture from the start can finish as soon as every source
+        // fragment has aired. Keep the eight-symbol visits, but defer repairs
+        // for short pages until the longest page has finished its source pass.
+        for limits in [sources, counts] {
+            let end = limits.reduce(0, +)
+            while result.count < end {
+                for page in limits.indices {
+                    for _ in 0..<min(8, limits[page] - positions[page]) {
+                        positions[page] += 1
+                        result.append(.init(page: page, sequence: UInt32(positions[page])))
+                    }
                 }
             }
         }
