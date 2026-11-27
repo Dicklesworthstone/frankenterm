@@ -746,9 +746,16 @@ impl RenderThread {
 
     /// The shortest time between two frames: the `max_fps` interval.
     pub fn set_min_frame_interval(&self, interval: Duration) {
-        self.shared
+        let interval_ns = nanos(interval);
+        let previous = self
+            .shared
             .min_frame_interval_ns
-            .store(nanos(interval), Ordering::Relaxed);
+            .swap(interval_ns, Ordering::Relaxed);
+        if interval_ns < previous {
+            // A requested frame can be parked until the old deadline. It
+            // already has pending set, so another ordinary wake coalesces.
+            self.shared.unpark();
+        }
     }
 
     pub fn stats(&self) -> RenderThreadStats {
@@ -877,6 +884,7 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
     let mut paused = false;
     let mut occlusion = OcclusionState::default();
     let mut running = false;
+    let mut awaiting_first_tick_frame = true;
     let mut cadence = VsyncCadence::default();
     let mut activity = Activity::default();
     let mut rate: Option<FrameRateRange> = None;
@@ -949,8 +957,8 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
                 let report = build_frame(shared, &mut driver, &mut configured, &surface, true);
                 let finished = Instant::now();
                 budget.observe(finished.saturating_duration_since(started));
-                last_frame = Some(finished);
-                immediate_frame_at = Some(finished);
+                last_frame = Some(started);
+                immediate_frame_at = Some(started);
                 cadence = VsyncCadence::default();
                 if let Some(at) = report.redraw_at {
                     redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
@@ -964,6 +972,7 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
             }
             source.set_running(true);
             running = true;
+            awaiting_first_tick_frame = true;
             shared.link_starts.fetch_add(1, Ordering::Relaxed);
         }
         let timeout = if running {
@@ -987,7 +996,17 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
             continue;
         }
         immediate_frame_at = None;
-        let ticks = ticks_per_frame(tick.interval, shared.min_frame_interval());
+        let interval = shared.min_frame_interval();
+        // No refresh callbacks arrive while the link is paused. When a
+        // whole frame interval has already elapsed, the first dirty tick
+        // can draw even if the pre-pause tick counter is still short.
+        let ticks = if awaiting_first_tick_frame
+            && last_frame.is_some_and(|last| now.saturating_duration_since(last) >= interval)
+        {
+            1
+        } else {
+            ticks_per_frame(tick.interval, interval)
+        };
         match cadence.on_tick(dirty, ticks) {
             TickDecision::Frame => {}
             TickDecision::Skip => {
@@ -1033,7 +1052,8 @@ fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn
         let report = build_frame(shared, &mut driver, &mut configured, &surface, false);
         let finished = Instant::now();
         budget.observe(finished.saturating_duration_since(now));
-        last_frame = Some(finished);
+        last_frame = Some(now);
+        awaiting_first_tick_frame = false;
         if tick
             .render_deadline
             .is_some_and(|deadline| finished > deadline)
@@ -1133,8 +1153,10 @@ fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
             redraw_at = None;
         }
 
-        let report = build_frame(shared, &mut driver, &mut configured, &surface, false);
+        // The frame budget includes reconfiguration, building and encoding.
+        // Only the time left in it should delay the next requested frame.
         last_frame = Some(Instant::now());
+        let report = build_frame(shared, &mut driver, &mut configured, &surface, false);
         if let Some(at) = report.redraw_at {
             redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
         }
@@ -1713,6 +1735,18 @@ mod tests {
             "{frames} frames in {elapsed:?} at a 20 ms interval"
         );
         assert!(frames >= 2, "wakes produced {frames} frames");
+    }
+
+    #[test]
+    fn raising_the_frame_cap_releases_an_already_requested_frame() {
+        let (thread, _) = spawn_recording(correlated(0), Duration::from_secs(120), Duration::ZERO);
+        assert!(eventually(|| thread.stats().frames_submitted == 1));
+        thread.waker().wake();
+        // Let the scheduler park at the old cap with this request pending.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(thread.stats().frames_submitted, 1);
+        thread.set_min_frame_interval(Duration::ZERO);
+        assert!(eventually(|| thread.stats().frames_submitted == 2));
     }
 
     // ft-yccm0.4.1.3: display-link pacing, with a fake link the test ticks.
@@ -2376,6 +2410,26 @@ mod tests {
         link.tick(hz(60.0));
         assert_eq!(thread.stats().frames_built, 2);
         assert_eq!(thread.stats().link_starts, 2);
+    }
+
+    #[test]
+    fn the_first_dirty_refresh_after_idle_counts_time_with_the_link_stopped() {
+        // At 120 Hz a 10 fps cap requires twelve ticks. The link pauses
+        // after four clean ticks, leaving its count below that threshold.
+        let (thread, link) = spawn_with_fake_link(10.0, false);
+        link.tick(hz(120.0));
+        for _ in 0..IDLE_TICKS_BEFORE_PAUSE {
+            link.tick(hz(120.0));
+        }
+        assert_eq!(link.running(), [true, false]);
+        std::thread::sleep(hz(10.0));
+        thread.waker().wake();
+        assert!(eventually(|| link.running() == [true, false, true]));
+        link.tick(hz(120.0));
+        assert_eq!(thread.stats().frames_built, 2);
+        thread.waker().wake();
+        link.tick(hz(120.0));
+        assert_eq!(thread.stats().frames_built, 2, "active cadence resumes");
     }
 
     #[test]
