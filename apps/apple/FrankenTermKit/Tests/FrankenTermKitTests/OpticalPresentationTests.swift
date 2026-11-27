@@ -175,10 +175,15 @@ final class OpticalPresentationTests: XCTestCase {
         }
         XCTAssertEqual(plan.addresses.prefix(8).map(\.page), Array(repeating: 0, count: 8))
         XCTAssertEqual(plan.addresses.dropFirst(8).prefix(8).map(\.page), Array(repeating: 1, count: 8))
-        for address in plan.addresses {
+        // This uneven two-page recording used to spend part of the first tour
+        // on the short page's repairs before the long page had aired its source.
+        // Decoding the actual prefix proves a clean capture can stop immediately.
+        let minimumSymbols = sender.identity.sourcePartCount
+        for (index, address) in plan.addresses.prefix(minimumSymbols).enumerated() {
             let frame = try OpticalFrame(text: sender.frame(page: address.page, sequence: address.sequence, using: crypto))
             if receiver == nil { receiver = OpticalReceiver(selecting: frame) }
             try receiver?.receive(frame, using: crypto)
+            XCTAssertEqual(receiver?.receivedParts, index + 1)
         }
         XCTAssertEqual(try receiver?.envelope(using: crypto), envelope)
         XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: requiredFrames - 1), "never truncate a recording")
@@ -231,6 +236,26 @@ final class OpticalPresentationTests: XCTestCase {
         }
     }
 
+    func testLosslessAnimationCapAvoidsResonanceWithoutRoomForAPrime() throws {
+        // This envelope needs 252 symbols including repairs. The next prime
+        // (257) would exceed the lossless APNG writer's 256-symbol budget.
+        let envelope = try recordingEnvelope(bytes: 36_000)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        let plan = try OpticalAnimationPlan(sender: sender, maximumFrames: 256)
+        XCTAssertEqual(plan.addresses.count, 253) // 11 * 23
+        let frames = try plan.addresses.map {
+            try OpticalFrame(text: sender.frame(page: $0.page, sequence: $0.sequence, using: crypto))
+        }
+        for stride in [2, 3, 4, 5, 6, 8, 10] {
+            var receiver = OpticalReceiver(selecting: frames[0])
+            for sample in frames.indices {
+                try receiver.receive(frames[(stride - 1 + stride * sample) % frames.count], using: crypto)
+                if receiver.isComplete { break }
+            }
+            XCTAssertEqual(try receiver.envelope(using: crypto), envelope, "capture stride \(stride)")
+        }
+    }
+
     func testCadencePaddingPreservesCompleteExportsAtCapacityAndSinglePartPages() throws {
         for bytes in [100, 40000, 131000, 634800] {
             let sender = try OpticalSender(envelope: recordingEnvelope(bytes: bytes), using: crypto)
@@ -245,8 +270,9 @@ final class OpticalPresentationTests: XCTestCase {
             XCTAssertEqual(exact.addresses, Array(full.addresses.prefix(required)))
             XCTAssertLessThanOrEqual(full.addresses.count, 4096)
             for capacity in required..<full.addresses.count {
-                XCTAssertEqual(try OpticalAnimationPlan(sender: sender, maximumFrames: capacity).addresses,
-                               exact.addresses, "optional cadence padding must not refuse a complete export")
+                let bounded = try OpticalAnimationPlan(sender: sender, maximumFrames: capacity)
+                XCTAssertLessThanOrEqual(bounded.addresses.count, capacity)
+                XCTAssertEqual(Array(bounded.addresses.prefix(required)), exact.addresses)
             }
             for page in counts.indices {
                 let numbers = full.addresses.filter { $0.page == page }.map(\.sequence)
