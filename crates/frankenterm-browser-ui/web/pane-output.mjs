@@ -433,11 +433,10 @@ export function createPaneOutput({
     gaps = discardedChars = 0;
     unanchored = false;
     retryMs = 1000;
-    status = suspended ? "suspended" : "connecting";
+    // A historical read selected while the page is hidden waits for restore.
+    status = !suspended ? "connecting" : capture === null ? "suspended" : "loading";
     dirty = true;
-    if (capture !== null && suspended) {
-      settleCapture("Historical capture request cancelled while the page was suspended.");
-    } else open();
+    open();
   }
 
   return {
@@ -494,8 +493,10 @@ export function createPaneOutput({
     },
     suspend() {
       if (suspended) return;
-      if (capturePending) settleCapture("Historical capture request cancelled when the page was suspended.");
-      else retire();
+      // A hidden page holds no connection. An unfinished historical read
+      // stays pending ("loading"), and restore requests the same capture
+      // again with a new deadline; nothing else can retry a pinned one.
+      retire();
       suspended = true;
       if (pane !== null && capture === null && !terminal) status = paused ? "paused" : "suspended";
       dirty = true;
@@ -915,8 +916,21 @@ export function mountPinnedOutputs({
     const existing = cards.get(key);
     if (existing) {
       focused = null;
+      // A capture that timed out or failed has nothing to preserve, and its
+      // tile has no retry control, so pinning it again reads it again.
+      const retry = capture !== null && existing.output.snapshot().status === "unavailable";
+      if (retry) {
+        try {
+          existing.output.selectCapture(capture);
+        } catch (_) {
+          text(status, "The capture could not be pinned. Open the pane or search for that capture again.");
+          return false;
+        }
+        existing.render(true);
+      }
       layout();
-      text(status, "That view is already pinned. Its capture history and position were preserved.");
+      text(status, retry ? "Reading that pinned capture again."
+        : "That view is already pinned. Its capture history and position were preserved.");
       existing.transcript.focus();
       return true;
     }

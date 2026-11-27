@@ -798,6 +798,24 @@ test("attention evicts a selected item without acting on its replacement", async
   assert.equal(f.get("pane-output-id").value, "");
 });
 
+test("a notification state change leaves an attention verification running", async (t) => {
+  const verification = deferred();
+  const f = fixture(t, { notifications: true, verifyNotificationSession: () => verification.promise,
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+  }); await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
+  emitNotificationDetection(feed); f.frame();
+  const list = f.get("attention-items");
+  list.value = list.children[0].value; list.emit("change");
+  f.get("attention-inspect").emit("click");
+  // Enabling publishes a requesting state while notifications are still off.
+  f.get("fleet-notifications-toggle").emit("click"); await flush();
+  assert.equal(f.get("fleet-notifications-toggle").attrs["aria-pressed"], "true");
+  verification.resolve(true); await flush();
+  assert.match(f.get("attention-status").textContent, /identity was verified/);
+  assert.equal(f.get("pane-output-id").value, "18446744073709551615");
+});
+
 function pinnedTile(f, index = 0) {
   const panel = f.get("pinned-output-grid").children[index];
   const [controls, state, actions, warnings, transcript] = panel.children;
@@ -1046,4 +1064,40 @@ test("historical pins read the exact capture once and cannot turn into live pane
   assert.equal(tile.transcript.value, "needle");
   f.visibility("hidden"); f.visibility("visible");
   assert.equal(f.sources.filter((source) => !source.closed && source.url.pathname.endsWith("/stream/deltas")).length, 0);
+});
+
+test("a pinned capture interrupted by a hidden page or a failed read is read again", async (t) => {
+  const f = fixture(t);
+  await f.app.ready; await flush();
+  f.get("history-search-open").emit("click");
+  f.get("history-query").value = "needle";
+  f.get("history-search-form").requestSubmit(); await flush();
+  f.get("history-results").children[0].children[2].emit("click");
+  const original = f.sources.at(-1);
+  readyPinned(original, "2");
+  const frame = { schema: "ft.stream.v1", stream: "deltas", kind: "delta",
+    data: { pane_id: 7, segment_id: 3, seq: 0, captured_at: 1000, content_len: 6, content: "needle" } };
+  original.message("delta", frame, deltaCursor("3")); f.frame();
+  f.get("pane-output-pin").emit("click");
+  const interrupted = f.sources.at(-1);
+  f.visibility("hidden");
+  assert.equal(interrupted.closed, true);
+  f.visibility("visible"); await flush();
+  const captureReads = () => f.sources.filter((source) => !source.closed
+    && source.url.searchParams.get("cursor") === deltaCursor("2"));
+  assert.equal(captureReads().length, 1, "restore reads the interrupted capture again");
+  const [resumed] = captureReads();
+  assert.notEqual(resumed, interrupted);
+  // The tile has no retry control, so pinning the failed capture again retries it.
+  resumed.emit("error", {}); f.frame();
+  const tile = pinnedTile(f);
+  assert.match(tile.state.textContent, /^unavailable/);
+  f.get("pane-output-pin").emit("click");
+  assert.match(f.get("pinned-output-status").textContent, /again/);
+  assert.equal(captureReads().length, 1);
+  const [retried] = captureReads();
+  assert.notEqual(retried, resumed);
+  readyPinned(retried, "2"); retried.message("delta", frame, deltaCursor("3")); f.frame();
+  assert.equal(tile.transcript.value, "needle");
+  assert.match(tile.state.textContent, /^historical/);
 });

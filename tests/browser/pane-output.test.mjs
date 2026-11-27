@@ -1550,16 +1550,39 @@ test("closing, switching, and page suspension retire historical callbacks and de
     const deadline = f.timers.values().next().value.fn;
     if (action === "close") f.output.close();
     if (action === "switch") f.output.select("8");
-    if (action === "suspend") { f.output.suspend(); f.output.restore(); }
+    if (action === "suspend") f.output.suspend();
     deadline();
     capturedDelta(old, hit, "late private capture");
     old.fail();
     assert.equal(old.closed, true);
     assert.equal(f.timers.size, action === "switch" ? 1 : 0);
     assert.equal(f.output.snapshot().text, "");
-    assert.equal(f.output.snapshot().status, action === "close" ? "closed" : action === "switch" ? "connecting" : "unavailable");
+    assert.equal(f.output.snapshot().status, action === "close" ? "closed" : action === "switch" ? "connecting" : "loading");
     assert.equal(f.sources.length, action === "switch" ? 2 : 1);
+    if (action === "suspend") {
+      // The read is still owed: restore requests the same capture with a new deadline.
+      f.output.restore();
+      assert.equal(f.sources.length, 2);
+      assert.equal(f.latest().url.searchParams.get("cursor"), hit.captureCursor);
+      assert.equal(f.timers.size, 1);
+      capturedDelta(f.latest(), hit, "restored capture");
+      assert.equal(f.output.snapshot().status, "historical");
+      assert.equal(f.output.snapshot().text, "restored capture");
+    }
   }
+});
+
+test("a capture selected while the page is hidden is read on restore", () => {
+  const f = fixture();
+  f.output.suspend();
+  const hit = captureHit();
+  f.output.selectCapture(hit);
+  assert.equal(f.sources.length, 0);
+  assert.equal(f.output.snapshot().status, "loading");
+  f.output.restore();
+  assert.equal(f.latest().url.searchParams.get("cursor"), hit.captureCursor);
+  capturedDelta(f.latest(), hit, "found");
+  assert.equal(f.output.snapshot().status, "historical");
 });
 
 test("historical capture uses the existing bounded Unicode-safe transcript", () => {

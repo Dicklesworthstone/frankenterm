@@ -901,6 +901,7 @@ export function mountFleetApp({
   let notificationsHalted = false;
   let notifications = null;
   let inspection = null;
+  let inspectionFromQueue = false;
   let inspectionController = null;
   let inspectionGeneration = 0;
   let refreshTimer = null;
@@ -1066,12 +1067,17 @@ export function mountFleetApp({
     if (!active || disposed || !viewer) return;
     cancelInspection();
     inspection = { target, fromQueue: true };
+    inspectionFromQueue = true;
     void inspectDetection();
   }, now);
 
-  function cancelInspection() {
+  // A queue verification answers to the attention queue, not to
+  // notifications, so a notification state change passes keepQueue.
+  function cancelInspection({ keepQueue = false } = {}) {
+    if (keepQueue && inspectionFromQueue) return;
     inspectionGeneration += 1;
     inspection = null;
+    inspectionFromQueue = false;
     inspectionController?.abort();
     inspectionController = null;
   }
@@ -1130,7 +1136,7 @@ export function mountFleetApp({
       setText(notificationToggle, state.enabled ? "Disable notifications" : "Enable notifications");
       setText(notificationStatus, state.message);
       if (!state.enabled) {
-        cancelInspection();
+        cancelInspection({ keepQueue: true });
         if (backgroundNotifications) stopFleet();
       }
       onNotificationsChanged(state.enabled);
