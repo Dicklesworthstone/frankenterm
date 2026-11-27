@@ -391,19 +391,30 @@ private struct MuxSearchContextScreen: View {
         return state.search?.results[hit.pane]?.matches.contains(hit.match) == true
     }
 
+    /// Only display or copy surrounding rows when the full captured match
+    /// still occupies its original rows in this bounded read.
+    private var verifiedLines: [TerminalMuxContextLine]? {
+        guard hitIsCurrent, let context, context.error == nil, let lines = context.lines,
+              hit.match.isPresent(in: lines) else { return nil }
+        return lines
+    }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if !hitIsCurrent {
-                        Text("This result is no longer current. Return to the search and try again.").padding()
-                    } else if let error = context?.error {
-                        Text(verbatim: error).padding().foregroundStyle(.orange)
-                    } else if let lines = context?.lines {
-                        if lines.isEmpty { Text("These rows are no longer on the machine.").padding() }
+                    if let lines = verifiedLines {
                         ForEach(lines) { line in
                             row(line).id(line.row)
                         }
+                    } else if !hitIsCurrent || context?.error != nil || context?.lines != nil {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Captured search result").font(.headline)
+                            Text(verbatim: hit.match.text).font(.system(.footnote, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text(verbatim: context?.error ?? "The surrounding rows can no longer be verified for this match.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }.padding()
                     } else {
                         ProgressView("Reading the rows around it…").padding()
                     }
@@ -417,8 +428,8 @@ private struct MuxSearchContextScreen: View {
         .navigationTitle(pane.map(MuxPaneHeader.name) ?? "Pane \(hit.pane)").navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .bottomBar) {
-                Button(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc") { copy() }
-                    .disabled(!hitIsCurrent || (context?.lines?.isEmpty ?? true))
+                Button(copied ? "Copied" : (verifiedLines == nil ? "Copy Match" : "Copy Context"),
+                       systemImage: copied ? "checkmark" : "doc.on.doc") { copy() }
                 Spacer()
                 Button("Show Pane", systemImage: "rectangle.portrait.and.arrow.right") {
                     guard hitIsCurrent else { return }
@@ -454,8 +465,8 @@ private struct MuxSearchContextScreen: View {
     /// The rows as plain text; like other copies, it stays on this device and
     /// expires after two minutes.
     private func copy() {
-        guard hitIsCurrent, let lines = context?.lines, !lines.isEmpty else { return }
-        UIPasteboard.general.setItems([["public.utf8-plain-text": lines.map(\.text).joined(separator: "\n")]],
+        let text = verifiedLines?.map(\.text).joined(separator: "\n") ?? hit.match.text
+        UIPasteboard.general.setItems([["public.utf8-plain-text": text]],
             options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
         copied = true
     }
