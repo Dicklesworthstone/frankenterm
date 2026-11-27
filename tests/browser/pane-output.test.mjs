@@ -843,7 +843,7 @@ test("invalid bounds are rejected before a source can be opened", () => {
 
 const CONTROL_IDS = [
   "workspace", "pane-output", "pane-output-title", "pane-output-status", "pane-output-warnings",
-  "pane-output-text", "pane-output-follow", "pane-output-pause", "pane-output-history",
+  "pane-output-text", "pane-output-follow", "pane-output-pause", "pane-output-history", "pane-output-recent",
   "pane-output-close", "pane-output-pin", "pane-output-open", "pane-output-id", "pane-output-form", "pane-output-submit",
   "pane-output-hint", "pane-output-search", "pane-output-find-form", "pane-output-previous",
   "pane-output-find-status", "terminal",
@@ -928,6 +928,40 @@ test("history button restarts only the pinned pane with explicit replay", () => 
   assert.equal(f.latest().url.searchParams.get("since_id"), "0");
   assert.equal(f.nodes["pane-output-text"].value, "");
   assert.match(f.nodes["pane-output-status"].textContent, /retained history/);
+});
+
+test("recent output loads the selected pane's tail, then resumes from the delivered cursor", () => {
+  const f = panelFixture();
+  f.panel.openSelected();
+  f.selectRow("8");
+  f.nodes["pane-output-recent"].emit("click");
+  const source = f.latest();
+  assert.equal(source.url.searchParams.get("pane_id"), "7");
+  assert.equal(source.url.searchParams.get("recent"), "32");
+  assert.equal(source.url.searchParams.has("since_id"), false);
+  const ready = JSON.parse(readyPayload("7", "40"));
+  ready.data.recent_segments = 32;
+  source.emit("ready", JSON.stringify(ready));
+  delta(source, "44", "already captured", "7", { sequence: "401" });
+  f.panel.render();
+  assert.equal(f.nodes["pane-output-text"].value, "already captured");
+  assert.match(f.nodes["pane-output-status"].textContent, /latest 32/);
+  assert.equal(f.output.snapshot().retainedPrefixMissing, false);
+  f.output.pause();
+  f.output.resume();
+  assertResume(f.latest(), "44");
+  assert.equal(f.latest().url.searchParams.has("recent"), false);
+  delta(f.latest(), "47", " and new output", "7", { sequence: "402" });
+  assert.equal(f.output.snapshot().text, "already captured and new output");
+});
+
+test("recent output reports servers that only acknowledge a fresh tail", () => {
+  const f = fixture();
+  f.output.select("7", { recentHistory: true });
+  f.latest().emit("ready", readyPayload("7", "90"));
+  assert.equal(f.output.snapshot().terminal, true);
+  assert.match(f.output.snapshot().error, /did not confirm/);
+  assert.equal(f.output.snapshot().resumeCursor, null);
 });
 
 test("a terminal output history leaves text readable and offers only explicit recovery", () => {

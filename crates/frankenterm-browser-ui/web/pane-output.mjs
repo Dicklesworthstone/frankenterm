@@ -3,6 +3,7 @@
 const U64_MAX = 18_446_744_073_709_551_615n;
 const I64_MAX = 9_223_372_036_854_775_807n;
 const RETRY_MAX_MS = 30_000;
+const RECENT_SEGMENTS = 32;
 
 function unsigned(value, maximum) {
   if (typeof value !== "string" || !/^[0-9]{1,20}$/.test(value)) return null;
@@ -86,6 +87,7 @@ export function createPaneOutput({
   let paused = false;
   let suspended = false;
   let history = false;
+  let recent = false;
   let received = null;
   let receivedCursor = null;
   let receivedSequence = null;
@@ -214,6 +216,7 @@ export function createPaneOutput({
     if (capture !== null) url.searchParams.set("cursor", capture.captureCursor);
     else if (receivedCursor !== null) url.searchParams.set("cursor", receivedCursor.token);
     else if (history) url.searchParams.set("since_id", "0");
+    else if (recent) url.searchParams.set("recent", String(RECENT_SEGMENTS));
     let candidate;
     try {
       candidate = new EventSourceImpl(url);
@@ -355,6 +358,10 @@ export function createPaneOutput({
           // Validate the scoped wire cursor as well as the exact JSON ID:
           // native reconnect may use Last-Event-ID from this checkpoint.
           const expectedCursor = receivedCursor ?? expectedCaptureCursor;
+          if (expectedCursor === null && recent && data.recent_segments !== RECENT_SEGMENTS) {
+            halt("the server did not confirm the requested recent output window");
+            return;
+          }
           const expectedResume = expectedCursor?.segment ?? url.searchParams.get("since_id");
           const resume = unsigned(exact.data.resume_after_id, I64_MAX);
           const checkpoint = cursorFor(message.lastEventId, selectedPane, true);
@@ -426,7 +433,7 @@ export function createPaneOutput({
       textDirty = false;
     }
     return {
-      paneId: pane, status, paused, suspended, history, cursor: received,
+      paneId: pane, status, paused, suspended, history, recent, cursor: received,
       resumeCursor: receivedCursor?.token ?? null, terminal,
       text, discardedChars, gapNotifications: gaps, unanchored, error, capture, followFromSegment,
       captureIdentified: captureProvenance !== null,
@@ -434,7 +441,7 @@ export function createPaneOutput({
     };
   }
 
-  function startSelection(selected, retainedHistory, target = null) {
+  function startSelection(selected, retainedHistory, target = null, recentHistory = false) {
     retire();
     pane = selected;
     capture = target;
@@ -442,6 +449,7 @@ export function createPaneOutput({
     captureProvenance = null;
     capturePending = target !== null;
     history = Boolean(retainedHistory);
+    recent = recentHistory;
     paused = false;
     received = null;
     receivedCursor = null;
@@ -466,10 +474,11 @@ export function createPaneOutput({
   return {
     // A new explicit selection is a new identity boundary, even for the same
     // numeric pane. Navigation elsewhere must not silently call this method.
-    select(paneId, { retainedHistory = false } = {}) {
+    select(paneId, { retainedHistory = false, recentHistory = false } = {}) {
       const selected = unsigned(paneId, U64_MAX);
       if (selected === null) throw new Error("invalid pane id");
-      startSelection(selected, retainedHistory);
+      if (retainedHistory && recentHistory) throw new Error("choose one history window");
+      startSelection(selected, retainedHistory, null, recentHistory);
     },
     // Search results identify a capture, not a current pane attachment. Keep
     // every identity as an exact decimal string; validate before retiring the
@@ -554,7 +563,7 @@ export function createPaneOutput({
       textDirty = false;
       error = null;
       terminal = false;
-      paused = history = unanchored = false;
+      paused = history = recent = unanchored = false;
       gaps = discardedChars = 0;
       status = "closed";
       dirty = true;
@@ -611,6 +620,7 @@ export function mountPaneOutput({
   const follow = element("pane-output-follow");
   const pause = element("pane-output-pause");
   const historyButton = element("pane-output-history");
+  const recentButton = element("pane-output-recent");
   const closeButton = element("pane-output-close");
   const pinButton = element("pane-output-pin");
   const openButton = element("pane-output-open");
@@ -656,7 +666,8 @@ export function mountPaneOutput({
     const captureStatus = state.status === "historical" ? "Historical capture loaded"
       : state.status === "loading" ? "Loading historical capture" : "Historical capture unavailable";
     const streamStart = state.followFromSegment !== null ? `from captured segment ${state.followFromSegment}`
-      : state.history ? "following retained history" : "new output since opening";
+      : state.history ? "following retained history" : state.recent
+        ? `latest ${RECENT_SEGMENTS} retained segments and new output` : "new output since opening";
     setText(statusLine, historical ? `${captureStatus} · read-only · not following a current pane`
       : opened ? `${state.status} · read-only · ${streamStart}` : "");
     setText(historyButton, historical ? "Follow captured output from here" : "Load retained history");
@@ -668,6 +679,8 @@ export function mountPaneOutput({
         : "Replace this view by replaying retained history from the beginning; large histories may take time.";
     if (historyButton.title !== historyTitle) historyButton.title = historyTitle;
     historyButton.disabled = historical && (state.status !== "historical" || state.suspended || unidentified);
+    recentButton.hidden = historical || state.followFromSegment !== null;
+    recentButton.disabled = recentButton.hidden || state.suspended || !opened;
     pinButton.disabled = !opened || state.suspended || (historical && state.status !== "historical");
     setText(pinButton, historical ? "Pin this capture" : "Pin pane output");
     follow.disabled = historical;
@@ -707,9 +720,9 @@ export function mountPaneOutput({
     transcript.focus();
   }
 
-  function show(paneId, retainedHistory = false) {
+  function show(paneId, options) {
     try {
-      output.select(paneId, { retainedHistory });
+      output.select(paneId, options);
     } catch (_) {
       hint.textContent = "Choose a pane or enter a valid unsigned pane ID.";
       return;
@@ -806,7 +819,11 @@ export function mountPaneOutput({
       follow.checked = true;
       hint.textContent = "Following captured output after the selected segment.";
       render();
-    } else if (state.paneId !== null) show(state.paneId, true);
+    } else if (state.paneId !== null) show(state.paneId, { retainedHistory: true });
+  });
+  recentButton.addEventListener("click", () => {
+    const state = output.snapshot();
+    if (state.paneId !== null && !recentButton.disabled) show(state.paneId, { recentHistory: true });
   });
   closeButton.addEventListener("click", close);
   pinButton.addEventListener("click", () => {
@@ -994,12 +1011,14 @@ export function mountPinnedOutputs({
     const actions = make("div", "output-toolbar");
     const pause = make("button", "", "Pause");
     const history = make("button", "", "Load retained history");
+    const recentOutput = make("button", "", "Load recent output");
+    recentOutput.title = `Show the latest ${RECENT_SEGMENTS} retained segments for this pane ID, then follow new output.`;
     const followLabel = make("label", "", "");
     const follow = make("input");
     follow.type = "checkbox";
     follow.checked = capture === null;
     followLabel.append(follow, make("span", "", " Follow output"));
-    actions.append(pause, history, followLabel);
+    actions.append(pause, recentOutput, history, followLabel);
     const stateLine = make("p", "pinned-output-state");
     stateLine.setAttribute("role", "status");
     const warnings = make("p", "pinned-output-warnings");
@@ -1027,12 +1046,15 @@ export function mountPinnedOutputs({
         follow.checked = false;
       }
       text(stateLine, historical ? `${state.status} · one historical capture · read-only`
-        : `${state.status} · read-only · ${state.history ? "following retained history" : "new output since pinning"}`);
+        : `${state.status} · read-only · ${state.history ? "following retained history" : state.recent
+          ? `latest ${RECENT_SEGMENTS} retained segments and new output` : "new output since pinning"}`);
       text(pause, state.paused ? "Resume" : "Pause");
       pause.setAttribute("aria-pressed", String(state.paused));
       pause.disabled = historical || state.terminal || suspended;
       history.disabled = historical || suspended;
       history.hidden = historical;
+      recentOutput.disabled = historical || suspended;
+      recentOutput.hidden = historical;
       follow.disabled = historical || suspended;
       focus.disabled = removeButton.disabled = suspended;
       const notices = outputNotices(state, holdingSelection);
@@ -1063,13 +1085,15 @@ export function mountPinnedOutputs({
       } else output.pause();
       render();
     });
-    history.addEventListener("click", () => {
+    function loadHistory(options) {
       if (!current() || suspended || capture !== null) return;
       transcript.setSelectionRange(0, 0);
-      output.select(pane, { retainedHistory: true });
+      output.select(pane, options);
       follow.checked = true;
       render();
-    });
+    }
+    history.addEventListener("click", () => loadHistory({ retainedHistory: true }));
+    recentOutput.addEventListener("click", () => loadHistory({ recentHistory: true }));
     follow.addEventListener("change", () => {
       if (!current() || suspended || !follow.checked) return;
       transcript.setSelectionRange(transcript.selectionEnd, transcript.selectionEnd);

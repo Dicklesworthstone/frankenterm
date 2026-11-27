@@ -1123,8 +1123,13 @@ inspector, giving four independent captured-output views. Each pin has its own
 pause/resume, follow, retained-history replay, scroll position, and text selection;
 **Focus pane** expands one pin and Escape returns to the comparison. Pinning a
 verified history result preserves that exact historical capture instead of
-attaching it to a current pane. Live pins begin with new output and can explicitly
-load retained history. Each pin retains at most 128 Ki UTF-16 code units and 1,024
+attaching it to a current pane. Live views begin with new output. Choose **Load
+recent output** in the inspector or a pin to see the latest 32 retained segments
+for that pane ID and follow incoming captures. **Load retained history** replays
+from the beginning. API clients can request a window of 1–128 segments with
+`/stream/deltas?pane_id=7&recent=32`. Reconnect with the cursor from the last
+received frame to continue at the same position.
+Each pin retains at most 128 Ki UTF-16 code units and 1,024
 chunks, with visible gap and truncation notices. Pins stay in this browser tab's
 memory, suspend their streams when the page is hidden, and clear on sign-out.
 The three-pin limit holds one tab to five event streams (three pins, the main

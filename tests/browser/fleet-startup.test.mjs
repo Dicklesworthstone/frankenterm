@@ -860,7 +860,7 @@ function pinnedTile(f, index = 0) {
   const [controls, state, actions, warnings, transcript] = panel.children;
   return { panel, state, warnings, transcript,
     focus: controls.children[1], remove: controls.children[2],
-    pause: actions.children[0], history: actions.children[1], follow: actions.children[2].children[0] };
+    pause: actions.children[0], recent: actions.children[1], history: actions.children[2], follow: actions.children[3].children[0] };
 }
 
 function readyPinned(source, after = "0") {
