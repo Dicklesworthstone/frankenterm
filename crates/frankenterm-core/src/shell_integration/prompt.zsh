@@ -38,7 +38,12 @@ __ft_preexec() {
 if [[ -o interactive ]]; then
     typeset -gi __ft_zsh_executing
     typeset -ga precmd_functions preexec_functions
-    (( ${precmd_functions[(Ie)__ft_precmd]} )) || precmd_functions=(__ft_precmd "${precmd_functions[@]}")
-    (( ${precmd_functions[(Ie)__ft_zsh_prompt]} )) || precmd_functions+=(__ft_zsh_prompt)
-    (( ${preexec_functions[(Ie)__ft_preexec]} )) || preexec_functions=(__ft_preexec "${preexec_functions[@]}")
+    # Test membership by name. An (Ie) index is 0 for the first element under
+    # KSH_ARRAYS, which would read as missing and add the hook again.
+    [[ " ${(j: :)precmd_functions[@]} " == *" __ft_precmd "* ]] ||
+        precmd_functions=(__ft_precmd "${precmd_functions[@]}")
+    [[ " ${(j: :)precmd_functions[@]} " == *" __ft_zsh_prompt "* ]] ||
+        precmd_functions+=(__ft_zsh_prompt)
+    [[ " ${(j: :)preexec_functions[@]} " == *" __ft_preexec "* ]] ||
+        preexec_functions=(__ft_preexec "${preexec_functions[@]}")
 fi

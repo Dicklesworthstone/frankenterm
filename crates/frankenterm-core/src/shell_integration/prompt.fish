@@ -2,7 +2,8 @@
 # These markers help ft detect prompt boundaries and command execution.
 
 function __ft_prompt_start --on-event fish_prompt
-    set -l host_name (hostname)
+    # fish's own $hostname needs no process per prompt, nor a hostname binary.
+    set -l host_name $hostname
     string match -qr '^[a-zA-Z0-9._-]+$' -- "$host_name"; or set host_name localhost
     set -l encoded (string escape --style=url -- "$PWD")
     printf '\e]7;file://%s%s\e\\' "$host_name" "$encoded"
