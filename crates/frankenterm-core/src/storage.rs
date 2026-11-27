@@ -10181,6 +10181,26 @@ impl StorageHandle {
         .await
     }
 
+    /// Return the exclusive cursor immediately before a pane's newest retained
+    /// segments. Read it with the stream epoch so a database replacement can
+    /// never relabel that cursor between choosing it and starting replay.
+    pub async fn get_recent_segment_stream_start_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        count: usize,
+    ) -> Result<(SegmentStreamSnapshot, i64)> {
+        Self::checkpoint_storage_operation(cx, "get_recent_segment_stream_start")?;
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            with_provider_fresh_read_backend(provider.as_ref(), db_path.as_str(), |backend| {
+                query_recent_segment_stream_start_backend(backend, pane_id, count)
+            })
+        })
+        .await
+    }
+
     /// Read at most 1,000 ordered segments and output-stream authority in one
     /// SQLite statement, including a snapshot when the page is empty.
     pub async fn get_segments_stream_page_with_cx(
@@ -12359,6 +12379,9 @@ pub struct SegmentStreamPage {
 
 /// Maximum number of retained rows in one authoritative output-stream page.
 pub const SEGMENT_STREAM_PAGE_MAX: usize = 1_000;
+
+/// Maximum retained segments requested when opening a recent-output stream.
+pub const SEGMENT_STREAM_RECENT_MAX: usize = 128;
 
 // =============================================================================
 // Writer Thread Implementation
@@ -36420,6 +36443,40 @@ fn query_segment_stream_snapshot_backend(
         return Err(StorageError::Database("missing segment stream authority".to_string()).into());
     }
     segment_stream_snapshot_from_cells(&rows[0], 0)
+}
+
+fn query_recent_segment_stream_start_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    count: usize,
+) -> Result<(SegmentStreamSnapshot, i64)> {
+    if !(1..=SEGMENT_STREAM_RECENT_MAX).contains(&count) {
+        return Err(StorageError::Database("invalid recent segment count".to_string()).into());
+    }
+    let mut params = Vec::new();
+    let snapshot = segment_stream_snapshot_select(Some(pane_id), &mut params)?;
+    params.push(ToSqlValue::Integer(usize_to_i64(count, "count")?));
+    // The (pane_id, id) index reaches the predecessor in at most count + 1
+    // entries. IDs need not be contiguous, even within the same capture.
+    let sql = format!(
+        "SELECT authority.*, COALESCE((SELECT id FROM output_segments
+             WHERE pane_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2), 0)
+         FROM ({snapshot}) AS authority"
+    );
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query recent segment stream start", err))?;
+    let [row] = rows.as_slice() else {
+        return Err(StorageError::Database("missing segment stream authority".to_string()).into());
+    };
+    let snapshot = segment_stream_snapshot_from_cells(row, 0)?;
+    let after_id = CellRowReader::new(row)
+        .i64(3)
+        .map_err(|err| storage_backend_error("Read recent segment stream start", err))?;
+    if after_id < 0 || (after_id != 0 && after_id >= snapshot.tail_segment_id) {
+        return Err(StorageError::Database("invalid recent segment boundary".to_string()).into());
+    }
+    Ok((snapshot, after_id))
 }
 
 fn query_segments_stream_page_backend(

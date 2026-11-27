@@ -3738,6 +3738,22 @@ mod web_tests {
                         "fresh output excludes the complete pre-connection prefix"
                     );
                     drop(stream);
+
+                    // An idle pane already has useful output. A bounded tail
+                    // asks for the last two captures in allocation order,
+                    // including the backdated one, without a new bus wakeup.
+                    let recent = fetch_stream_until_delta_count(
+                        addr,
+                        b"GET /stream/deltas?pane_id=7&recent=2&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        Duration::from_secs(3),
+                        2,
+                    )
+                    .await?;
+                    ensure!(delta_stream_ids(&recent) == [30, 40], "recent retained suffix");
+                    ensure!(
+                        recent.lines().any(|line| line == format!("id: delta-v2:{epoch}:pane:7:20")),
+                        "recent replay starts at its scoped predecessor"
+                    );
                     Ok::<_, anyhow::Error>(())
                 }))
                 .await;

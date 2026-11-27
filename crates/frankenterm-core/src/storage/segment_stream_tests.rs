@@ -198,6 +198,36 @@ fn segment_allocator_exhaustion_fails_without_mutation() {
 }
 
 #[test]
+fn recent_segment_start_counts_retained_rows_in_the_requested_pane() {
+    let backend = stream_backend();
+    let first = append(&backend, 7, 0, 100);
+    append(&backend, 8, 0, 200);
+    let second = append(&backend, 7, 1, 60);
+    let last = append(&backend, 7, 2, 10);
+    let foreign = append(&backend, 8, 1, 100);
+    for (pane, count, expected_after, tail) in [
+        (7, 1, second.id, last.id),
+        (7, 2, first.id, last.id),
+        (7, 3, 0, last.id),
+        (7, SEGMENT_STREAM_RECENT_MAX, 0, last.id),
+        (99, 2, 0, 0),
+    ] {
+        let (authority, after) =
+            query_recent_segment_stream_start_backend(&backend, pane, count).unwrap();
+        assert_eq!(after, expected_after);
+        assert_eq!(authority.tail_segment_id, tail);
+        assert_eq!(authority.max_segment_id, foreign.id);
+        assert_eq!(
+            authority,
+            query_segment_stream_snapshot_backend(&backend, Some(pane)).unwrap()
+        );
+    }
+    for count in [0, SEGMENT_STREAM_RECENT_MAX + 1] {
+        assert!(query_recent_segment_stream_start_backend(&backend, 7, count).is_err());
+    }
+}
+
+#[test]
 fn segment_pages_bind_empty_and_scoped_rows_to_one_authority() {
     let backend = stream_backend();
     let first = append(&backend, 7, 0, 100);

@@ -39,6 +39,7 @@ enum DeltaResume {
     Cursor(DeltaResumeCursor),
     /// A deliberate query against the current database, never a reconnect.
     Bootstrap(i64),
+    Recent { pane_id: u64, count: usize },
 }
 
 fn decimal_u64(value: &str) -> Option<u64> {
@@ -109,6 +110,7 @@ fn parse_delta_resume(
     cursor: Option<&str>,
     since_id: Option<&str>,
     pane_filter: Option<u64>,
+    recent: Option<&str>,
 ) -> Result<Option<DeltaResume>, &'static str> {
     if let Some(bytes) = last_event_id {
         if bytes.len() > 128 || bytes.iter().any(|&byte| matches!(byte, b'\r' | b'\n' | 0)) {
@@ -127,6 +129,17 @@ fn parse_delta_resume(
         return parse_delta_cursor(cursor, pane_filter)
             .map(DeltaResume::Cursor)
             .map(Some);
+    }
+    if let Some(recent) = recent {
+        let pane_id = pane_filter.ok_or("invalid_recent_segments")?;
+        let count = decimal_u64(recent)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=crate::storage::SEGMENT_STREAM_RECENT_MAX).contains(n))
+            .ok_or("invalid_recent_segments")?;
+        if since_id.is_some() {
+            return Err("invalid_recent_segments");
+        }
+        return Ok(Some(DeltaResume::Recent { pane_id, count }));
     }
     since_id
         .map(|value| {
@@ -371,6 +384,7 @@ pub fn handle_stream_deltas(
         cursor.as_deref(),
         qs.get("since_id"),
         pane_filter,
+        qs.get("recent"),
     ) {
         Ok(cursor) => cursor,
         Err(code) => {
@@ -378,7 +392,7 @@ pub fn handle_stream_deltas(
                 json_err(
                     StatusCode::BAD_REQUEST,
                     code,
-                    "Use a complete delta-v2 cursor for this pane selection or a deliberate since_id bootstrap",
+                    "Use a scoped delta-v2 cursor, since_id, or recent=1..128 with a pane_id",
                 )
             });
         }
@@ -423,15 +437,25 @@ pub fn handle_stream_deltas(
         let recv_cx = stream_cx.clone();
         // Subscribe before capturing the tail boundary so a committed row
         // after that read cannot fall between the snapshot and subscription.
-        // Only the scoped tail is exposed as the fresh cursor; the global
+        // Only a scoped boundary is exposed as the fresh cursor; the global
         // allocation watermark stays internal. Periodic scans also recover
         // missing bus notifications and fence a changed capture database.
         let mut subscriber = event_bus.subscribe_deltas();
-        let snapshot = match storage
-            .get_segment_stream_snapshot_with_cx(&stream_cx, pane_filter)
-            .await
-        {
-            Ok(snapshot) => snapshot,
+        let start = match &resume_after {
+            Some(DeltaResume::Recent { pane_id, count }) => storage
+                .get_recent_segment_stream_start_with_cx(&stream_cx, *pane_id, *count)
+                .await
+                .map(|(snapshot, after_id)| (snapshot, after_id, Some(*count))),
+            _ => storage
+                .get_segment_stream_snapshot_with_cx(&stream_cx, pane_filter)
+                .await
+                .map(|snapshot| {
+                    let after_id = snapshot.tail_segment_id;
+                    (snapshot, after_id, None)
+                }),
+        };
+        let (snapshot, start_id, recent_count) = match start {
+            Ok(start) => start,
             Err(_) => {
                 return json_err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -446,9 +470,9 @@ pub fn handle_stream_deltas(
                 epoch: snapshot.cursor_epoch.clone(),
                 after_id,
             },
-            None => DeltaResumeCursor {
+            Some(DeltaResume::Recent { .. }) | None => DeltaResumeCursor {
                 epoch: snapshot.cursor_epoch.clone(),
-                after_id: snapshot.tail_segment_id,
+                after_id: start_id,
             },
         };
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
@@ -475,6 +499,7 @@ pub fn handle_stream_deltas(
                     "resume_after_id": state.after_id,
                     "cursor": encode_delta_cursor(&state.epoch, pane_filter, state.after_id),
                     "cursor_format": "delta-v2",
+                    "recent_segments": recent_count,
                     "recovery": "retained_segments_only",
                 }),
             );
@@ -1206,28 +1231,28 @@ mod tests {
 
     #[test]
     fn delta_resume_header_supersedes_bootstrap_query_but_empty_header_does_not() {
-        assert_eq!(parse_delta_resume(None, None, None, None), Ok(None));
+        assert_eq!(parse_delta_resume(None, None, None, None, None), Ok(None));
         assert_eq!(
-            parse_delta_resume(None, None, Some("0"), None),
+            parse_delta_resume(None, None, Some("0"), None, None),
             Ok(Some(DeltaResume::Bootstrap(0)))
         );
         assert_eq!(
-            parse_delta_resume(Some(b""), None, Some("91"), Some(7)),
+            parse_delta_resume(Some(b""), None, Some("91"), Some(7), None),
             Ok(Some(DeltaResume::Bootstrap(91)))
         );
-        assert_eq!(parse_delta_resume(Some(b" \t"), None, None, None), Ok(None));
+        assert_eq!(parse_delta_resume(Some(b" \t"), None, None, None, None), Ok(None));
         let query = token(Some(7), 91);
         let header = format!(" {} \t", token(Some(7), 95));
         assert_eq!(
-            parse_delta_resume(Some(header.as_bytes()), Some(&query), Some("0"), Some(7)),
+            parse_delta_resume(Some(header.as_bytes()), Some(&query), Some("0"), Some(7), None),
             Ok(Some(DeltaResume::Cursor(cursor(95))))
         );
         assert_eq!(
-            parse_delta_resume(Some(b""), Some(&query), Some("0"), Some(7)),
+            parse_delta_resume(Some(b""), Some(&query), Some("0"), Some(7), None),
             Ok(Some(DeltaResume::Cursor(cursor(91))))
         );
         assert_eq!(
-            parse_delta_resume(None, Some("invalid"), Some("0"), Some(7)),
+            parse_delta_resume(None, Some("invalid"), Some("0"), Some(7), None),
             Err(INVALID_CURSOR)
         );
         // The browser retains its original URL; a valid received header is
@@ -1237,9 +1262,39 @@ mod tests {
                 Some(header.as_bytes()),
                 Some("invalid"),
                 Some("invalid"),
-                Some(7)
+                Some(7),
+                Some("invalid"),
             ),
             Ok(Some(DeltaResume::Cursor(cursor(95)))),
+        );
+    }
+
+    #[test]
+    fn recent_delta_bootstrap_is_bounded_scoped_and_subordinate_to_received_cursor() {
+        assert_eq!(
+            parse_delta_resume(None, None, None, Some(7), Some("32")),
+            Ok(Some(DeltaResume::Recent {
+                pane_id: 7,
+                count: 32
+            }))
+        );
+        for value in ["0", "129", "1.0", "01", ""] {
+            assert_eq!(
+                parse_delta_resume(None, None, None, Some(7), Some(value)),
+                Err("invalid_recent_segments")
+            );
+        }
+        assert_eq!(
+            parse_delta_resume(None, None, None, None, Some("32")),
+            Err("invalid_recent_segments")
+        );
+        assert_eq!(
+            parse_delta_resume(None, None, Some("0"), Some(7), Some("32")),
+            Err("invalid_recent_segments")
+        );
+        assert_eq!(
+            parse_delta_resume(None, Some(&token(Some(7), 95)), None, Some(7), Some("32")),
+            Ok(Some(DeltaResume::Cursor(cursor(95))))
         );
     }
 
@@ -1272,7 +1327,8 @@ mod tests {
                     Some(value.as_bytes()),
                     Some(&token(None, 1)),
                     Some("0"),
-                    None
+                    None,
+                    None,
                 ),
                 Err(INVALID_CURSOR),
                 "{value}"
@@ -1290,17 +1346,17 @@ mod tests {
             "9223372036854775808",
         ] {
             assert_eq!(
-                parse_delta_resume(None, None, Some(value), None),
+                parse_delta_resume(None, None, Some(value), None, None),
                 Err(INVALID_CURSOR),
                 "{value}"
             );
         }
         assert_eq!(
-            parse_delta_resume(Some(&[0xff]), None, Some("0"), None),
+            parse_delta_resume(Some(&[0xff]), None, Some("0"), None, None),
             Err(INVALID_CURSOR)
         );
         assert_eq!(
-            parse_delta_resume(Some(&[b'1'; 129]), None, None, None),
+            parse_delta_resume(Some(&[b'1'; 129]), None, None, None, None),
             Err(INVALID_CURSOR)
         );
         assert_eq!(
@@ -1513,7 +1569,7 @@ mod tests {
             drop(stream); // The unread frames 2 and 3 disappear with this body.
 
             let resume =
-                parse_delta_resume(Some(received_id.as_bytes()), None, None, Some(7)).unwrap();
+                parse_delta_resume(Some(received_id.as_bytes()), None, None, Some(7), None).unwrap();
             let Some(DeltaResume::Cursor(resume)) = resume else {
                 panic!("received cursor must stay epoch-bound");
             };
