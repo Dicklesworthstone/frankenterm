@@ -312,9 +312,30 @@ impl RobotConnectorError {
 /// — silently starting empty would resurrect uninstalled/disabled
 /// connectors and forget installed ones.
 pub fn decode_connector_state(json: &str) -> Result<Vec<ManagedConnector>, RobotConnectorError> {
-    serde_json::from_str(json).map_err(|err| RobotConnectorError::StateLoadFailed {
-        detail: err.to_string(),
-    })
+    let connectors: Vec<ManagedConnector> =
+        serde_json::from_str(json).map_err(|err| RobotConnectorError::StateLoadFailed {
+            detail: err.to_string(),
+        })?;
+    // Rehydration inserts into a map keyed by connector_id. Duplicate IDs
+    // otherwise silently replace earlier records, potentially turning a
+    // disabled connector back on depending on JSON array order.
+    let mut seen = std::collections::HashSet::with_capacity(connectors.len());
+    for connector in &connectors {
+        if connector.connector_id.trim().is_empty() {
+            return Err(RobotConnectorError::StateLoadFailed {
+                detail: "persisted connector has an empty connector_id".to_string(),
+            });
+        }
+        if !seen.insert(connector.connector_id.as_str()) {
+            return Err(RobotConnectorError::StateLoadFailed {
+                detail: format!(
+                    "duplicate connector_id in persisted lifecycle state: {}",
+                    connector.connector_id
+                ),
+            });
+        }
+    }
+    Ok(connectors)
 }
 
 /// Encode the managed-connector snapshot for persistence.
@@ -887,6 +908,34 @@ mod tests {
             fresh.get("slack").map(|mc| mc.admin_state.as_str()),
             Some("enabled")
         );
+    }
+
+    #[test]
+    fn duplicate_connector_records_fail_closed_instead_of_overwriting_disabled_state() {
+        let mut engine = PolicyEngine::permissive();
+        install(&mut engine, "slack");
+        let snapshot = engine.lifecycle_manager().managed_connectors();
+        let mut enabled = snapshot[0].clone();
+        let mut disabled = enabled.clone();
+        disabled.admin_state = crate::connector_lifecycle::AdminState::Disabled;
+
+        for records in [vec![disabled.clone(), enabled.clone()], vec![enabled.clone(), disabled.clone()]] {
+            let raw = serde_json::to_string(&records).unwrap();
+            let err = decode_connector_state(&raw).expect_err("duplicate IDs must fail closed");
+            assert_eq!(err.code(), "robot.connector.state_load_failed");
+            assert!(err.message().contains("duplicate connector_id"));
+        }
+    }
+
+    #[test]
+    fn empty_connector_identity_fails_closed_before_rehydration() {
+        let mut engine = PolicyEngine::permissive();
+        install(&mut engine, "slack");
+        let mut snapshot = engine.lifecycle_manager().managed_connectors();
+        snapshot[0].connector_id = "  ".to_string();
+        let raw = serde_json::to_string(&snapshot).unwrap();
+        let err = decode_connector_state(&raw).expect_err("empty identity must fail closed");
+        assert_eq!(err.code(), "robot.connector.state_load_failed");
     }
 
     #[test]
