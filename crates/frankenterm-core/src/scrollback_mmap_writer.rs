@@ -653,7 +653,11 @@ impl MmapScrollback {
         let output_record_kind = self.pending_record_kind.unwrap_or(record_kind);
         let redacted = self.redactor.redact_chunk(payload);
         if redacted.bytes.is_empty() {
-            if !payload.is_empty() {
+            // Only retained bytes are written later. Overflow suppression
+            // discards its input and retains nothing, so a kind recorded for
+            // that input labelled the first record after footer recovery
+            // with a discarded chunk's kind, such as an OSC payload as text.
+            if !payload.is_empty() && self.redactor.pending_bytes() > 0 {
                 self.pending_record_kind.get_or_insert(record_kind);
             }
             return Ok(MmapAppendReport {
@@ -3688,6 +3692,52 @@ mod tests {
         assert_eq!(
             snapshot.records[1],
             (RecordKind::Osc, b"\x1b]0;title\x07".to_vec())
+        );
+    }
+
+    #[test]
+    fn first_record_after_suppression_recovery_has_its_own_kind() {
+        // This overflows on purpose, which moves the process-wide counter
+        // that redactor tests assert on.
+        let _guard = crate::redactor::streaming_overflow_test_lock();
+        let dir = test_dir("suppressed-kind");
+        let config = MmapScrollbackConfig::new(&dir, "pane-suppressed-kind")
+            .with_cap_bytes(64 * 1024)
+            .with_sync_every_appends(1);
+        let path = config.bin_path();
+        {
+            let mut writer = MmapScrollback::open(config.clone()).expect("open writer");
+            writer.redactor = StreamingRedactor::new()
+                .with_tail_bytes(64)
+                .with_max_pending_bytes(2048);
+            writer
+                .append(RecordKind::Text, b"-----BEGIN PRIVATE KEY-----\n")
+                .expect("append header");
+            // The open key pins retention past the cap: one marker record.
+            writer
+                .append(RecordKind::Text, "A".repeat(3000).as_bytes())
+                .expect("append body");
+            // Discarded while suppression waits for the footer.
+            writer
+                .append(RecordKind::Text, b"more key body\n")
+                .expect("append suppressed");
+            writer
+                .append(
+                    RecordKind::Osc,
+                    b"-----END PRIVATE KEY-----\x1b]0;title\x07",
+                )
+                .expect("append footer and osc");
+            writer.flush_pending_redaction().expect("flush");
+            writer.sync().expect("sync");
+        }
+
+        let snapshot = read_linear_records(&path, test_read_limits()).expect("read records");
+        assert_eq!(
+            snapshot.records,
+            vec![
+                (RecordKind::Text, b"[REDACTED]".to_vec()),
+                (RecordKind::Osc, b"\x1b]0;title\x07".to_vec()),
+            ]
         );
     }
 
