@@ -40,12 +40,15 @@ data: {"schema":"ft.stream.v1","stream":"deltas","kind":"delta","seq":2,"ts_ms":
 ```
 
 `data.pane_uuid` names the capture the segment belongs to: 32 lowercase
-hexadecimal characters, or `null` when its producer recorded none (output
-stored before capture provenance existed). A numeric pane ID can be reused by
-a new terminal, and the pane-local `data.seq` continues across that reuse, so
-a client following one capture must stop when `pane_uuid` changes. The
-browser viewer's follow mode does, and treats `null` on one side and a UUID on
-the other as a change.
+hexadecimal characters, or `null` when its producer recorded none. That is
+output stored before capture provenance existed, and output a distributed
+aggregator stores for remote panes, which records no capture binding. A
+numeric pane ID can be reused by a new terminal, and the pane-local
+`data.seq` continues across that reuse, so a client following one capture
+must stop when `pane_uuid` changes or goes missing, and cannot follow a
+capture whose `pane_uuid` is `null`: two unknown captures look the same. The
+browser viewer's follow mode refuses to follow such a segment and halts when
+a later frame's `pane_uuid` differs from the followed one, `null` included.
 
 A reconnecting EventSource supplies that id in `Last-Event-ID`. A nonempty,
 valid header takes precedence over the original URL's `cursor` and `since_id`, so an

@@ -1651,13 +1651,15 @@ test("historical panel exposes unavailable and truncated states without substitu
   assert.match(f.nodes["pane-output-hint"].textContent, /invalid capture identity/);
 });
 
+const FOLLOWED_CAPTURE = "0123456789abcdef0123456789abcdef";
+
 test("following a confirmed search hit resumes its exact stream and keeps the displayed capture", () => {
   const f = panelFixture();
   const hit = captureHit({ segmentId: "9007199254740993" });
   f.panel.openCapture(hit);
   const historical = f.latest();
   assert.equal(f.output.followCapture(), false, "pending capture has no continuation authority");
-  capturedDelta(historical, hit, "found\n", { sequence: "72" });
+  capturedDelta(historical, hit, "found\n", { sequence: "72", paneUuid: FOLLOWED_CAPTURE });
   f.panel.render();
   const button = f.nodes["pane-output-history"];
   assert.equal(button.textContent, "Follow captured output from here");
@@ -1668,8 +1670,8 @@ test("following a confirmed search hit resumes its exact stream and keeps the di
   const continuation = f.latest();
   assertResume(continuation, hit.segmentId);
   assert.equal(continuation.url.searchParams.get("pane_id"), hit.paneId);
-  delta(continuation, hit.segmentId, "discard duplicate", hit.paneId, { sequence: "72" });
-  delta(continuation, "9007199254740997", "next\n", hit.paneId, { sequence: "73" });
+  delta(continuation, hit.segmentId, "discard duplicate", hit.paneId, { sequence: "72", paneUuid: FOLLOWED_CAPTURE });
+  delta(continuation, "9007199254740997", "next\n", hit.paneId, { sequence: "73", paneUuid: FOLLOWED_CAPTURE });
   f.panel.render();
   assert.equal(f.nodes["pane-output-text"].value, "found\nnext\n");
   assert.match(f.nodes["pane-output-status"].textContent, /from captured segment 9007199254740993/);
@@ -1686,7 +1688,7 @@ test("following a search hit stops before showing another epoch or a discontinuo
     const f = fixture();
     const hit = captureHit();
     f.output.selectCapture(hit);
-    capturedDelta(f.latest(), hit, "verified", { sequence: "48" });
+    capturedDelta(f.latest(), hit, "verified", { sequence: "48", paneUuid: FOLLOWED_CAPTURE });
     f.output.suspend();
     assert.equal(f.output.followCapture(), false);
     f.output.restore();
@@ -1694,7 +1696,8 @@ test("following a search hit stops before showing another epoch or a discontinuo
     assert.equal(f.output.followCapture(), false, "one action owns one continuation");
     const next = f.latest();
     if (reason === "epoch") next.emit("ready", readyPayload(hit.paneId, hit.segmentId, OTHER_OUTPUT_EPOCH));
-    else delta(next, "19", "other capture", hit.paneId, { sequence: reason === "reset" ? "0" : "50" });
+    else delta(next, "19", "other capture", hit.paneId,
+      { sequence: reason === "reset" ? "0" : "50", paneUuid: FOLLOWED_CAPTURE });
     assert.equal(next.closed, true);
     assert.equal(f.output.snapshot().text, "verified");
     assert.equal(f.output.snapshot().resumeCursor, deltaCursor(hit.segmentId));
@@ -1705,10 +1708,10 @@ test("following a search hit stops before showing another epoch or a discontinuo
 
 test("following a search hit stops when a reused pane ID continues the sequence for another capture", () => {
   // ft-tje6dm: a new terminal that reuses the pane ID continues its seq, so
-  // only the capture UUID tells it apart. Unknown on one side is a change.
-  const first = "0123456789abcdef0123456789abcdef";
+  // only the capture UUID tells it apart. A missing UUID later is a change.
+  const first = FOLLOWED_CAPTURE;
   const second = "fedcba9876543210fedcba9876543210";
-  for (const [historical, later] of [[first, second], [first, null], [undefined, first]]) {
+  for (const [historical, later] of [[first, second], [first, null], [first, undefined]]) {
     const label = `${historical} then ${later}`;
     const f = fixture();
     const hit = captureHit();
@@ -1723,6 +1726,29 @@ test("following a search hit stops when a reused pane ID continues the sequence 
     assert.equal(f.output.snapshot().text, "verified\nsame capture\n", label);
     assert.equal(f.output.snapshot().terminal, true, label);
     assert.match(f.output.snapshot().error, /another capture reused this pane ID/, label);
+  }
+});
+
+test("a capture without a recorded capture UUID is shown but cannot be followed", () => {
+  // Distributed remote panes and output stored before capture provenance carry
+  // no UUID, so a later terminal reusing the pane ID would look identical.
+  for (const unknown of [undefined, null]) {
+    const f = panelFixture();
+    const hit = captureHit();
+    f.panel.openCapture(hit);
+    capturedDelta(f.latest(), hit, "remote output\n", { sequence: "48", paneUuid: unknown });
+    f.panel.render();
+    const button = f.nodes["pane-output-history"];
+    assert.equal(f.nodes["pane-output-text"].value, "remote output\n");
+    assert.equal(f.output.snapshot().captureIdentified, false);
+    assert.equal(button.disabled, true);
+    assert.match(button.title, /no recorded capture identity/);
+    const sources = f.sources.length;
+    button.emit("click");
+    assert.equal(f.output.followCapture(), false);
+    assert.equal(f.sources.length, sources, "no continuation stream opens");
+    assert.equal(f.output.snapshot().followFromSegment, null);
+    assert.equal(f.output.snapshot().status, "historical");
   }
 });
 

@@ -313,8 +313,9 @@ export function createPaneOutput({
             return;
           }
           // A reused pane ID continues the per-pane seq, so only the capture
-          // UUID shows that later output came from another terminal. An
-          // unknown UUID on either side differs from a known one.
+          // UUID shows that later output came from another terminal. A
+          // followed capture always has a known UUID (followCapture refuses
+          // an unknown one), so a different or missing UUID is another capture.
           if (followFromSegment !== null && paneUuid !== captureProvenance) {
             halt("another capture reused this pane ID after the selected segment");
             return;
@@ -428,6 +429,7 @@ export function createPaneOutput({
       paneId: pane, status, paused, suspended, history, cursor: received,
       resumeCursor: receivedCursor?.token ?? null, terminal,
       text, discardedChars, gapNotifications: gaps, unanchored, error, capture, followFromSegment,
+      captureIdentified: captureProvenance !== null,
       sequence: receivedSequence, sequenceDiscontinuities, sequenceRestarted, retainedPrefixMissing,
     };
   }
@@ -490,8 +492,11 @@ export function createPaneOutput({
     // An explicit new action turns a completed one-segment read into a
     // read-only stream. Keep its admitted epoch, segment and per-pane sequence
     // together: opening by numeric pane alone would skip intervening output.
+    // A capture without a recorded UUID (output stored before capture
+    // provenance, or a distributed remote pane) cannot be told apart from a
+    // terminal that later reuses its pane ID, so it is not followed.
     followCapture() {
-      if (status !== "historical" || capture === null || suspended
+      if (status !== "historical" || capture === null || suspended || captureProvenance === null
           || receivedCursor?.segment !== capture.segmentId || receivedSequence === null) return false;
       followFromSegment = capture.segmentId;
       capture = null;
@@ -655,11 +660,14 @@ export function mountPaneOutput({
     setText(statusLine, historical ? `${captureStatus} · read-only · not following a current pane`
       : opened ? `${state.status} · read-only · ${streamStart}` : "");
     setText(historyButton, historical ? "Follow captured output from here" : "Load retained history");
-    const historyTitle = historical
-      ? "Read subsequent captures for this pane, starting after the displayed segment."
-      : "Replace this view by replaying retained history from the beginning; large histories may take time.";
+    const unidentified = historical && state.status === "historical" && !state.captureIdentified;
+    const historyTitle = unidentified
+      ? "This capture has no recorded capture identity, so later output could come from another terminal that reused the pane ID."
+      : historical
+        ? "Read subsequent captures for this pane, starting after the displayed segment."
+        : "Replace this view by replaying retained history from the beginning; large histories may take time.";
     if (historyButton.title !== historyTitle) historyButton.title = historyTitle;
-    historyButton.disabled = historical && (state.status !== "historical" || state.suspended);
+    historyButton.disabled = historical && (state.status !== "historical" || state.suspended || unidentified);
     pinButton.disabled = !opened || state.suspended || (historical && state.status !== "historical");
     setText(pinButton, historical ? "Pin this capture" : "Pin pane output");
     follow.disabled = historical;
