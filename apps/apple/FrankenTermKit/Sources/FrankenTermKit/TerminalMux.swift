@@ -47,6 +47,22 @@ public struct TerminalMuxSearchMatch: Decodable, Equatable, Sendable, Identifiab
         self.text = text; self.textStart = textStart; self.textEnd = textEnd
     }
 
+    /// Search and context are separate reads of mutable scrollback. A stable
+    /// row number alone cannot prove that the context still depicts the hit.
+    public func isPresent(in lines: [TerminalMuxContextLine]) -> Bool {
+        guard row >= 0, endRow >= row else { return false }
+        let captured = text.components(separatedBy: "\n")
+        guard endRow - row == Int64(captured.count - 1),
+              let first = lines.firstIndex(where: { $0.row == row }),
+              captured.count <= lines.count - first else { return false }
+        for (offset, expected) in captured.enumerated() {
+            let line = lines[first + offset]
+            guard line.row == row + Int64(offset),
+                  line.text.utf8.elementsEqual(expected.utf8) else { return false }
+        }
+        return true
+    }
+
     /// The matched part of `text`, when its offsets are present and fall on
     /// character boundaries.
     public var matchedRange: Range<String.Index>? {
