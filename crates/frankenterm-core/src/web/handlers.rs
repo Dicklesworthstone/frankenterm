@@ -200,6 +200,59 @@ impl EventView {
     }
 }
 
+pub(super) fn handle_event_capture(
+    req: &Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    let storage = require_storage(req);
+    let qs = QueryString::parse(req.query().unwrap_or(""));
+    let pane = parse_pane_filter(&qs);
+    let cursor = query_text(&qs, "cursor").map(Cow::into_owned);
+    let uuid = query_text(&qs, "pane_uuid").map(Cow::into_owned);
+    Box::pin(async move {
+        let (storage, _) = match storage {
+            Ok(state) => state,
+            Err(response) => return response,
+        };
+        let pane = match pane {
+            Ok(pane) => pane,
+            Err(response) => return response,
+        };
+        let identity = pane.and_then(|pane| {
+            let (epoch, id) = super::sse::detection_cursor(cursor.as_deref()?, pane)?;
+            let uuid = uuid.filter(|s| {
+                s.len() == 32
+                    && s.bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            })?;
+            Some((epoch, id, pane, uuid))
+        });
+        let Some((epoch, id, pane, uuid)) = identity else {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_event_capture",
+                "Provide an event cursor, pane_id and capture pane_uuid",
+            );
+        };
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        match storage
+            .detection_capture_with_cx(&cx, epoch, id, pane, uuid)
+            .await
+        {
+            Ok(Some(capture)) => json_ok(capture),
+            Ok(None) => json_err(
+                StatusCode::NOT_FOUND,
+                "capture_unavailable",
+                "The original event capture is unavailable",
+            ),
+            Err(_) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "Could not read the event capture",
+            ),
+        }
+    })
+}
+
 pub(super) fn handle_events(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
@@ -1137,6 +1190,44 @@ mod tests {
                     assert_eq!(json["error_code"], "invalid_pane_id");
                     assert!(json.get("data").is_none());
                 }
+            }
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn event_capture_requires_the_selected_cursor_scope_and_capture_identity() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            let epoch = "acbd1234acbd1234acbd1234acbd1234";
+            let uuid = "0123456789abcdef0123456789abcdef";
+            for query in [
+                format!("pane_id=7&pane_uuid={uuid}"),
+                format!("cursor=event-v1:{epoch}:all:1&pane_uuid={uuid}"),
+                format!("cursor=event-v1:{epoch}:pane:8:1&pane_id=7&pane_uuid={uuid}"),
+                format!("cursor=event-v1:{epoch}:all:0&pane_id=7&pane_uuid={uuid}"),
+                format!("cursor=event-v1:{epoch}:all:1&pane_id=7&pane_uuid=missing"),
+            ] {
+                let request = make_request("/events/capture", Some(&query), Some(storage.clone()));
+                let response = handle_event_capture(&request).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+                assert_eq!(
+                    response_json(response)["error_code"],
+                    "invalid_event_capture"
+                );
+            }
+
+            // Both event feed scopes are valid selections. An unavailable
+            // capture is a lookup miss, including URLSearchParams-encoded cursors.
+            for scope in ["all", "pane%3A7"] {
+                let query =
+                    format!("cursor=event-v1%3A{epoch}%3A{scope}%3A1&pane_id=7&pane_uuid={uuid}");
+                let request = make_request("/events/capture", Some(&query), Some(storage.clone()));
+                let response = handle_event_capture(&request).await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{query}");
+                let body = response_json(response);
+                assert_eq!(body["error_code"], "capture_unavailable");
+                assert!(body.get("data").is_none());
             }
             storage.shutdown().await.expect("shutdown storage");
         });

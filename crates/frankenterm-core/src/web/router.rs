@@ -5,8 +5,8 @@
 
 use super::auth::{SessionAuthMiddleware, handle_login, handle_logout, handle_status};
 use super::handlers::{
-    handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
-    handle_search, health_response,
+    handle_bookmarks, handle_event_capture, handle_events, handle_panes, handle_ruleset_profile,
+    handle_saved_searches, handle_search, health_response,
 };
 use super::middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
 use super::sse::{handle_stream_deltas, handle_stream_events};
@@ -99,6 +99,11 @@ pub(super) fn build_app(
             "/events",
             Method::Get,
             |_ctx: &RequestContext, req: &mut Request| handle_events(req),
+        )
+        .route(
+            "/events/capture",
+            Method::Get,
+            |_ctx: &RequestContext, req: &mut Request| handle_event_capture(req),
         )
         .route(
             "/search",

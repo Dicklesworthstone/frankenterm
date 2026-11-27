@@ -50,6 +50,7 @@ mod tests {
             "/auth/status",
             "/panes",
             "/events",
+            "/events/capture",
             "/search",
             "/bookmarks",
             "/ruleset-profile",
@@ -82,12 +83,12 @@ mod tests {
             }
         }
         assert_eq!(documented, actual, "discovery and live routes must agree");
-        assert_eq!(documented.len(), 12, "review newly exposed operations");
+        assert_eq!(documented.len(), 13, "review newly exposed operations");
         assert!(documented.iter().all(|(path, method)| {
             method == "get"
                 || (path == "/auth/session" && matches!(method.as_str(), "post" | "delete"))
         }));
-        assert_eq!(app.routes().count(), 13, "no external docs UI routes");
+        assert_eq!(app.routes().count(), 14, "no external docs UI routes");
         assert_eq!(spec["info"]["title"], "FrankenTerm observation API");
         assert_eq!(spec["info"]["version"], crate::VERSION);
         assert_eq!(spec["openapi"], "3.1.0");

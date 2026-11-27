@@ -537,6 +537,7 @@ mod web_tests {
                 for path in [
                     "/panes",
                     "/events",
+                    "/events/capture",
                     "/search?q=test",
                     "/bookmarks",
                     "/ruleset-profile",
@@ -1921,13 +1922,14 @@ mod web_tests {
                     "application version must match"
                 );
                 let paths = spec["paths"].as_object().context("live paths object")?;
-                // The same inventory as web::openapi's unit test: ten reads
+                // The same inventory as web::openapi's unit test: eleven reads
                 // plus local viewer sign-in and sign-out.
                 let expected: std::collections::BTreeSet<_> = [
                     "/health",
                     "/auth/status",
                     "/panes",
                     "/events",
+                    "/events/capture",
                     "/search",
                     "/bookmarks",
                     "/ruleset-profile",

@@ -564,6 +564,15 @@ fn parse_event_cursor(
     })
 }
 
+/// Identify an event selected in either the fleet feed or this pane's feed.
+/// The storage lookup independently checks the event's pane and capture UUID.
+pub(super) fn detection_cursor(value: &str, pane_id: u64) -> Option<(String, i64)> {
+    let cursor = parse_event_cursor(value, Some(pane_id))
+        .or_else(|_| parse_event_cursor(value, None))
+        .ok()?;
+    (cursor.after_id > 0).then_some((cursor.epoch, cursor.after_id))
+}
+
 /// A valid reconnect header supersedes the URL's bootstrap token. A nonempty
 /// malformed header, a numeric legacy cursor, or a changed pane scope cannot
 /// silently become a fresh subscription or adopt the database's current epoch.

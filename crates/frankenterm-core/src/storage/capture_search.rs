@@ -25,6 +25,112 @@ const CAPTURE_AUTHORITY_COLUMNS: &str =
     "(SELECT cursor_epoch FROM segment_stream_state WHERE singleton = 1),
      (SELECT max_segment_id FROM segment_stream_state WHERE singleton = 1)";
 
+/// Exact address of a detection's retained output. Decimal strings preserve
+/// all SQLite integer bits in browser clients.
+#[cfg(feature = "web")]
+#[derive(serde::Serialize)]
+pub(crate) struct DetectionCapture {
+    event_id: String,
+    event_epoch: String,
+    pane_id: String,
+    pane_uuid: String,
+    segment_id: String,
+    captured_at: String,
+    content_len: String,
+    capture_cursor: String,
+}
+
+#[cfg(feature = "web")]
+impl StorageHandle {
+    pub(crate) async fn detection_capture_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        epoch: String,
+        event_id: i64,
+        pane_id: u64,
+        pane_uuid: String,
+    ) -> Result<Option<DetectionCapture>> {
+        Self::checkpoint_storage_operation(cx, "detection_capture")?;
+        let db_path = Arc::clone(&self.db_path);
+        let provider = Arc::clone(&self.backend_provider);
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            super::with_provider_fresh_read_backend(
+                provider.as_ref(),
+                db_path.as_str(),
+                |backend| detection_capture_backend(backend, &epoch, event_id, pane_id, &pane_uuid),
+            )
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "web")]
+fn detection_capture_backend(
+    backend: &dyn StorageBackend,
+    epoch: &str,
+    event_id: i64,
+    pane_id: u64,
+    pane_uuid: &str,
+) -> Result<Option<DetectionCapture>> {
+    let Ok(sql_pane) = i64::try_from(pane_id) else {
+        return Ok(None);
+    };
+    // Bind both independent epochs, the event and its source in a single
+    // read. The current panes table may already describe another terminal.
+    let row = backend
+        .query_row_cells(
+            "SELECT s.id, s.captured_at, s.content_len, stream.cursor_epoch
+         FROM events e
+         JOIN output_segments s ON s.id = e.segment_id AND s.pane_id = e.pane_id
+         JOIN output_segment_captures c ON c.segment_id = s.id
+         JOIN pane_capture_bindings b ON b.capture_uuid = c.capture_uuid AND b.pane_id = s.pane_id
+         JOIN event_retention_state ev ON ev.singleton = 1 AND ev.cursor_epoch = ?1
+             AND e.id <= ev.max_event_id
+         JOIN segment_stream_state stream ON stream.singleton = 1 AND s.id <= stream.max_segment_id
+         WHERE e.id = ?2 AND e.pane_id = ?3 AND b.capture_uuid = ?4",
+            &[
+                ToSqlValue::Text(epoch),
+                ToSqlValue::Integer(event_id),
+                ToSqlValue::Integer(sql_pane),
+                ToSqlValue::Text(pane_uuid),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Resolve detection capture", err))?;
+    let Some(row) = row else { return Ok(None) };
+    let reader = CellRowReader::new(&row);
+    let number = |index| {
+        reader
+            .i64(index)
+            .map_err(|err| storage_backend_error("Read detection capture", err))
+    };
+    let id = number(0)?;
+    let captured_at = number(1)?;
+    let content_len = number(2)?;
+    let stream_epoch = reader
+        .string(3)
+        .map_err(|err| storage_backend_error("Read capture epoch", err))?;
+    if id <= 0
+        || captured_at < 0
+        || content_len < 0
+        || stream_epoch.len() != 32
+        || !stream_epoch
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err(StorageError::Database("invalid detection capture metadata".into()).into());
+    }
+    Ok(Some(DetectionCapture {
+        event_id: event_id.to_string(),
+        event_epoch: epoch.to_owned(),
+        pane_id: pane_id.to_string(),
+        pane_uuid: pane_uuid.to_owned(),
+        segment_id: id.to_string(),
+        captured_at: captured_at.to_string(),
+        content_len: content_len.to_string(),
+        capture_cursor: format!("delta-v2:{stream_epoch}:pane:{pane_id}:{}", id - 1),
+    }))
+}
+
 impl StorageHandle {
     /// Search retained output with each hit bound to its database epoch.
     ///
@@ -288,6 +394,72 @@ mod tests {
             assert_eq!(first[0].result.snippet.is_some(), snippets);
             assert!(first[0].result.highlight.is_none());
         }
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn detection_resolves_only_its_retained_capture_after_pane_reuse() {
+        let backend = fixture("needle retained");
+        let original = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let replacement = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        backend
+            .execute_batch(
+                "INSERT INTO pane_capture_bindings (capture_uuid, pane_id, created_at)
+                 VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 7, 1000),
+                        ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 7, 2000);
+                 INSERT INTO output_segment_captures (segment_id, capture_uuid)
+                 VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+                 INSERT INTO events (id, pane_id, rule_id, agent_type, event_type,
+                                     severity, confidence, segment_id, detected_at)
+                 VALUES (10, 7, 'demo', 'codex', 'match', 'info', 1.0, 1, 1000);
+                 UPDATE panes SET pane_uuid = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE pane_id = 7;",
+            )
+            .unwrap();
+        let epoch = crate::storage::event_retention_snapshot_backend(&backend)
+            .unwrap()
+            .cursor_epoch;
+        let stream_epoch = crate::storage::query_segment_stream_snapshot_backend(&backend, Some(7))
+            .unwrap()
+            .cursor_epoch;
+        let lookup = |epoch: &str, pane, uuid: &str| {
+            detection_capture_backend(&backend, epoch, 10, pane, uuid).unwrap()
+        };
+        let target = lookup(&epoch, 7, original).expect("retained original capture");
+        assert_eq!(target.pane_uuid, original);
+        assert_eq!(target.segment_id, "1");
+        assert_eq!(
+            target.capture_cursor,
+            format!("delta-v2:{stream_epoch}:pane:7:0")
+        );
+        assert!(lookup(&epoch, 7, replacement).is_none());
+        assert!(lookup(&epoch, 8, original).is_none());
+        let other = fixture("different database");
+        let other_epoch = crate::storage::event_retention_snapshot_backend(&other)
+            .unwrap()
+            .cursor_epoch;
+        assert!(lookup(&other_epoch, 7, original).is_none());
+
+        // A regressed allocation watermark cannot authorize an otherwise
+        // exact event and retained segment in the same database epoch.
+        backend
+            .execute_batch(
+                "SAVEPOINT bad_event_watermark;
+                 DROP TRIGGER event_retention_state_monotonic_guard;
+                 UPDATE event_retention_state SET max_event_id = 9 WHERE singleton = 1;",
+            )
+            .unwrap();
+        assert!(lookup(&epoch, 7, original).is_none());
+        backend
+            .execute_batch("ROLLBACK TO bad_event_watermark; RELEASE bad_event_watermark;")
+            .unwrap();
+
+        backend
+            .execute("UPDATE events SET segment_id = NULL WHERE id = 10")
+            .unwrap();
+        backend
+            .execute("DELETE FROM output_segments WHERE id = 1")
+            .unwrap();
+        assert!(lookup(&epoch, 7, original).is_none());
     }
 
     #[test]
