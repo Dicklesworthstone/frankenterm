@@ -66709,6 +66709,20 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         "  prepare outcome: {}",
                         tx_prepare_outcome_label(&data.prepare_report.outcome)
                     );
+                    if data.prepare_report.outcome
+                        != frankenterm_core::plan::TxPrepareOutcome::AllReady
+                    {
+                        let refusals = tx_prepare_gate_refusal_lines(
+                            &data.prepare_report,
+                            !contract.plan.preconditions.is_empty(),
+                        );
+                        if refusals.is_empty() {
+                            println!("  blocked: no gate reported a failed check");
+                        }
+                        for refusal in refusals {
+                            println!("  blocked: {refusal}");
+                        }
+                    }
                     if let Some(commit_report) = data.commit_report.as_ref() {
                         println!(
                             "  commit outcome: {}",
@@ -79883,6 +79897,62 @@ fn tx_prepare_outcome_label(outcome: &frankenterm_core::plan::TxPrepareOutcome) 
         frankenterm_core::plan::TxPrepareOutcome::Denied => "denied",
         frankenterm_core::plan::TxPrepareOutcome::Deferred => "deferred",
     }
+}
+
+/// One plain-text line per prepare gate that held its step back, naming each
+/// failed check and its reason code (ft-wi5kjq). As in `evaluate_prepare_phase`,
+/// a precondition counts only when the plan has preconditions. A failed check
+/// with no reason code reads "unsatisfied". Reason codes can carry policy text,
+/// so each line is made single-line and terminal-safe.
+fn tx_prepare_gate_refusal_lines(
+    report: &frankenterm_core::plan::TxPrepareReport,
+    plan_has_preconditions: bool,
+) -> Vec<String> {
+    report
+        .gate_inputs
+        .iter()
+        .filter_map(|gate| {
+            let checks = [
+                (
+                    "precondition",
+                    !plan_has_preconditions || gate.preconditions_satisfied,
+                    gate.precondition_reason_code.as_deref(),
+                ),
+                (
+                    "policy",
+                    gate.policy_passed,
+                    gate.policy_reason_code.as_deref(),
+                ),
+                (
+                    "reservation",
+                    gate.reservation_available,
+                    gate.reservation_reason_code.as_deref(),
+                ),
+                (
+                    "liveness",
+                    gate.target_liveness,
+                    gate.liveness_reason_code.as_deref(),
+                ),
+                (
+                    "approval",
+                    gate.approval_satisfied,
+                    gate.approval_reason_code.as_deref(),
+                ),
+            ];
+            let failed: Vec<String> = checks
+                .iter()
+                .filter(|(_, passed, _)| !passed)
+                .map(|(check, _, code)| format!("{check} {}", code.unwrap_or("unsatisfied")))
+                .collect();
+            (!failed.is_empty()).then(|| {
+                frankenterm_core::output::sanitize_terminal_text(&format!(
+                    "step {}: {}",
+                    gate.step_id.0,
+                    failed.join(", ")
+                ))
+            })
+        })
+        .collect()
 }
 
 fn tx_commit_outcome_label(outcome: &frankenterm_core::plan::TxCommitOutcome) -> &'static str {
@@ -115287,10 +115357,75 @@ reason = "overly conservative pending threshold"
                 Some("robot.steer_hash_mismatch")
             );
         }
+        // The plain-text output names the refusal for every step.
+        let refusals = tx_prepare_gate_refusal_lines(
+            &data.prepare_report,
+            !contract.plan.preconditions.is_empty(),
+        );
+        assert_eq!(refusals.len(), contract.plan.steps.len());
+        for refusal in &refusals {
+            assert!(
+                refusal.contains("policy robot.steer_hash_mismatch"),
+                "refusal line must name the receipt check: {refusal}"
+            );
+        }
         assert_eq!(
             data.final_state,
             frankenterm_core::plan::MissionTxState::Failed
         );
+    }
+
+    /// ft-wi5kjq: the plain-text refusal lines list each failed check of each
+    /// held-back gate, skip ready gates, and stay single-line and terminal-safe.
+    #[test]
+    fn tx_prepare_gate_refusal_lines_name_each_failed_check() {
+        let ready = |step: &str| frankenterm_core::plan::TxPrepareGateInput {
+            step_id: frankenterm_core::plan::TxStepId(step.to_string()),
+            pane_id: Some(1),
+            preconditions_satisfied: true,
+            precondition_reason_code: None,
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+            required_approval: None,
+        };
+        let mut no_code = ready("s2");
+        no_code.reservation_available = false;
+        no_code.approval_satisfied = false;
+        no_code.approval_reason_code = Some("approval.required".to_string());
+        let mut precondition_only = ready("s3");
+        precondition_only.preconditions_satisfied = false;
+        let mut hostile = ready("s4");
+        hostile.policy_passed = false;
+        hostile.policy_reason_code = Some("deny\u{1b}]0;title\u{7}\nnext".to_string());
+        let report = frankenterm_core::plan::TxPrepareReport {
+            outcome: frankenterm_core::plan::TxPrepareOutcome::Denied,
+            gate_inputs: vec![ready("s1"), no_code, precondition_only, hostile],
+        };
+
+        // Without plan preconditions a false precondition flag does not count,
+        // as in evaluate_prepare_phase, so s3 is ready.
+        let lines = tx_prepare_gate_refusal_lines(&report, false);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "step s2: reservation unsatisfied, approval approval.required"
+        );
+        assert!(lines[1].starts_with("step s4: policy deny"), "{lines:?}");
+        assert!(
+            !lines[1].chars().any(char::is_control),
+            "refusal lines must not carry terminal controls: {lines:?}"
+        );
+        assert!(lines[1].contains("next"), "{lines:?}");
+
+        let lines = tx_prepare_gate_refusal_lines(&report, true);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[1], "step s3: precondition unsatisfied");
     }
 
     /// ft-wi5kjq: a receipt that lapses between the run's start and prepare
