@@ -16053,9 +16053,13 @@ mod tests {
         rt.block_on(async { mock.inject_output(7, "\nuser@host:~$ ").await.unwrap() });
         let started = std::time::Instant::now();
         // The caller's current-thread runtime is parked inside this sync call.
+        // Each read first passes policy admission against the fixture's
+        // SQLite store, about 450 ms on a loaded Mac, and the idle wait needs
+        // several reads; 1 s was not always enough. It returns as soon as
+        // the pane is idle.
         let idle = rt.block_on(async {
             executor
-                .execute_admitted_action(&action(1_000), None)
+                .execute_admitted_action(&action(3_000), None)
                 .into_input()
         });
         assert!(idle.0, "{idle:?}");
@@ -16074,13 +16078,17 @@ mod tests {
             mock.inject_output(0, "unchanged output").await.unwrap();
         });
         let executor = make_pane_executor(mock as WeztermHandle);
+        // A stable tail needs at least two reads, and each read first passes
+        // policy admission against the fixture's SQLite store, about 450 ms
+        // on a loaded Mac; 1 s was not always enough. The wait returns as
+        // soon as the tail has been stable for 30 ms.
         let action = StepAction::WaitFor {
             pane_id: Some(0),
             condition: WaitCondition::StableTail {
                 pane_id: Some(0),
                 stable_for_ms: 30,
             },
-            timeout_ms: 1_000,
+            timeout_ms: 3_000,
         };
         let started = std::time::Instant::now();
         let stable = executor.execute_admitted_action(&action, None).into_input();
@@ -16234,7 +16242,11 @@ mod tests {
             let _restriction = crate::cx::Cx::push_restriction(
                 <CapSet<true, true, false, true, true> as CapSetRuntimeMask>::MASK,
             );
-            let result = executor.execute_admitted_action(&tx_probe_wait(150, 0), None);
+            // The read starts only after policy admission, which opens the
+            // fixture's SQLite policy store: about 450 ms on a loaded Mac
+            // (two queries of 165-270 ms each), so a 150 ms wait timed out
+            // before the read began. 1 s leaves room for admission.
+            let result = executor.execute_admitted_action(&tx_probe_wait(1_000, 0), None);
             assert!(matches!(&result, StepDispatchOutcome::Settled(_)));
             assert_eq!(result.input().1, "wait_for_timeout");
             assert_eq!(*probe.task_id.lock().unwrap(), Some(expected_task));
@@ -16243,7 +16255,9 @@ mod tests {
                 Some([true, true, false, true, true])
             );
         });
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // The parked read never completes, so returning within this bound
+        // shows the wait honoured its 1 s timeout.
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
         assert_eq!(*probe.tails.lock().unwrap(), vec![Some(200)]);
@@ -16259,11 +16273,13 @@ mod tests {
                 .unwrap();
             let seed = rt.request_cx_with_budget(crate::cx::Budget::INFINITE);
             let caller = if deadline_bound {
-                // Long enough for the first read to start on a loaded machine
-                // (150 ms was not), well inside the 2 s bound below.
+                // The read starts only after policy admission opens the
+                // fixture's SQLite policy store, about 450 ms on a loaded Mac
+                // (two queries of 165-270 ms each). 600 ms was not always
+                // enough. 1.5 s is, and stays well inside the bound below.
                 rt.request_cx_with_budget(crate::cx::Budget::new().with_deadline(
                     crate::runtime_async::timer_now_with_cx(&seed)
-                        + std::time::Duration::from_millis(600),
+                        + std::time::Duration::from_millis(1_500),
                 ))
             } else {
                 seed
@@ -16276,7 +16292,7 @@ mod tests {
                 Some(std::thread::spawn(move || {
                     let started = std::time::Instant::now();
                     while observed.calls.load(Ordering::SeqCst) == 0
-                        && started.elapsed() < std::time::Duration::from_secs(2)
+                        && started.elapsed() < std::time::Duration::from_secs(5)
                     {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
@@ -16295,7 +16311,9 @@ mod tests {
             }
             assert!(!result.0);
             assert_eq!(result.1, "wait_for_cancelled", "deadline={deadline_bound}");
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // The wait's own timeout is 60 s: returning this soon shows the
+            // cancellation or the parent deadline ended it.
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
             assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
         }
@@ -16309,9 +16327,11 @@ mod tests {
         ] {
             let probe = TxWaitReadProbe::new(mode);
             let executor = make_pane_executor(FileEffectBackend::wait_handle(probe.clone()));
-            // 1 s leaves room for the two reads the changing tail needs; a
-            // loaded machine sometimes managed only one within 200 ms.
-            let result = executor.execute_admitted_action(&tx_probe_wait(1_000, 20), None);
+            // The changing tail needs two reads, and each read first passes
+            // policy admission against the fixture's SQLite store, about
+            // 450 ms on a loaded Mac. A loaded machine sometimes managed only
+            // one read within 200 ms, and then within 1 s. 3 s leaves room.
+            let result = executor.execute_admitted_action(&tx_probe_wait(3_000, 20), None);
             assert!(!result.input().0);
             assert_eq!(result.input().1, reason);
             assert!(
