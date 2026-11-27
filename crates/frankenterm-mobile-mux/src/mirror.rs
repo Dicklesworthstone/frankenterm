@@ -55,6 +55,12 @@ impl Target {
     fn viewport(&self) -> Range<StableRowIndex> {
         self.top()..offset(self.top(), self.rows())
     }
+
+    /// The displayed rows leaving the viewport can be repainted in their
+    /// final form only while the server still retains their coordinates.
+    fn leaving(&self, old_top: StableRowIndex) -> Range<StableRowIndex> {
+        old_top.max(self.dims.scrollback_top)..self.top().min(offset(old_top, self.rows()))
+    }
 }
 
 fn offset(row: StableRowIndex, by: usize) -> StableRowIndex {
@@ -394,6 +400,19 @@ impl PaneMirror {
             });
         if self.visible {
             let viewport = target.viewport();
+            if !target.alt
+                && self.shown.primary.is_some_and(|old_top| {
+                    target.dims.scrollback_top > offset(old_top, self.shown.rows)
+                })
+            {
+                // There is a hole between the last displayed screen and the
+                // oldest surviving row. Start a fresh stream from retained
+                // history. Never splice unrelated rows into the phone's history
+                // or wait for a fenced read the server must always refuse.
+                self.shown = Shown::default();
+                self.drawn = None;
+                self.shown_palette = None;
+            }
             let retained = self.retained_rows(&target);
             let retain_row =
                 |row: &StableRowIndex| retained.iter().any(|range| range.contains(row));
@@ -595,8 +614,8 @@ impl PaneMirror {
                     entering
                 };
                 [
-                    from.min(viewport.start)..viewport.end,
-                    old_top..viewport.start.min(offset(old_top, target.rows())),
+                    from.max(target.dims.scrollback_top).min(viewport.start)..viewport.end,
+                    target.leaving(old_top),
                 ]
             }
             Plan::Full | Plan::Dirty => [viewport, 0..0],
@@ -619,7 +638,6 @@ impl PaneMirror {
                 entering,
                 all,
             } => {
-                let leaving_end = viewport.start.min(offset(old_top, target.rows()));
                 // With the row above the entering ones while the phone's
                 // bottom row shows it, in case it wraps into them.
                 let from = if entering == offset(old_top, target.rows()) {
@@ -627,7 +645,10 @@ impl PaneMirror {
                 } else {
                     entering
                 };
-                let mut needed = vec![old_top..leaving_end, from..viewport.end];
+                let mut needed = vec![
+                    target.leaving(old_top),
+                    from.max(target.dims.scrollback_top).min(viewport.end)..viewport.end,
+                ];
                 if all {
                     needed.push(viewport.clone());
                 } else {
@@ -801,7 +822,7 @@ impl PaneMirror {
                 all,
             } => {
                 let redrawn = |row: &StableRowIndex| all || self.dirty.contains(row);
-                let leaving = old_top..top.min(offset(old_top, rows));
+                let leaving = target.leaving(old_top);
                 let mut wraps = false;
                 for row in leaving.clone() {
                     wraps = in_place(&mut out, row, at(row, old_top));
@@ -813,7 +834,8 @@ impl PaneMirror {
                 // in place below, where it carries on.
                 let above = entering.saturating_sub(1);
                 let bottom = rows.saturating_sub(1);
-                let continued = entering == offset(old_top, rows);
+                let continued =
+                    entering == offset(old_top, rows) && above >= target.dims.scrollback_top;
                 if !(continued && leaving.contains(&above)) {
                     render::move_to(&mut out, bottom, 0);
                     wraps = continued
@@ -1027,5 +1049,66 @@ mod tests {
         assert_eq!(mirror.dirty, BTreeSet::from([0, 1]));
         assert!(mirror.wanted().is_empty());
         assert!(!mirror.render().is_empty());
+    }
+
+    #[test]
+    fn partial_eviction_keeps_scrolling_without_reading_past_the_retention_floor() {
+        let mut mirror = PaneMirror::new(true);
+        mirror.apply_changes(head(0), Some(entries(0..2))).unwrap();
+        mirror.render();
+        for top in 1..=4 {
+            let mut update = head(top);
+            update.dimensions.scrollback_top = top;
+            update.dimensions.scrollback_rows = 2;
+            mirror
+                .apply_changes(update, Some(entries([top + 1])))
+                .unwrap();
+            let wanted = mirror.wanted();
+            assert_eq!(wanted, vec![top..top + 1]);
+            mirror.set_fetching(&wanted);
+            mirror.apply_lines(entries([top]), &wanted);
+            let output = mirror.render();
+            assert_eq!(
+                output.len(),
+                1,
+                "ordinary scrolling must not reset the phone"
+            );
+            assert!(output[0].complete);
+            assert!(
+                String::from_utf8_lossy(&output[0].bytes).contains(&format!("row-{}", top + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn advancing_retention_during_a_fetch_rebuilds_only_the_surviving_history() {
+        let mut mirror = PaneMirror::new(true);
+        mirror.apply_changes(head(0), Some(entries(0..2))).unwrap();
+        mirror.render();
+        mirror.apply_changes(head(1), Some(entries([2]))).unwrap();
+        let stale = mirror.wanted();
+        mirror.set_fetching(&stale);
+        for top in [20, 40] {
+            let mut update = head(top);
+            update.dimensions.scrollback_top = top - 3;
+            update.dimensions.scrollback_rows = 5;
+            mirror
+                .apply_changes(update, Some(entries([top + 1])))
+                .unwrap();
+        }
+        mirror.apply_lines(entries(0..2), &stale);
+        let surviving = mirror.wanted();
+        assert_eq!(surviving, vec![37..41]);
+        mirror.set_fetching(&surviving);
+        mirror.apply_lines(entries(37..41), &surviving);
+        let output = mirror.render();
+        assert_eq!(output.len(), 2);
+        assert!(!output[0].complete);
+        assert!(output[1].complete);
+        let painted = String::from_utf8_lossy(&output[1].bytes);
+        for row in 37..=41 {
+            assert!(painted.contains(&format!("row-{row}")));
+        }
+        assert!(mirror.is_drawable());
     }
 }

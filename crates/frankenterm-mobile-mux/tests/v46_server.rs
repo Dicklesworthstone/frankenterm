@@ -139,6 +139,34 @@ fn a_burst_longer_than_the_catch_up_keeps_its_last_rows() {
 }
 
 #[test]
+fn evicting_the_previous_viewport_does_not_stall_the_attached_phone() {
+    let rows = 4;
+    let cols = 20;
+    let mut harness = Harness::new(rows, cols);
+    harness.output(b"old screen\r\n");
+    harness.attach();
+    let asked = harness.server.line_ranges.len();
+    // The desktop fixture retains 5,000 history rows. By the next push
+    // even the bottom of the original viewport has been evicted.
+    harness.quiet_output(&numbered(0, 5100));
+    let floor = mux::renderable::terminal_get_dimensions(&mut harness.server.term).scrollback_top;
+    assert!(floor > isize::try_from(rows).unwrap());
+    harness.push();
+    assert!(
+        harness.server.line_ranges[asked..]
+            .iter()
+            .all(|range| range.start >= floor)
+    );
+    assert_mirrored(&mut harness);
+    let remote = all_text(&mut harness.server.term);
+    let kept = rows + history_rows(rows, cols);
+    assert_eq!(all_text(&mut harness.phone), remote[remote.len() - kept..]);
+
+    harness.output(b"still live");
+    assert_mirrored(&mut harness);
+}
+
+#[test]
 fn a_full_screen_program_takes_over_and_gives_the_screen_back() {
     let mut harness = Harness::new(6, 30);
     harness.quiet_output(&numbered(0, 10));
