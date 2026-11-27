@@ -7070,6 +7070,10 @@ mod tests {
             let _guard = line.appdata.lock().unwrap();
             panic!("poison appdata");
         }));
+        assert!(
+            line.appdata.is_poisoned(),
+            "panic-while-held must poison the appdata lock"
+        );
 
         let data = alloc::sync::Arc::new(42u32);
         line.set_appdata(alloc::sync::Arc::clone(&data));

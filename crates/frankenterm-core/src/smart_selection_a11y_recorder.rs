@@ -413,6 +413,10 @@ mod tests {
             );
             panic!("poison recorder buffer");
         }));
+        assert!(
+            r.inner.is_poisoned(),
+            "panic-while-held must poison the buffer lock"
+        );
 
         r.record_smart_selection(
             &synth(SelectionPatternKind::Url, "https://example.com"),

@@ -873,6 +873,10 @@ mod tests {
             let _guard = budget.audit_history.write().unwrap();
             panic!("poison audit history");
         }));
+        assert!(
+            budget.audit_history.is_poisoned(),
+            "panic-while-held must poison the audit history lock"
+        );
 
         let result = budget.audit();
         assert!(result.current_fds > 0);
