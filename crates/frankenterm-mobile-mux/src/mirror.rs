@@ -103,6 +103,9 @@ struct Shown {
     alt: Option<StableRowIndex>,
     /// The top row of the primary screen as last drawn.
     primary: Option<StableRowIndex>,
+    /// Number of retained remote history rows represented at the last primary
+    /// publication. Kept across alternate-screen updates with its primary top.
+    primary_history_rows: usize,
     title: String,
 }
 
@@ -414,11 +417,16 @@ impl PaneMirror {
             if !target.alt
                 && self.shown.painted
                 && self.shown.primary.is_none_or(|old_top| {
-                    target.dims.scrollback_top > offset(old_top, self.shown.rows)
+                    let floor = target.dims.scrollback_top;
+                    let old_history = self.shown.primary_history_rows;
+                    let old_floor = old_top.saturating_sub(offset(0, old_history));
+                    floor > offset(old_top, self.shown.rows)
+                        || (floor > old_floor && distance(floor, target.top()) < old_history)
                 })
             {
                 // Only join rows to the old primary screen when its layout is
-                // still known and there is no hole before retained history.
+                // still known, retained history is continuous, and a remote
+                // scrollback clear or trim has not removed part of our copy.
                 // Resetting the phone clears its old scrollback and exits the
                 // alternate screen before replaying the surviving primary.
                 self.shown = Shown::default();
@@ -909,6 +917,8 @@ impl PaneMirror {
         } else {
             self.shown.alt = None;
             self.shown.primary = Some(top);
+            self.shown.primary_history_rows =
+                distance(target.dims.scrollback_top, top).min(history_rows(rows, cols));
         }
         self.drawn = Some(target);
         self.lines.clear();
@@ -1159,6 +1169,28 @@ mod tests {
                 );
                 assert!(output[1].complete);
             }
+        }
+    }
+
+    #[test]
+    fn shrinking_retained_history_reseeds_from_the_new_floor() {
+        for floor in [2, 4] {
+            let mut mirror = PaneMirror::new(true);
+            mirror.apply_changes(head(4), Some(entries(0..6))).unwrap();
+            mirror.render();
+
+            let mut trimmed = head(4);
+            trimmed.dimensions.scrollback_top = floor;
+            trimmed.dimensions.scrollback_rows = usize::try_from(6 - floor).unwrap();
+            mirror.apply_changes(trimmed, Some(entries([5]))).unwrap();
+            let wanted = mirror.wanted();
+            assert_eq!(wanted, vec![floor..5]);
+            mirror.set_fetching(&wanted);
+            mirror.apply_lines(entries(floor..5), &wanted);
+            let output = mirror.render();
+            assert_eq!(output.len(), 2);
+            assert!(output[0].bytes.starts_with(b"\x1bc"));
+            assert!(output[1].complete);
         }
     }
 }

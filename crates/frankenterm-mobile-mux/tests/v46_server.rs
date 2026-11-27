@@ -188,6 +188,23 @@ fn a_full_screen_program_takes_over_and_gives_the_screen_back() {
 }
 
 #[test]
+fn clearing_remote_scrollback_also_removes_it_from_the_phone() {
+    let mut harness = Harness::new(4, 20);
+    harness.quiet_output(&numbered(0, 12));
+    harness.attach();
+    assert!(all_text(&mut harness.phone).len() > 4);
+    harness.output(b"\x1b[3J");
+    assert_mirrored(&mut harness);
+    assert_eq!(all_text(&mut harness.server.term).len(), 4);
+    assert_eq!(
+        all_text(&mut harness.phone),
+        all_text(&mut harness.server.term)
+    );
+    harness.output(b"next command\r\n");
+    assert_kept(&mut harness);
+}
+
+#[test]
 fn leaving_a_resized_editor_rebuilds_the_shells_reflowed_history() {
     let mut harness = Harness::new(4, 20);
     for n in 0..16 {
