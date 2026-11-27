@@ -80343,6 +80343,27 @@ impl<E> SteeringReceiptRevalidatingExecutor<E> {
     }
 }
 
+impl<E> SteeringReceiptRevalidatingExecutor<E> {
+    /// The receipt checked against the clock and the mission file as they
+    /// are now: the refusal's error code, or `None` when it still admits
+    /// the run. A mission file that no longer reads fails closed when the
+    /// receipt bound a mission.
+    fn live_receipt_refusal(&self, now_ms: i64) -> Option<&'static str> {
+        let live_now_ms = now_ms.max((self.clock)());
+        let live_mission = self
+            .mission_path
+            .as_deref()
+            .and_then(read_steering_live_mission);
+        frankenterm_core::steer_run::steer_run_gate(
+            &self.receipt,
+            live_mission.as_ref(),
+            Some(&self.full_tx_contract_hash),
+            live_now_ms,
+        )
+        .error_code()
+    }
+}
+
 impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execution::StepExecutor
     for SteeringReceiptRevalidatingExecutor<E>
 {
@@ -80351,7 +80372,32 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         contract: &frankenterm_core::plan::MissionTxContract,
         now_ms: i64,
     ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
-        self.inner.evaluate_gates(contract, now_ms)
+        let mut gates = self.inner.evaluate_gates(contract, now_ms);
+        // ft-wi5kjq: the receipt is a prepare gate. The engine claims every
+        // step's allow-once approval once all gates pass, so a receipt that
+        // lapsed after the run started must deny prepare here. Otherwise the
+        // claim spends approvals for steps the dispatch check then refuses.
+        // A receipt that lapses after a step has run still costs the
+        // approvals already claimed for the later steps. That loss fails
+        // closed, because the dispatch check refuses those steps.
+        if let Some(error_code) = self.live_receipt_refusal(now_ms) {
+            for gate in gates.iter_mut().filter(|gate| gate.policy_passed) {
+                gate.policy_passed = false;
+                gate.policy_reason_code = Some(error_code.to_string());
+            }
+        }
+        gates
+    }
+
+    fn evaluate_compensation_gates(
+        &self,
+        contract: &frankenterm_core::plan::MissionTxContract,
+        now_ms: i64,
+    ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+        // The receipt authorizes the forward steps only. An expired receipt
+        // must not stop the undo of a step that already ran, so it is not a
+        // compensation gate, just as execute_compensations does not check it.
+        self.inner.evaluate_compensation_gates(contract, now_ms)
     }
 
     fn claim_prepare_approvals(
@@ -80394,20 +80440,8 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         // Every dispatch is an effect boundary (ft-7h5da.6.8): the receipt is
         // checked against the clock and the mission file as they are now, not
         // as they were when the run started, so a receipt that expires or a
-        // mission that drifts mid-run stops every later step. A mission file
-        // that no longer reads fails closed when the receipt bound a mission.
-        let live_now_ms = now_ms.max((self.clock)());
-        let live_mission = self
-            .mission_path
-            .as_deref()
-            .and_then(read_steering_live_mission);
-        let verdict = frankenterm_core::steer_run::steer_run_gate(
-            &self.receipt,
-            live_mission.as_ref(),
-            Some(&self.full_tx_contract_hash),
-            live_now_ms,
-        );
-        if let Some(error_code) = verdict.error_code() {
+        // mission that drifts mid-run stops every later step.
+        if let Some(error_code) = self.live_receipt_refusal(now_ms) {
             return contract
                 .plan
                 .steps
@@ -115264,12 +115298,97 @@ reason = "overly conservative pending threshold"
             !calls.contains(&"execute_steps"),
             "stale receipt must stop before side-effecting commit steps"
         );
-        let commit_report = data.commit_report.expect("commit report should be present");
-        assert_eq!(commit_report.failed_count, 1);
+        // ft-wi5kjq: the receipt is a prepare gate, so the run is denied at
+        // prepare and never reaches commit.
         assert_eq!(
-            commit_report.error_code.as_deref(),
-            Some("robot.steer_hash_mismatch")
+            data.prepare_report.outcome,
+            frankenterm_core::plan::TxPrepareOutcome::Denied
         );
+        assert!(data.commit_report.is_none());
+        assert_eq!(
+            data.prepare_report.gate_inputs.len(),
+            contract.plan.steps.len()
+        );
+        for gate in &data.prepare_report.gate_inputs {
+            assert!(!gate.policy_passed);
+            assert_eq!(
+                gate.policy_reason_code.as_deref(),
+                Some("robot.steer_hash_mismatch")
+            );
+        }
+        assert_eq!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Failed
+        );
+    }
+
+    /// ft-wi5kjq: a receipt that lapses between the run's start and prepare
+    /// denies prepare, so no allow-once approval is spent on steps the
+    /// dispatch check would refuse.
+    #[test]
+    fn steering_receipt_expiring_before_prepare_leaves_allow_once_approvals_unspent() {
+        let mut contract = sample_robot_tx_contract();
+        assert_eq!(contract.plan.steps.len(), 2, "fixture runs two steps");
+        let live_hash = steering_tx_contract_hash(&contract);
+        let created_at_ms = 1_704_200_000_000;
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            created_at_ms,
+            Some(60_000),
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let tokens = Arc::new(std::sync::Mutex::new(2));
+        let executor = RecordingStepExecutor {
+            approval_tokens: Some(tokens.clone()),
+            ..Default::default()
+        };
+
+        // The run starts 1 s into the receipt's 60 s TTL. The wrapper's wall
+        // clock already reads two minutes in when prepare evaluates the gates.
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(move || created_at_ms + 120_000),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            created_at_ms + 1_000,
+        )
+        .expect("a receipt expiring before prepare should become a tx report");
+
+        assert_eq!(
+            *tokens.lock().unwrap(),
+            2,
+            "no allow-once approval may be spent for a run the receipt refuses"
+        );
+        assert!(!executor.recorded_calls().contains(&"execute_steps"));
+        assert_eq!(
+            data.prepare_report.outcome,
+            frankenterm_core::plan::TxPrepareOutcome::Denied,
+            "the run fails with the steering reason, not RequireApproval"
+        );
+        assert!(data.commit_report.is_none());
+        assert_eq!(
+            data.prepare_report.gate_inputs.len(),
+            contract.plan.steps.len()
+        );
+        for gate in &data.prepare_report.gate_inputs {
+            assert!(gate.approval_satisfied, "approvals were available");
+            assert_eq!(
+                gate.policy_reason_code.as_deref(),
+                Some("robot.steer_receipt_expired")
+            );
+        }
     }
 
     #[test]
@@ -115294,12 +115413,12 @@ reason = "overly conservative pending threshold"
         let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
         let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
-        // The first step dispatches 1 s into the receipt's 60 s TTL; the second
-        // comes two minutes in, after it expired. The engine's own clock stays
-        // at the run's start for both.
+        // Prepare and the first step's dispatch read the clock 1 s into the
+        // receipt's 60 s TTL; the second step comes two minutes in, after it
+        // expired. The engine's own clock stays at the run's start throughout.
         let clock_reads = Arc::new(AtomicUsize::new(0));
         let clock = move || {
-            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) < 2 {
                 created_at_ms + 1_000
             } else {
                 created_at_ms + 120_000
@@ -115336,6 +115455,18 @@ reason = "overly conservative pending threshold"
             data.final_state,
             frankenterm_core::plan::MissionTxState::Committed
         );
+        // The expired receipt must not block the undo of the step that ran:
+        // it gates forward steps only (ft-wi5kjq).
+        assert_eq!(
+            executor.recorded_calls(),
+            vec![
+                "evaluate_gates",
+                "execute_steps",
+                "evaluate_gates",
+                "execute_compensations",
+            ]
+        );
+        assert!(data.compensation_report.is_some());
     }
 
     /// Edits the mission file after each step it runs, as an operator

@@ -2961,6 +2961,20 @@ pub trait StepExecutor {
     /// Evaluate prepare-phase gates for all steps.
     fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput>;
 
+    /// Evaluate the gates of a compensation batch. Each step of `contract`
+    /// carries its compensation action. The default is [`Self::evaluate_gates`].
+    /// An executor whose forward gates add an authority that must not block an
+    /// undo overrides this to leave that authority out. The steering receipt
+    /// wrapper does this (ft-wi5kjq). A wrapper that forwards `evaluate_gates`
+    /// to an inner executor should forward this method as well.
+    fn evaluate_compensation_gates(
+        &self,
+        contract: &MissionTxContract,
+        now_ms: i64,
+    ) -> Vec<TxPrepareGateInput> {
+        self.evaluate_gates(contract, now_ms)
+    }
+
     /// Consume the scoped allow-once approvals the passing gates relied on,
     /// before commit or compensation dispatch (ft-0rlfq.9). A lost claim marks its gate
     /// unsatisfied. Executors without durable approvals have nothing to claim.
@@ -6954,7 +6968,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         gate_contract.plan.compensations.clear();
         gate_contract.plan.preconditions.clear();
 
-        let mut gate_inputs = self.executor.evaluate_gates(&gate_contract, now_ms);
+        let mut gate_inputs = self
+            .executor
+            .evaluate_compensation_gates(&gate_contract, now_ms);
         let mut report = evaluate_prepare_phase(
             &gate_contract.intent.tx_id,
             &gate_contract.plan,
