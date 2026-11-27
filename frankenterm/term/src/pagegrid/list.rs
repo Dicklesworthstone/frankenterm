@@ -636,14 +636,18 @@ impl PageList {
     pub fn rotate_up(&mut self, range: Range<StableRowIndex>, n: usize, seqno: SequenceNo) {
         let range = self.clamp(range);
         let n = n.min(range.len());
-        if n > 0 {
-            self.materialize_floors(&range);
+        if n == 0 {
+            return;
         }
-        for _ in 0..n {
-            self.clear(range.start, seqno);
-            for bubble in range.start..range.end - 1 {
-                self.bubble_step(bubble, bubble + 1, seqno);
-            }
+        self.materialize_floors(&range);
+        let distance = n as StableRowIndex;
+        for row in range.start..range.start + distance {
+            self.clear(row, seqno);
+        }
+        // Fill the cleared prefix from the first surviving row. Each move
+        // leaves its source empty for the row that follows it by `distance`.
+        for source in range.start + distance..range.end {
+            self.move_into_empty(source - distance, source, seqno);
         }
         self.debug_check_counts();
     }
@@ -653,14 +657,16 @@ impl PageList {
     pub fn rotate_down(&mut self, range: Range<StableRowIndex>, n: usize, seqno: SequenceNo) {
         let range = self.clamp(range);
         let n = n.min(range.len());
-        if n > 0 {
-            self.materialize_floors(&range);
+        if n == 0 {
+            return;
         }
-        for _ in 0..n {
-            self.clear(range.end - 1, seqno);
-            for bubble in (range.start + 1..range.end).rev() {
-                self.bubble_step(bubble, bubble - 1, seqno);
-            }
+        self.materialize_floors(&range);
+        let distance = n as StableRowIndex;
+        for row in range.end - distance..range.end {
+            self.clear(row, seqno);
+        }
+        for source in (range.start..range.end - distance).rev() {
+            self.move_into_empty(source + distance, source, seqno);
         }
         self.debug_check_counts();
     }
@@ -700,31 +706,31 @@ impl PageList {
         page.clear_row(row, seqno);
     }
 
-    /// Moves the empty row at `bubble` to `other` and the row at `other` to
-    /// `bubble`. Rows in one page swap headers. Across a page boundary the
-    /// other row is copied into the empty one and cleared in its own page.
-    fn bubble_step(&mut self, bubble: StableRowIndex, other: StableRowIndex, seqno: SequenceNo) {
-        let (bubble_index, bubble_row) = self.locate(bubble).expect("a retained row");
-        let (other_index, other_row) = self.locate(other).expect("a retained row");
-        if bubble_index == other_index {
-            self.page_mut(bubble_index).swap_rows(bubble_row, other_row);
+    /// Move one surviving row directly to its empty destination. Rows in one
+    /// page swap headers. Across pages, copy into the destination before
+    /// clearing the source, so side entries remain live throughout.
+    fn move_into_empty(&mut self, dest: StableRowIndex, source: StableRowIndex, seqno: SequenceNo) {
+        let (dest_index, dest_row) = self.locate(dest).expect("a retained row");
+        let (source_index, source_row) = self.locate(source).expect("a retained row");
+        if dest_index == source_index {
+            self.page_mut(dest_index).swap_rows(dest_row, source_row);
             return;
         }
         // The source page is held aside while the destination, a different
         // page, is written: an active page moved out of its slot and put
         // back, a sealed one shared for the moment.
-        let source_slot = &mut self.pages[other_index];
+        let source_slot = &mut self.pages[source_index];
         let held_active = source_slot.active.take();
         let held_sealed = source_slot.sealed.clone();
         let source: &Page = held_active
             .as_deref()
             .or(held_sealed.as_deref())
             .expect("a page slot holds its page");
-        self.page_mut(bubble_index)
-            .copy_row_from(bubble_row, source, other_row);
-        self.pages[other_index].active = held_active;
+        self.page_mut(dest_index)
+            .copy_row_from(dest_row, source, source_row);
+        self.pages[source_index].active = held_active;
         drop(held_sealed);
-        self.page_mut(other_index).clear_row(other_row, seqno);
+        self.page_mut(source_index).clear_row(source_row, seqno);
     }
 
     /// Raises every row's effective seqno to at least `seqno`, as legacy's

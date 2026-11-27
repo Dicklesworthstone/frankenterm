@@ -346,13 +346,9 @@ impl PageRows {
             self.views.pop_front();
         }
         if footer > 0 && n > 0 {
-            // The list moved the n new rows above the footer.
             let len = self.views.len();
             let start = len.saturating_sub(footer + n);
-            for _ in 0..n {
-                let view = self.views.pop_back().expect("a new row's view");
-                self.views.insert(start, view);
-            }
+            self.shift_views_down(start..len, n.min(len - start));
         }
         debug_assert_eq!(self.views.len(), self.list.retained_rows());
         scrolled
@@ -368,9 +364,16 @@ impl PageRows {
         }
         let stable = self.stable(range.start)..self.stable(range.end);
         self.list.rotate_up(stable, n, seqno);
-        for _ in 0..n {
+        if n == 1 {
             self.views.remove(range.start);
             self.views.insert(range.end - 1, RowView::default());
+        } else {
+            for source in range.start + n..range.end {
+                self.views.swap(source - n, source);
+            }
+            for view in self.views.range_mut(range.end - n..range.end) {
+                *view = RowView::default();
+            }
         }
     }
 
@@ -383,9 +386,22 @@ impl PageRows {
         }
         let stable = self.stable(range.start)..self.stable(range.end);
         self.list.rotate_down(stable, n, seqno);
-        for _ in 0..n {
+        self.shift_views_down(range, n);
+    }
+
+    /// Move edited and cached views with the rows. Swapping only within the
+    /// region leaves the history prefix in place even if the deque wraps.
+    fn shift_views_down(&mut self, range: Range<usize>, n: usize) {
+        if n == 1 {
             self.views.remove(range.end - 1);
             self.views.insert(range.start, RowView::default());
+        } else {
+            for source in (range.start..range.end - n).rev() {
+                self.views.swap(source + n, source);
+            }
+            for view in self.views.range_mut(range.start..range.start + n) {
+                *view = RowView::default();
+            }
         }
     }
 
@@ -905,6 +921,62 @@ mod tests {
             rows.scroll(1, sequence, false, 0);
         }
         Rows::Page(Box::new(rows))
+    }
+
+    #[test]
+    fn bulk_region_scroll_moves_edited_and_cached_views_with_their_packed_rows() {
+        for up in [true, false] {
+            for count in [0, 1, 2, 4, 7, 9, 12] {
+                let mut rows = PageRows {
+                    list: super::PageList::with_page_rows(8, 3, 5, 11, 1),
+                    views: Default::default(),
+                };
+                for seqno in 1..=19 {
+                    rows.scroll(1, seqno, false, 1);
+                }
+                let region = 1..10;
+                for index in 0..rows.len() {
+                    if index % 3 == 1 {
+                        *rows.line_mut(index) = Line::from_text(
+                            &format!("edited row {index} beyond the page width"),
+                            &CellAttributes::blank(),
+                            100 + index,
+                            None,
+                        );
+                    } else if index % 3 == 2 {
+                        let _ = rows.line(index);
+                    }
+                }
+                let n = count.min(region.len());
+                if up {
+                    rows.rotate_up(region.clone(), count, 200);
+                } else {
+                    rows.rotate_down(region.clone(), count, 200);
+                }
+                rows.list.check_invariants().unwrap();
+                for index in 0..rows.len() {
+                    let source = if !region.contains(&index) {
+                        Some(index)
+                    } else if up {
+                        (index + n < region.end).then_some(index + n)
+                    } else {
+                        index.checked_sub(n).filter(|src| region.contains(src))
+                    };
+                    let edited = source.is_some_and(|src| src % 3 == 1);
+                    let cached = source.is_some_and(|src| src % 3 != 0);
+                    assert_eq!(rows.is_edited(index), edited);
+                    assert_eq!(rows.views[index].line.get().is_some(), cached);
+                    let seqno = source.map_or(200, |src| if edited { 100 + src } else { 9 + src });
+                    assert_eq!(rows.effective_seqno(index), Some(seqno));
+                    if let Some(src) = source.filter(|_| edited) {
+                        assert_eq!(
+                            rows.line(index).as_str(),
+                            format!("edited row {src} beyond the page width")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
