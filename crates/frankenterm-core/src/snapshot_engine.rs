@@ -23495,6 +23495,86 @@ mod tests {
         });
     }
 
+    /// Pruning a session's newest snapshot clears its clean state, even when
+    /// the clean receipt survives and is still the latest checkpoint. The
+    /// session also loses an older snapshot in the same run, so the rule must
+    /// hold across all of that session's deleted rows, not only the first.
+    #[test]
+    fn cleanup_pruning_the_newest_snapshot_clears_a_surviving_clean_receipt() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-newest-pruned",
+            500,
+            r#"{"version":"session"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+        let older_snapshot_id = insert_checkpoint_fixture(
+            db_path.as_str(),
+            "sess-newest-pruned",
+            1_000,
+            CHECKPOINT_ROLE_SNAPSHOT,
+            "000000000000000b",
+            Some(r#"{"version":"older"}"#),
+            10,
+        );
+        let newest_snapshot_id = insert_checkpoint_fixture(
+            db_path.as_str(),
+            "sess-newest-pruned",
+            2_000,
+            CHECKPOINT_ROLE_SNAPSHOT,
+            "000000000000000c",
+            Some(r#"{"version":"newest"}"#),
+            20,
+        );
+        let receipt_id = insert_checkpoint_fixture(
+            db_path.as_str(),
+            "sess-newest-pruned",
+            3_000,
+            "restore_receipt",
+            "restore",
+            None,
+            0,
+        );
+        set_session_checkpoint_summary(
+            db_path.as_str(),
+            "sess-newest-pruned",
+            3_000,
+            r#"{"version":"newest"}"#,
+            Some(receipt_id),
+        );
+
+        // Both snapshots are far older than one day; the count limit is not
+        // reached, so age alone prunes them.
+        assert_eq!(cleanup_sync(db_path.as_str(), 10, 1).unwrap(), 2);
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM session_checkpoints ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![receipt_id]);
+        assert!(!remaining.contains(&older_snapshot_id));
+        assert!(!remaining.contains(&newest_snapshot_id));
+        let summary: (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT shutdown_clean, clean_checkpoint_id, last_checkpoint_at
+                 FROM mux_sessions WHERE session_id = 'sess-newest-pruned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary,
+            (0, None, Some(3_000)),
+            "pruning the newest snapshot must clear the clean receipt"
+        );
+    }
+
     #[test]
     fn unresolved_restore_source_is_protected_from_cleanup_and_explicit_delete() {
         run_async_test(async {
