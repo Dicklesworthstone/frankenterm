@@ -230,6 +230,28 @@ class BashPromptTests(unittest.TestCase):
                     for hook in [b"__ft_precmd", b"__ft_finish_prompt", b"theme_hook"]:
                         self.assertEqual(listing.count(hook), 1, listing)
 
+    def test_prompt_hooks_can_read_the_commands_pipeline_statuses(self):
+        # Every command resets PIPESTATUS, so a hook after ft's sees ft's.
+        # __ft_pipestatus keeps the user's command's statuses for it.
+        rc_text = (
+            "PS1='FT> '\n"
+            + SOURCE_SNIPPETS
+            + "status_hook() { printf '<pipe:%s>' \"${__ft_pipestatus[*]}\"; }\n"
+            "if [[ $(declare -p PROMPT_COMMAND) == 'declare -a'* ]]; then\n"
+            "  PROMPT_COMMAND+=(status_hook)\n"
+            "else\n"
+            "  PROMPT_COMMAND=\"$PROMPT_COMMAND; status_hook\"\n"
+            "fi\n"
+        )
+        lines = [b"false | (exit 3) | true", b"! false"]
+        for bash in BASH_BINARIES:
+            with self.subTest(bash=bash):
+                _, piped, negated = self.run_session(bash, rc_text, lines)
+                self.assertIn(b"<pipe:1 3 0>", piped)
+                self.assertEqual(MARKER.findall(piped), [b"C", b"D;0", b"A", b"B"], piped)
+                self.assertIn(b"<pipe:1>", negated)
+                self.assertEqual(MARKER.findall(negated), [b"C", b"D;0", b"A", b"B"], negated)
+
 
 @unittest.skipUnless(shutil.which('zsh'), 'zsh unavailable')
 class ZshPromptTests(unittest.TestCase):

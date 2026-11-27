@@ -1,8 +1,21 @@
 # Emit one OSC 133 command boundary per interactive submission, including compound commands.
+# Prompt code running after this block sees PIPESTATUS from ft's hook; read
+# __ft_pipestatus for the last command's pipeline statuses instead (with
+# bash-preexec loaded, its BP_PIPESTATUS).
 if [[ $- == *i* ]]; then
     __ft_precmd() {
-        local last_exit=$?
-        unset __ft_armed
+        # PROMPT_COMMAND runs this hook first, so it alone still sees the
+        # command's statuses: every command resets PIPESTATUS, and no hook can
+        # restore it. One command keeps both values.
+        __ft_pipestatus=("${PIPESTATUS[@]}") __ft_last_exit=$?
+        local last_exit=$__ft_last_exit
+        unset __ft_last_exit __ft_armed
+        # On the DEBUG fallback the trap runs just before this hook, and
+        # Bash 3.2 does not restore PIPESTATUS after it, so it saved them.
+        if [[ -n ${__ft_trap_pipestatus+set} ]]; then
+            __ft_pipestatus=("${__ft_trap_pipestatus[@]}")
+            unset __ft_trap_pipestatus
+        fi
         if [[ -n ${__ft_running_marker:-} ]]; then
             printf '\033]133;D;%d\033\\' "$last_exit"
         fi
@@ -34,9 +47,12 @@ if [[ $- == *i* ]]; then
     }
 
     __ft_preexec() {
-        # The DEBUG trap passes the previous command's $_ as the last word of
-        # its only command, so $_ is unchanged for the user's command. PS0
-        # owns the event on modern Bash.
+        # The DEBUG trap passes PIPESTATUS, then the previous command's $_ as
+        # the last word of its only command, so $_ is unchanged for the
+        # user's command. PS0 owns the event on modern Bash.
+        if [[ $BASH_COMMAND == __ft_precmd ]] && (( $# > 1 )); then
+            __ft_trap_pipestatus=("${@:1:$#-1}")
+        fi
         if (( $# == 0 )); then
             # Only an earlier version's DEBUG trap calls this without an
             # argument, and it replaces $_ with its own words. A re-source
@@ -45,7 +61,7 @@ if [[ $- == *i* ]]; then
             # removes itself. Bash 3.2 restores the earlier trap when this
             # function returns, so it stays until that shell exits.
             if [[ ${__ft_native_ps0:-0} == 0 ]]; then
-                trap '__ft_preexec "$_"' DEBUG
+                trap '__ft_preexec "${PIPESTATUS[@]}" "$_"' DEBUG
             else
                 trap 'trap - DEBUG' DEBUG
             fi
@@ -113,6 +129,6 @@ if [[ $- == *i* ]]; then
         # Bash 3.2 has no PS0. Only take an unowned trap. It acts only once
         # the prompt has armed it, so setup and prompt commands stay
         # invisible. Its one command ends with "$_", which keeps $_ intact.
-        trap '__ft_preexec "$_"' DEBUG
+        trap '__ft_preexec "${PIPESTATUS[@]}" "$_"' DEBUG
     fi
 fi
