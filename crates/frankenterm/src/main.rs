@@ -50987,7 +50987,38 @@ fn send_backup_notification(
     let _ = notifier.notify_message(title, body, urgency);
 }
 
+/// Stack reserved for the thread that runs the CLI.
+///
+/// Debug builds give every local of every `run` match arm its own stack slot,
+/// so `run`'s poll frame alone is about 4 MB, and clap's derived command tree
+/// needs about 4 MB more while it parses. Together they passed the 8 MiB main
+/// thread stack on macOS and Linux, so every debug `ft` run, even
+/// `ft --version`, died with a stack overflow, and so did every test that
+/// starts the binary. The reservation is address space: pages are committed
+/// only when touched.
+const CLI_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() {
+    let cli = std::thread::Builder::new()
+        .name("ft-cli".to_owned())
+        .stack_size(CLI_THREAD_STACK_BYTES)
+        .spawn(run_cli_process);
+    match cli {
+        Ok(handle) => {
+            if handle.join().is_err() {
+                // The panic hook has already reported the panic. 101 is the
+                // status a panic in `main` itself exits with.
+                std::process::exit(101);
+            }
+        }
+        Err(error) => {
+            eprintln!("ft: could not start the CLI thread: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_cli_process() {
     use frankenterm_core::runtime_async::CompatRuntime;
 
     // GH#75: `ft` output is machine-readable and destined for pipelines;
