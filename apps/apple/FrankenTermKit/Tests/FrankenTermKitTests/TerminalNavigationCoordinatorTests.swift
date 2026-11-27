@@ -136,25 +136,37 @@ final class TerminalNavigationCoordinatorTests: XCTestCase {
     }
 
     func testInventoryUpdateRightAfterCommitKeepsThePublishedKeyboard() async throws {
-        let (coordinator, owner) = try setup(); coordinator.resume()
-        try await coordinator.activateSelection()
-        let old = coordinator.navigation.machines
-        let plan = try XCTUnwrap(coordinator.navigation.plan(paneID: old[1].panes[0].id))
-        let job = Task { try await coordinator.perform(plan) }
-        await owner.waitForPublication()
-        // Committed and published, but perform has not yet retired the
-        // operation. A binding republish can land here.
-        XCTAssertEqual(coordinator.phase, .switching, "the test must run inside the window")
-        XCTAssertEqual(coordinator.navigation.selection, plan.destination)
-        try coordinator.replaceInventory(coordinator.navigation.machines)
-        try coordinator.replaceInventory([
-            old[0], old[1], TerminalNavigationMachine(id: "C", name: "renamed host", panes: old[2].panes)
-        ])
-        XCTAssertEqual(owner.seals, 0, "a finished switch is not invalidated by a later inventory")
-        try await job.value
-        XCTAssertEqual(coordinator.phase, .ready)
-        XCTAssertEqual(owner.currentSelection, plan.destination)
-        XCTAssertEqual(owner.published.count, 2)
+        // The window is open only when this test resumes from the publication
+        // before perform resumes from its finished task. Swift does not order
+        // those two MainActor jobs (on macOS about half the runs miss it), so
+        // repeat on a fresh coordinator until one run lands inside the window.
+        var windows = 0
+        for _ in 0..<64 where windows == 0 {
+            let (coordinator, owner) = try setup(); coordinator.resume()
+            try await coordinator.activateSelection()
+            let old = coordinator.navigation.machines
+            let plan = try XCTUnwrap(coordinator.navigation.plan(paneID: old[1].panes[0].id))
+            let job = Task { try await coordinator.perform(plan) }
+            await owner.waitForPublication()
+            // Committed and published, but perform has not yet retired the
+            // operation. A binding republish can land here.
+            guard coordinator.phase == .switching else {
+                try await job.value
+                continue
+            }
+            windows += 1
+            XCTAssertEqual(coordinator.navigation.selection, plan.destination)
+            try coordinator.replaceInventory(coordinator.navigation.machines)
+            try coordinator.replaceInventory([
+                old[0], old[1], TerminalNavigationMachine(id: "C", name: "renamed host", panes: old[2].panes)
+            ])
+            XCTAssertEqual(owner.seals, 0, "a finished switch is not invalidated by a later inventory")
+            try await job.value
+            XCTAssertEqual(coordinator.phase, .ready)
+            XCTAssertEqual(owner.currentSelection, plan.destination)
+            XCTAssertEqual(owner.published.count, 2)
+        }
+        XCTAssertEqual(windows, 1, "the test must run inside the window")
     }
 
     func testTargetRemovalSealsExactHandoffAndReappearanceCannotReviveIt() async throws {
