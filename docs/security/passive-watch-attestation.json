@@ -127,14 +127,14 @@
   "fuzz_target_contract": {
     "target_name": "passive_watch_invariant",
     "input_cap_bytes": 262144,
-    "parser_surface": "scan_pipeline::quick_scan",
+    "parser_surface": "patterns::PatternEngine::detect_with_context",
     "observation_shape": [
       "one Capture action for the consumed bytes",
-      "one PatternDetection per non-zero TriggerCategory count",
+      "one PatternDetection per detection, named by its rule_id",
       "one WatchMetadataWrite::Telemetry for the counter dump"
     ],
     "assertions": [
-      "scan.input_bytes equals input length",
+      "every detection names a rule the engine loaded",
       "check_invariants(&obs) returns empty",
       "PassiveWatchHealth::is_safe() is true after folding the observation"
     ]

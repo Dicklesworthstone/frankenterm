@@ -121,21 +121,30 @@ attestation surface dumps this struct verbatim in the recovery JSON artifact.
 
 ## Harness shape (current vs. follow-on)
 
-The shipped target drives `scan_pipeline::quick_scan` — the
-production parser the watch loop already uses to turn bytes
-into "what to capture / what pattern matched." For each fuzz
-input it synthesizes a `PassiveWatchObservation` containing:
+The shipped target drives `PatternEngine::detect_with_context`,
+built from the default `PatternsConfig`: the call the watch loop
+makes for every captured segment. It decodes each fuzz input as
+the capture path does (lossy UTF-8), runs it with a fresh pane
+context, checks that every detection names a rule the engine
+loaded, and synthesizes a `PassiveWatchObservation` containing:
 
 - one `Capture` for the bytes consumed,
-- one `PatternDetection` per non-zero `TriggerCategory` count,
+- one `PatternDetection` per detection, named by its `rule_id`,
 - one `WatchMetadataWrite::Telemetry` for the counter dump,
 
 then asserts no invariant fires and `health.is_safe()` holds.
-This proves the parser surface itself has no path to a mutating
-action — by construction. The integration follow-on bead (filed
-by pane 2) wires the real `ft watch` driver into the same
-harness so the dispatcher (not just the parser) is exercised
-by libfuzzer's coverage-guided mutation.
+The detection surface returns plain values and holds no mux, IPC
+or storage handle, so it has no path to a mutating action by
+construction; the harness pins that shape and catches panics in
+the production matcher. The integration follow-on wires the real
+`ft watch` driver into the same harness so the dispatcher (not
+just the matcher) is exercised by libfuzzer's coverage-guided
+mutation.
+
+The first target (2026-05) drove `scan_pipeline::quick_scan`.
+That parser was deleted in round 9, the target was removed with
+it in v0.12.0, and ft-s56rd6 restored the target against the
+matcher that replaced it.
 
 ## Re-running
 
@@ -167,10 +176,9 @@ contract that lane consumes.
   `grid_reflow`, `render_quality`, `snap_back_fuzz`,
   `wayland_frame_pacing`, `bidi_correctness`,
   `tx_killswitch_model`.
-- **Production parser:** `scan_pipeline::quick_scan` in
-  `crates/frankenterm-core/src/scan_pipeline.rs`.
-- **Production trigger taxonomy:** `pattern_trigger::TriggerCategory`
-  in `crates/frankenterm-core/src/pattern_trigger.rs`.
+- **Production detection surface:** `PatternEngine::detect_with_context`
+  in `crates/frankenterm-core/src/patterns.rs`, called from the
+  capture loop in `crates/frankenterm-core/src/runtime.rs`.
 - **Attestation cross-link:** `docs/attestations/manifest.json`
   contains the `security/passive-watch` slot pointing at
   `docs/security/passive-watch-attestation.json`.

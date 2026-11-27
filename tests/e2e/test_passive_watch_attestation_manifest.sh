@@ -113,7 +113,7 @@ expect_equal(
 fuzz_contract = att.fetch("fuzz_target_contract")
 expect_equal(fuzz_contract["target_name"], "passive_watch_invariant", "fuzz target name changed", check: "passive_watch.fuzz_target_name", input_path: att_path)
 expect_equal(fuzz_contract["input_cap_bytes"], 262_144, "fuzz input cap changed", check: "passive_watch.fuzz_input_cap", input_path: att_path)
-expect_equal(fuzz_contract["parser_surface"], "scan_pipeline::quick_scan", "parser surface changed", check: "passive_watch.parser_surface", input_path: att_path)
+expect_equal(fuzz_contract["parser_surface"], "patterns::PatternEngine::detect_with_context", "parser surface changed", check: "passive_watch.parser_surface", input_path: att_path)
 StaticAttestation.require_terms!(
   fuzz_contract.fetch("assertions").join("\n"),
   StaticAttestation.expected_strings(
@@ -164,7 +164,9 @@ StaticAttestation.require_terms!(
 StaticAttestation.require_terms!(
   fuzz,
   StaticAttestation.expected_strings(
-    "quick_scan",
+    "PatternEngine::from_config(&PatternsConfig::default())",
+    "ENGINE.detect_with_context(",
+    "RULE_IDS.contains(",
     "check_invariants",
     "fold_observation",
     "PassiveWatchHealth::baseline",
@@ -174,6 +176,7 @@ StaticAttestation.require_terms!(
   source: fuzz_path,
   check: "passive_watch.fuzz_terms",
 )
+assert_ok(!fuzz.include?("use frankenterm_core::scan_pipeline"), "fuzz target imports the deleted scan_pipeline", check: "passive_watch.fuzz_absence", input_path: fuzz_path, expected: "absent", actual: fuzz.include?("use frankenterm_core::scan_pipeline") ? "present" : "absent")
 
 bin = toml[/\[\[bin\]\]\s*name = "passive_watch_invariant".*?(?=\n\[\[bin\]\]|\z)/m]
 assert_ok(!bin.nil?, "fuzz Cargo.toml missing passive_watch_invariant bin", check: "passive_watch.fuzz_bin", input_path: "fuzz/Cargo.toml")
@@ -220,7 +223,7 @@ StaticAttestation.require_terms!(
   readme,
   StaticAttestation.expected_strings(
     "<!--count:e2e_scripts-->#{live_e2e}<!--/count-->",
-    "# #{live_e2e} shell E2E scripts",
+    "# <!--count:e2e_scripts-->#{live_e2e}<!--/count--> shell E2E scripts",
   ),
   source: "README.md",
   check: "passive_watch.readme_e2e_count",

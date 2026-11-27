@@ -382,10 +382,16 @@ path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
-# ft-x0666.1 passive_watch_invariant fuzz target removed: it imported
-# frankenterm_core::scan_pipeline::quick_scan, deleted in round 9. The
-# contract module crates/frankenterm-core/src/passive_watch_invariant.rs
-# survives; re-point a fuzz target at the live parser (simd_scan) if wanted.
+# ft-x0666.1 / ft-s56rd6: passive-watch read-only invariant. Drives the
+# watch loop's detection call (PatternEngine::detect_with_context); the
+# earlier target drove scan_pipeline::quick_scan, deleted in round 9.
+[[bin]]
+name = "passive_watch_invariant"
+test = false
+bench = false
+path = "fuzz_targets/passive_watch_invariant.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
 
 
 
