@@ -821,8 +821,11 @@ export function mountPaneOutput({
 // A small, session-owned watchboard for comparing captured output. Each tile
 // uses the same epoch-fenced SSE owner as the inspector. Pins are deliberately
 // memory-only: a numeric capture pane ID is not a durable live-pane identity.
-// Three pins plus the inspector and fleet feed own at most five SSE connections,
-// leaving an HTTP/1 origin connection for session checks and ordinary reads.
+// Three pins plus the inspector and fleet feed own at most five SSE connections
+// in this tab, leaving an HTTP/1 origin connection for session checks and
+// ordinary reads only while no other tab of the origin holds connections. Every
+// tab shares the browser's six per-origin connections and the session's eight
+// server streams.
 // Each pin retains at most 128 Ki UTF-16 units; no preferences or data persist.
 export function mountPinnedOutputs({
   document: doc = globalThis.document,

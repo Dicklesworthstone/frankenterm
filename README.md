@@ -1127,9 +1127,14 @@ attaching it to a current pane. Live pins begin with new output and can explicit
 load retained history. Each pin retains at most 128 Ki UTF-16 code units and 1,024
 chunks, with visible gap and truncation notices. Pins stay in this browser tab's
 memory, suspend their streams when the page is hidden, and clear on sign-out.
-The three-pin limit leaves room for HTTP requests alongside the fleet feed and
-main inspector. These are captured-text views; native terminal input and geometry
-remain outside this preview.
+The three-pin limit holds one tab to five event streams (three pins, the main
+inspector and the fleet feed), which leaves one of the browser's six connections
+to a plain-HTTP origin for ordinary requests. Both limits are shared beyond the
+tab: every tab on the origin draws on those six connections, and every tab of one
+sign-in (or every anonymous viewer) on the server's eight streams. With several
+pinned tabs open, requests queue in the browser and extra streams are refused
+until pins or tabs close. These are captured-text views; native terminal input
+and geometry remain outside this preview.
 
 ```bash
 RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
