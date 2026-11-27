@@ -856,6 +856,38 @@ impl PageList {
         };
     }
 
+    /// Discard already-admitted or explicitly erased history. Unlike an
+    /// eviction during a scroll, no sink needs to inspect individual rows.
+    /// Release whole pages and advance only the boundary slot's coordinates;
+    /// readers holding sealed pages keep their immutable copies.
+    pub(crate) fn discard_prefix(&mut self, count: usize) {
+        assert!(count <= self.retained_rows);
+        let mut remaining = count;
+        while remaining != 0 {
+            let slot = self.pages.front_mut().expect("a retained page");
+            let retained = slot.retained();
+            if remaining < retained {
+                slot.front_trim += remaining as u32;
+                slot.first_stable += remaining as StableRowIndex;
+                break;
+            }
+            self.pages.pop_front();
+            self.sealed = self.sealed.saturating_sub(1);
+            remaining -= retained;
+        }
+        self.retained_rows -= count;
+        let first = self.first_stable();
+        self.range_floors.retain(|floor| floor.end > first);
+        if self.retained_rows <= self.hot_cap {
+            self.over_cap = None;
+        }
+        self.debug_check_counts();
+    }
+
+    pub(super) fn shrink_to_fit(&mut self) {
+        self.pages.shrink_to_fit();
+    }
+
     /// Sets the viewport height. Growing it can pull rows of sealed pages
     /// back within [`SEAL_DISTANCE`] of the viewport top; those pages are
     /// unsealed, by fork when a reader still holds them (D8).

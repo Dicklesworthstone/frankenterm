@@ -6137,7 +6137,7 @@ impl Screen {
         let over_limits = self.preflight_resident_checkpoint_usage(limits, usage)?;
         if over_limits != 0 {
             note_history_over_checkpoint_limits(over_limits);
-            self.lines.drain(..over_limits);
+            self.lines.discard_prefix(over_limits);
             self.advance_stable_row_index_offset(over_limits);
             self.raise_recovery_boundary_to_oldest_row();
         }
@@ -6951,7 +6951,7 @@ impl Screen {
             );
         }
         self.coordinate_identity = next_coordinate_identity;
-        self.lines.drain(..evicted + cold_prefix_line_count);
+        self.lines.discard_prefix(evicted + cold_prefix_line_count);
         self.stable_row_index_offset = new_resident_oldest;
         self.scrollback_tiering.reset();
         self.recovery_scrollback = None;
@@ -11100,11 +11100,9 @@ impl Screen {
             self.cold_source_observation = None;
         }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
-        for _ in 0..to_clear {
-            self.lines.pop_front();
-            if self.allow_scrollback {
-                self.advance_stable_row_index_offset(1);
-            }
+        self.lines.discard_prefix(to_clear);
+        if self.allow_scrollback {
+            self.advance_stable_row_index_offset(to_clear);
         }
         if let (Some(recovery), Some(boundary)) = (
             self.recovery_scrollback.as_mut(),
@@ -11145,9 +11143,7 @@ impl Screen {
             return 0;
         }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
-        for _ in 0..excess {
-            self.lines.pop_front();
-        }
+        self.lines.discard_prefix(excess);
         self.advance_stable_row_index_offset(excess);
         self.lines.shrink_to_fit();
         excess
@@ -21282,6 +21278,46 @@ pub(crate) mod tests {
     // =========================================================================
     // Core Screen::resize() behavior
     // =========================================================================
+
+    #[test]
+    fn clear_and_policy_trim_keep_packed_history_and_edited_viewport_rows() {
+        let mut legacy = test_screen_with_history(GridEngine::Legacy);
+        let mut page = test_screen_with_history(GridEngine::Page);
+        for screen in [&mut legacy, &mut page] {
+            let visible = screen.phys_row(0);
+            screen.lines[visible] = Line::from_text(
+                "edited beyond the page width",
+                &CellAttributes::blank(),
+                21,
+                None,
+            );
+            screen.scrollback_policy.size = 2;
+            assert_eq!(screen.trim_scrollback_to_policy(22), 6);
+            assert_eq!(screen.trim_scrollback_to_policy(22), 0);
+        }
+        let first = page.phys_to_stable_row_index(0);
+        assert_eq!(page.grid_engine(), GridEngine::Page);
+        assert_eq!(page.cached_page_views(), 1);
+        assert_eq!(page.stable_row_index_offset, legacy.stable_row_index_offset);
+        for screen in [&mut legacy, &mut page] {
+            screen.erase_scrollback().unwrap();
+            screen.erase_scrollback().unwrap();
+        }
+        assert_eq!(page.grid_engine(), GridEngine::Page);
+        assert_eq!(page.cached_page_views(), 1);
+        assert_eq!(page.phys_to_stable_row_index(0), first + 2);
+        assert_eq!(page.lines.len(), page.physical_rows);
+        assert_eq!(page.lines, legacy.lines);
+        assert_eq!(page.lines[0].as_str(), "edited beyond the page width");
+        for screen in [&mut legacy, &mut page] {
+            screen.scroll_up(&(0..4), 1, 23, CellAttributes::blank(), bidi_mode());
+        }
+        assert_eq!(page.grid_engine(), GridEngine::Page);
+        assert_eq!(page.lines, legacy.lines);
+        let list = page.lines.page().unwrap().list();
+        assert_eq!(list.first_stable(), page.phys_to_stable_row_index(0));
+        list.check_invariants().unwrap();
+    }
 
     #[test]
     fn page_same_width_resize_preserves_history_cursor_selection_and_edited_views() {

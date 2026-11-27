@@ -153,6 +153,45 @@ fn refusal_hold_and_cap_changes_keep_legacy_eviction_counts() {
 }
 
 #[test]
+fn discard_prefix_preserves_sealed_readers_and_surviving_row_coordinates() {
+    let mut list = PageList::with_page_rows(COLS, 4, 2, 17, 1);
+    for stable in 0..20 {
+        list.scroll(1, 1, false, admit_all);
+        put(&mut list, stable, stable as u32, 1);
+    }
+    assert_eq!(list.first_stable(), 3);
+    let removed = Arc::clone(list.row(4).unwrap().sealed.unwrap());
+    let boundary = Arc::clone(list.row(8).unwrap().sealed.unwrap());
+    list.mark_rows_changed(4..8, 20);
+    list.mark_rows_changed(8..12, 21);
+    list.set_hot_cap(8);
+
+    // Drop the already partially trimmed first page, one whole page, and
+    // the beginning of a shared boundary page. Later, drop the entire tail.
+    for (count, first) in [(0, 3), (6, 9), (3, 12), (8, 20)] {
+        list.discard_prefix(count);
+        assert_eq!(list.first_stable(), first);
+        assert_eq!(list.end_stable(), 20);
+        assert_eq!(list.over_cap().is_some(), first < 12);
+        assert!(list.row(first - 1).is_none());
+        for stable in first..20 {
+            assert_eq!(content(&list, stable), Some(stable as u32));
+        }
+        if first == 9 {
+            assert_eq!(list.row(first).unwrap().page.serial(), boundary.serial());
+            assert_eq!(list.effective_seqno(first), Some(21));
+        }
+        check(&list);
+    }
+    assert_eq!(removed.glyph(0, 0), Glyph::Char(glyph(4)));
+    assert_eq!(boundary.glyph(0, 0), Glyph::Char(glyph(8)));
+    let scrolled = list.scroll_line(30, 0);
+    assert_eq!(scrolled.first_new, 20);
+    assert_eq!(list.effective_seqno(20), Some(30));
+    check(&list);
+}
+
+#[test]
 fn resize_truncation_keeps_stable_prefix_and_shared_pages_without_stale_floors() {
     let mut list = PageList::with_page_rows(COLS, 4, 2, 17, 1);
     for stable in 0..20 {

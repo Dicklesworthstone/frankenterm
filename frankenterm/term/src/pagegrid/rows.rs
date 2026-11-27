@@ -11,7 +11,7 @@
 //! - an insertion or removal of rows other than the page engine's own scroll
 //!   operations turns the rows back into legacy `Line`s for good
 //!   ([`Rows::legacy_mut`]). Those come from width reflow, cold seams,
-//!   recovery and erasing the scrollback, which later B3 beads make
+//!   recovery and other structural edits, which later B3 beads make
 //!   page-native.
 
 use super::list::{PageList, Scrolled};
@@ -620,8 +620,12 @@ impl Rows {
     }
 
     pub fn shrink_to_fit(&mut self) {
-        if let Rows::Legacy(lines) = self {
-            lines.shrink_to_fit();
+        match self {
+            Rows::Legacy(lines) => lines.shrink_to_fit(),
+            Rows::Page(rows) => {
+                rows.views.shrink_to_fit();
+                rows.list.shrink_to_fit();
+            }
         }
     }
 
@@ -681,6 +685,21 @@ impl Rows {
 
     pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> vec_deque::Drain<'_, Line> {
         self.legacy_mut().drain(range)
+    }
+
+    /// Drop a prefix without constructing compatibility views or disturbing
+    /// authoritative edited views in the retained suffix.
+    pub(crate) fn discard_prefix(&mut self, count: usize) {
+        match self {
+            Rows::Legacy(lines) => {
+                lines.drain(..count);
+            }
+            Rows::Page(rows) => {
+                rows.list.discard_prefix(count);
+                rows.views.drain(..count);
+                debug_assert_eq!(rows.views.len(), rows.list.retained_rows());
+            }
+        }
     }
 }
 
