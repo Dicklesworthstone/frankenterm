@@ -1283,6 +1283,16 @@ function captureHit(overrides = {}) {
   return { captureCursor: deltaCursor(before, hit.paneId), ...hit };
 }
 
+test("a detection capture refuses missing or changed capture provenance before showing text", () => {
+  for (const paneUuid of [undefined, null, "b".repeat(32)]) {
+    const f = fixture(), hit = captureHit({ paneUuid: "a".repeat(32) });
+    f.output.selectCapture(hit);
+    capturedDelta(f.latest(), hit, "wrong capture", { paneUuid });
+    assert.equal(f.output.snapshot().status, "unavailable");
+    assert.equal(f.output.snapshot().text, "");
+  }
+});
+
 function capturedDelta(source, hit, content, overrides = {}) {
   beginDelivery(source);
   const payload = '{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":' +

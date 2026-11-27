@@ -292,6 +292,7 @@ export function createPaneOutput({
               return;
             }
             if (typeof data.captured_at !== "number" || typeof data.content_len !== "number"
+                || (capture.paneUuid !== undefined && paneUuid !== capture.paneUuid)
                 || unsigned(exact.data.captured_at, I64_MAX) !== capture.capturedAt
                 || unsigned(exact.data.content_len, U64_MAX) !== capture.contentLength) {
               settleCapture("Capture identity changed or was invalid. Search again; no current pane was opened.");
@@ -496,6 +497,10 @@ export function createPaneOutput({
         throw new Error("invalid capture identity");
       }
       target.captureCursor = boundary.token;
+      if (hit.paneUuid !== undefined) {
+        if (typeof hit.paneUuid !== "string" || !/^[0-9a-f]{32}$/.test(hit.paneUuid)) throw new Error("invalid capture identity");
+        target.paneUuid = hit.paneUuid;
+      }
       startSelection(target.paneId, true, Object.freeze(target));
     },
     // An explicit new action turns a completed one-segment read into a
@@ -735,9 +740,10 @@ export function mountPaneOutput({
       output.selectCapture(hit);
     } catch (_) {
       hint.textContent = "The search result has an invalid capture identity. Search again.";
-      return;
+      return false;
     }
     presentSelection("Showing one historical capture. Use Follow captured output from here to read subsequent captures.", false);
+    return true;
   }
 
   function openSelected() {

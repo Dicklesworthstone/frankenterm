@@ -150,6 +150,7 @@ function fixture(t, options = {}) {
   const rendererModule = { default: async () => {}, FrankenTermWeb: Renderer };
   const fetchImpl = async (url, init) => {
     const request = { url: new URL(url), ...init }; requests.push(request);
+    if (request.url.pathname.endsWith("/events/capture") && options.captureReply) return options.captureReply();
     if (request.url.pathname.endsWith("/search") && options.pendingSearch) return searchGate.promise;
     if (request.url.pathname.endsWith("/search")) return new Response(JSON.stringify({ ok: true, data: {
       results: [{ segment_id: 3, pane_id: 7, score: -0.5, captured_at: 1000, content_len: 6, snippet: "needle", capture_cursor: deltaCursor("2") }], total: 1,
@@ -792,6 +793,52 @@ test("attention triages admitted warnings and input requests without notificatio
   assert.equal(f.notifications.length, 0);
   f.app.dispose();
   assert.deepEqual(select.children, []);
+});
+
+test("triggering output resolves the exact event even after its pane has closed", async (t) => {
+  const uuid = "a".repeat(32), pane = "18446744073709551615", event = "9007199254740995";
+  const cursor = deltaCursor("899", pane);
+  const ref = { event_id: event, event_epoch: DETECTION_EPOCH, pane_id: pane, pane_uuid: uuid,
+    segment_id: "900", capture_cursor: cursor, captured_at: "1000", content_len: "12" };
+  const f = fixture(t, { paneSnapshot: '{"ok":true,"data":{"panes":[]}}',
+    captureReply: () => new Response(JSON.stringify({ ok: true, data: ref })) });
+  await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed);
+  emitNotificationDetection(feed, event, uuid); f.frame();
+  const list = f.get("attention-items"); list.value = list.children[0].value; list.emit("change");
+  const button = f.get("attention-capture");
+  assert.equal(button.disabled, false);
+  button.emit("click"); await flush();
+  const req = f.requests.find((r) => r.url.pathname.endsWith("/events/capture"));
+  assert.equal(req.url.searchParams.get("cursor"), `event-v1:${DETECTION_EPOCH}:all:${event}`);
+  assert.equal(req.url.searchParams.get("pane_uuid"), uuid);
+  assert.equal(req.url.searchParams.get("pane_id"), pane);
+  const source = f.sources.at(-1);
+  assert.equal(source.url.searchParams.get("cursor"), cursor);
+  readyPinned(source, "899");
+  source.emit("delta", { lastEventId: deltaCursor("900", pane),
+    data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":${pane},"pane_uuid":"${uuid}","segment_id":900,"seq":42,"captured_at":1000,"content_len":12,"content":"original row"}}` });
+  f.frame();
+  assert.equal(f.get("pane-output-text").value, "original row");
+  assert.equal(source.closed, true);
+});
+
+test("a triggering-output lookup cannot open a deselected alert", async (t) => {
+  const pending = deferred(), uuid = "b".repeat(32);
+  const f = fixture(t, { captureReply: () => pending.promise });
+  await f.app.ready; await flush();
+  const feed = f.fleetSources()[0]; notificationReady(feed);
+  emitNotificationDetection(feed, "1", uuid); f.frame();
+  const list = f.get("attention-items"); list.value = list.children[0].value; list.emit("change");
+  const before = f.sources.length;
+  f.get("attention-capture").emit("click"); await flush();
+  list.value = ""; list.emit("change");
+  pending.resolve(new Response(JSON.stringify({ ok: true, data: { event_id: "1", event_epoch: DETECTION_EPOCH,
+    pane_id: "18446744073709551615", pane_uuid: uuid, segment_id: "3", captured_at: "1000", content_len: "4",
+    capture_cursor: deltaCursor("2", "18446744073709551615") } })));
+  await flush();
+  assert.equal(f.sources.length, before);
+  assert.equal(f.get("pane-output").hidden, true);
 });
 
 test("attention ages a detection by server time, whether this browser's clock runs ahead or behind", async (t) => {

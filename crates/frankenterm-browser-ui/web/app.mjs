@@ -36,6 +36,7 @@ function mountAttentionQueue(doc, inspect, now) {
   const summary = doc.getElementById("attention-summary");
   const review = doc.getElementById("attention-review");
   const inspectButton = doc.getElementById("attention-inspect");
+  const captureButton = doc.getElementById("attention-capture");
   const status = doc.getElementById("attention-status");
   let items = [];
   let dropped = 0;
@@ -47,6 +48,7 @@ function mountAttentionQueue(doc, inspect, now) {
     review.disabled = !row;
     review.textContent = row?.reviewed ? "Mark unread" : "Mark reviewed";
     inspectButton.disabled = !row?.target.paneUuid;
+    captureButton.disabled = !/^[0-9a-f]{32}$/.test(row?.target.paneUuid ?? "");
   }
   function render() {
     const time = now();
@@ -85,6 +87,10 @@ function mountAttentionQueue(doc, inspect, now) {
   inspectButton.addEventListener("click", () => {
     const row = selected();
     if (row?.target.paneUuid) inspect(row.target);
+  });
+  captureButton.addEventListener("click", () => {
+    const row = selected();
+    if (row && !captureButton.disabled) inspect(row.target, true);
   });
   return {
     // detectedAt and sentAt (the frame's ts_ms) are both server wall-clock
@@ -1043,7 +1049,7 @@ export function mountFleetApp({
     document: doc, apiRoot,
     output: createPaneOutput({ apiRoot, EventSourceImpl, setTimer, clearTimer }),
     onPin: pinnedOutputs.pin,
-    onOpen: pinnedOutputs.showAll,
+    onOpen() { cancelInspection(); pinnedOutputs.showAll(); },
     restoreFocus: () => {
       if (active) (viewer ? (textView() ? screenText : canvas) : element("pane-output-id")).focus();
     },
@@ -1070,10 +1076,10 @@ export function mountFleetApp({
     },
   });
 
-  const attention = mountAttentionQueue(doc, (target) => {
+  const attention = mountAttentionQueue(doc, (target, triggeringOutput = false) => {
     if (!active || disposed || !viewer) return;
     cancelInspection();
-    inspection = { target, fromQueue: true };
+    inspection = { target, fromQueue: true, triggeringOutput };
     inspectionFromQueue = true;
     void inspectDetection();
   }, now);
@@ -1090,7 +1096,7 @@ export function mountFleetApp({
   }
   async function inspectDetection() {
     if (!inspection || !active || disposed) return;
-    const { target, fromQueue } = inspection;
+    const { target, fromQueue, triggeringOutput } = inspection;
     const admitted = () => fromQueue ? attention.contains(target) : notifications.isEnabled();
     if (!admitted()) return;
     // The result goes to the fleet view and the pane form, which pinned focus
@@ -1110,6 +1116,26 @@ export function mountFleetApp({
         return;
       }
       if (!current()) return;
+      if (triggeringOutput) {
+        // Query the event's own source. A later registration can reuse the
+        // pane ID, and a closed pane can still have a readable detection.
+        const params = new URLSearchParams({
+          cursor: `event-v1:${target.epoch}:all:${target.id}`,
+          pane_id: target.paneId, pane_uuid: target.paneUuid,
+        });
+        const body = JSON.parse(await readSnapshot(`events/capture?${params}`, apiRoot, fetchImpl, controller.signal, 8192));
+        if (!current()) return;
+        const ref = body?.data;
+        if (body?.ok !== true || ref?.event_epoch !== target.epoch || ref.event_id !== target.id
+            || ref.pane_id !== target.paneId || ref.pane_uuid !== target.paneUuid
+            || !inspector.openCapture({ paneId: ref.pane_id, paneUuid: ref.pane_uuid, segmentId: ref.segment_id,
+              capturedAt: ref.captured_at, contentLength: ref.content_len, captureCursor: ref.capture_cursor })) {
+          report("The triggering capture could not be verified.");
+          return;
+        }
+        report("Opened the triggering capture.");
+        return;
+      }
       // Bring the read-only detection list forward only in response to this
       // explicit click. Never inject input into a terminal or attach control.
       viewer?.pushEncodedInput(JSON.stringify(keyInput({ key: "2" }, "down")));
@@ -1125,7 +1151,8 @@ export function mountFleetApp({
       }
     } catch (_) {
       if (!disposed && active && admitted() && inspectionGeneration === expected) {
-        report("The detected pane could not be verified. Review Detections or search captured history.");
+        report(triggeringOutput ? "The triggering output is unavailable. It may have expired from retained history."
+          : "The detected pane could not be verified. Review Detections or search captured history.");
       }
     } finally {
       clearTimer(deadline);
