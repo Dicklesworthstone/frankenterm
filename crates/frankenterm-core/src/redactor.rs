@@ -46,6 +46,16 @@ pub fn reset_streaming_redactor_pending_overflow_count_for_test() {
     STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// Test helper: the counter is process-wide, so every test that reads or
+/// resets it, and every test anywhere in the crate that overflows a
+/// redactor on purpose, holds this lock.
+#[cfg(test)]
+pub(crate) fn streaming_overflow_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Internal helper: bump the counter when overflow suppression starts.
 fn record_streaming_redactor_pending_overflow() {
     STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1664,62 +1674,220 @@ pub struct StreamingRedactor {
 }
 
 /// After discarding an unresolved prefix, ordinary regex matching cannot see
-/// what later bytes continue. Retain only a bounded terminator matcher, never
+/// what later bytes continue. Retain only bounded armour-line state, never
 /// the discarded secret. Arbitrary regexes have no generally safe delimiter.
 #[derive(Debug, Clone)]
 enum StreamingSuppression {
     UntilFinish,
-    Armour {
-        terminator: Vec<u8>,
-        fallback: Vec<usize>,
+    Armour(ArmourSuppression),
+}
+
+/// Most distinct sensitive labels one suppression episode tracks at once.
+/// More ends the episode only at finish.
+const MAX_SUPPRESSED_OPEN_BLOCKS: usize = 16;
+
+/// Longest armour label whose footer is tracked, as in [`armoured_footer_label`].
+const MAX_ARMOUR_LABEL_BYTES: usize = 128;
+
+/// Suppression that ends at the footer closing the last sensitive block still
+/// open. Ending at the first block's own footer released the rest of any
+/// block with another label that opened inside it, such as a key printed
+/// while a PGP message was still being written.
+///
+/// A footer closes every open block with its label. A second header with the
+/// same label is either nested or follows a block that lost its footer, which
+/// look the same; nesting is not valid armour, and waiting for a second footer
+/// would lose the rest of `cat truncated.pem good.pem`.
+///
+/// It keeps the footer labels still owed and the armour line being read, at
+/// most [`MAX_ARMOUR_LABEL_BYTES`] of label characters, never body bytes. The
+/// episode's own header, at the start of the suppressed prefix, is the first
+/// block it sees open.
+#[derive(Debug, Clone, Default)]
+struct ArmourSuppression {
+    /// Distinct footer labels of the open sensitive blocks.
+    open: Vec<String>,
+    line: ArmourLine,
+}
+
+/// Position within an armour line `-----BEGIN <label>-----` or
+/// `-----END <label>-----`, with the label characters `[A-Z0-9 ]` the catalog
+/// uses. Body bytes outside a line are never kept.
+#[derive(Debug, Clone)]
+enum ArmourLine {
+    Dashes(usize),
+    Keyword {
+        begin: bool,
         matched: usize,
+    },
+    Label {
+        begin: bool,
+        label: Vec<u8>,
+    },
+    Closing {
+        begin: bool,
+        label: Vec<u8>,
+        dashes: usize,
     },
 }
 
-impl StreamingSuppression {
-    fn armour(terminator: String) -> Self {
-        let terminator = terminator.into_bytes();
-        let mut fallback = vec![0; terminator.len()];
-        for index in 1..terminator.len() {
-            let mut matched = fallback[index - 1];
-            while matched > 0 && terminator[index] != terminator[matched] {
-                matched = fallback[matched - 1];
+impl Default for ArmourLine {
+    fn default() -> Self {
+        Self::Dashes(0)
+    }
+}
+
+enum ArmourProgress {
+    Open,
+    Closed(usize),
+    UntilFinish,
+}
+
+impl ArmourLine {
+    /// Advance by one byte. Returns a complete line's kind and label, which
+    /// may be one byte over [`MAX_ARMOUR_LABEL_BYTES`] to mark it oversized.
+    fn step(&mut self, byte: u8) -> Option<(bool, Vec<u8>)> {
+        const BEGIN: &[u8] = b"BEGIN ";
+        const END: &[u8] = b"END ";
+        loop {
+            match self {
+                Self::Dashes(count) => {
+                    if byte == b'-' {
+                        *count = count.saturating_add(1);
+                        return None;
+                    }
+                    let opened = *count >= 5 && (byte == b'B' || byte == b'E');
+                    *self = if opened {
+                        Self::Keyword {
+                            begin: byte == b'B',
+                            matched: 1,
+                        }
+                    } else {
+                        Self::Dashes(0)
+                    };
+                    return None;
+                }
+                Self::Keyword { begin, matched } => {
+                    let keyword = if *begin { BEGIN } else { END };
+                    if byte != keyword[*matched] {
+                        *self = Self::Dashes(0);
+                        continue;
+                    }
+                    *matched += 1;
+                    if *matched == keyword.len() {
+                        *self = Self::Label {
+                            begin: *begin,
+                            label: Vec::new(),
+                        };
+                    }
+                    return None;
+                }
+                Self::Label { begin, label } => {
+                    if byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' ' {
+                        if label.len() <= MAX_ARMOUR_LABEL_BYTES {
+                            label.push(byte);
+                        }
+                        return None;
+                    }
+                    if byte != b'-' {
+                        *self = Self::Dashes(0);
+                        continue;
+                    }
+                    *self = Self::Closing {
+                        begin: *begin,
+                        label: std::mem::take(label),
+                        dashes: 1,
+                    };
+                    return None;
+                }
+                Self::Closing {
+                    begin,
+                    label,
+                    dashes,
+                } => {
+                    if byte != b'-' {
+                        // At most four dashes were seen, too few to open a line.
+                        *self = Self::Dashes(0);
+                        continue;
+                    }
+                    *dashes += 1;
+                    if *dashes < 5 {
+                        return None;
+                    }
+                    let line = (*begin, std::mem::take(label));
+                    *self = Self::Dashes(0);
+                    return Some(line);
+                }
             }
-            if terminator[index] == terminator[matched] {
-                matched += 1;
-            }
-            fallback[index] = matched;
-        }
-        Self::Armour {
-            terminator,
-            fallback,
-            matched: 0,
         }
     }
+}
 
-    /// The returned boundary includes the complete ASCII terminator and is
+/// Whether `label` opens a block the catalog redacts, by the same grammar as
+/// [`STREAMING_ARMOURED_HEADER`].
+fn sensitive_armour_label(label: &str) -> bool {
+    let line = format!("-----BEGIN {label}-----");
+    STREAMING_ARMOURED_HEADER
+        .find(&line)
+        .is_some_and(|whole| whole.start() == 0 && whole.end() == line.len())
+}
+
+impl ArmourSuppression {
+    /// The returned boundary includes the complete ASCII footer and is
     /// therefore a UTF-8 boundary, even when the footer spans several chunks.
-    fn consume(&mut self, bytes: &[u8]) -> Option<usize> {
-        let Self::Armour {
-            terminator,
-            fallback,
-            matched,
-        } = self
-        else {
-            return None;
-        };
-        for (index, byte) in bytes.iter().enumerate() {
-            while *matched > 0 && *byte != terminator[*matched] {
-                *matched = fallback[*matched - 1];
-            }
-            if *byte == terminator[*matched] {
-                *matched += 1;
-            }
-            if *matched == terminator.len() {
-                return Some(index + 1);
+    fn consume(&mut self, bytes: &[u8]) -> ArmourProgress {
+        for (index, &byte) in bytes.iter().enumerate() {
+            let Some((begin, label)) = self.line.step(byte) else {
+                continue;
+            };
+            let oversized = label.len() > MAX_ARMOUR_LABEL_BYTES;
+            // Label bytes are ASCII by construction.
+            let label = String::from_utf8_lossy(&label);
+            if begin {
+                if oversized {
+                    // Its full label, and so whether it is sensitive and
+                    // which footer closes it, is unknown.
+                    return ArmourProgress::UntilFinish;
+                }
+                if !sensitive_armour_label(&label) {
+                    continue;
+                }
+                let Some(footer) = armoured_footer_label(&label) else {
+                    continue;
+                };
+                if self.open.iter().any(|open| open == footer) {
+                    continue;
+                }
+                if self.open.len() == MAX_SUPPRESSED_OPEN_BLOCKS {
+                    return ArmourProgress::UntilFinish;
+                }
+                self.open.push(footer.to_owned());
+            } else if let Some(position) = self.open.iter().rposition(|open| *open == label) {
+                self.open.remove(position);
+                if self.open.is_empty() {
+                    return ArmourProgress::Closed(index + 1);
+                }
             }
         }
-        None
+        ArmourProgress::Open
+    }
+}
+
+impl StreamingSuppression {
+    /// The boundary just past the footer that ends this episode, if `bytes`
+    /// contains it. An episode that can only end at finish returns None.
+    fn consume(&mut self, bytes: &[u8]) -> Option<usize> {
+        let Self::Armour(armour) = self else {
+            return None;
+        };
+        match armour.consume(bytes) {
+            ArmourProgress::Open => None,
+            ArmourProgress::Closed(end) => Some(end),
+            ArmourProgress::UntilFinish => {
+                *self = Self::UntilFinish;
+                None
+            }
+        }
     }
 }
 
@@ -1732,7 +1900,7 @@ static STREAMING_ARMOURED_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     .expect("streaming armoured header regex")
 });
 
-/// Every footer an [`armoured_terminator`] can name.
+/// Every footer an [`armoured_footer_label`] can name.
 static STREAMING_ARMOURED_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"-----END (?P<label>[A-Z0-9 ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK|PGP PUBLIC KEY BLOCK|PGP MESSAGE|PGP SIGNATURE)-----",
@@ -1741,7 +1909,7 @@ static STREAMING_ARMOURED_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn armoured_footer_label(label: &str) -> Option<&str> {
-    if label.len() > 128 {
+    if label.len() > MAX_ARMOUR_LABEL_BYTES {
         return None;
     }
     Some(if label == "PGP SIGNED MESSAGE" {
@@ -1749,10 +1917,6 @@ fn armoured_footer_label(label: &str) -> Option<&str> {
     } else {
         label
     })
-}
-
-fn armoured_terminator(label: &str) -> Option<String> {
-    armoured_footer_label(label).map(|label| format!("-----END {label}-----"))
 }
 
 /// The last start of each footer label in `text`, from one pass. Searching
@@ -2188,8 +2352,8 @@ impl StreamingRedactor {
                         .captures(self.pending.as_str())
                         .filter(|header| header.get(0).is_some_and(|whole| whole.start() == 0))
                         .and_then(|header| header.name("label"))
-                        .and_then(|label| armoured_terminator(label.as_str()))
-                        .map(StreamingSuppression::armour)
+                        .and_then(|label| armoured_footer_label(label.as_str()))
+                        .map(|_| StreamingSuppression::Armour(ArmourSuppression::default()))
                         .unwrap_or(StreamingSuppression::UntilFinish)
                 } else {
                     StreamingSuppression::UntilFinish
@@ -3916,10 +4080,7 @@ mod tests {
     //
     // Counter is process-wide; tests serialize via a Mutex guard.
 
-    fn streaming_overflow_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use super::streaming_overflow_test_lock;
 
     #[test]
     fn streaming_redactor_pending_overflow_counter_zero_for_normal_traffic() {
@@ -4524,6 +4685,56 @@ mod tests {
         let rendered = String::from_utf8(all).expect("utf8 output");
         assert!(!rendered.contains("sk-1234567890abcdef1234567890abcdef"));
         assert_eq!(rendered, format!("{before}[REDACTED]\nafter!\n"));
+    }
+
+    /// One suppression episode: an open `outer` block passes the 2 KiB cap,
+    /// then `rest` arrives seven bytes at a time, so armour lines are split
+    /// across chunks as well.
+    fn streaming_overflow_episode(outer: &str, rest: &str) -> String {
+        let mut streaming = StreamingRedactor::new()
+            .with_tail_bytes(64)
+            .with_max_pending_bytes(2048);
+        let mut result = streaming.redact_chunk(format!("-----BEGIN {outer}-----\n").as_bytes());
+        let body = format!("{}\n", "A".repeat(3000));
+        result = super::merge_redaction_results(result, streaming.redact_chunk(body.as_bytes()));
+        for chunk in rest.as_bytes().chunks(7) {
+            result = super::merge_redaction_results(result, streaming.redact_chunk(chunk));
+        }
+        result = super::merge_redaction_results(result, streaming.finish());
+        String::from_utf8(result.bytes).expect("utf8 output")
+    }
+
+    #[test]
+    fn streaming_suppression_outlasts_a_key_that_opened_inside_the_block() {
+        // Output from two programs interleaves: a key starts printing while
+        // a PGP message is still open. Ending at the message's footer
+        // emitted the rest of the key in plaintext.
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+        let rendered = streaming_overflow_episode(
+            "PGP MESSAGE",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END PGP MESSAGE-----\n\
+             keytailsecretbody\n-----END RSA PRIVATE KEY-----\nafter!\n",
+        );
+        assert_eq!(super::streaming_redactor_pending_overflow_count(), 1);
+        assert!(!rendered.contains("keytailsecretbody"), "{rendered:?}");
+        assert_eq!(rendered, "[REDACTED]\nafter!\n");
+    }
+
+    #[test]
+    fn streaming_suppression_ends_at_the_footer_a_repeated_label_shares() {
+        // A truncated key followed by a complete one ends at the complete
+        // key's footer; a certificate in between neither ends nor extends
+        // the episode.
+        let _guard = streaming_overflow_test_lock();
+        let rendered = streaming_overflow_episode(
+            "RSA PRIVATE KEY",
+            "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmg\n-----END CERTIFICATE-----\n\
+             -----BEGIN RSA PRIVATE KEY-----\nsecondkeybody\n-----END RSA PRIVATE KEY-----\n\
+             after!\n",
+        );
+        assert!(!rendered.contains("secondkeybody"), "{rendered:?}");
+        assert_eq!(rendered, "[REDACTED]\nafter!\n");
     }
 
     /// br-ft-8nd26: bare JWT in a log line (not preceded by
