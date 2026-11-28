@@ -2045,8 +2045,10 @@ final class TerminalSessionControllerTests: XCTestCase {
         defer { relay.down() }
         let live = try await liveScene(muxCommand: muxCommand, machineIDs: ["alpha"], relayPort: relay.port)
         let scene = live.scene
-        let wifi = TerminalNetworkPath(usable: true, interfaces: ["en0"])
-        let cellular = TerminalNetworkPath(usable: true, interfaces: ["pdp_ip0"])
+        // Both interfaces remain available. Only the system's preferred
+        // interface changes when Wi-Fi and cellular trade places.
+        let wifi = TerminalNetworkPath(usable: true, interfacesInPreferenceOrder: ["en0", "pdp_ip0"])
+        let cellular = TerminalNetworkPath(usable: true, interfacesInPreferenceOrder: ["pdp_ip0", "en0"])
         scene.networkPathChanged(wifi)
         let session = try await connect(scene, "alpha")
         XCTAssertEqual(session.phase, .live)
@@ -2471,7 +2473,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         let live = try await liveScene(muxCommand: command, machineIDs: ["alpha"], autoConnect: true,
                                        relayPort: relay.port)
         let scene = live.scene
-        scene.networkPathChanged(.init(usable: true, interfaces: ["en0"]))
+        scene.networkPathChanged(.init(usable: true, interfacesInPreferenceOrder: ["en0", "pdp_ip0"]))
         let first = try await connect(scene, "alpha")
         XCTAssertEqual(first.phase, .live)
 
@@ -2492,7 +2494,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(again.phase, .live)
 
         // The network changes while it is live, and then it drops again.
-        scene.networkPathChanged(.init(usable: true, interfaces: ["pdp_ip0"]))
+        scene.networkPathChanged(.init(usable: true, interfacesInPreferenceOrder: ["pdp_ip0", "en0"]))
         try await Task.sleep(for: .seconds(1))
         relay.down()
         var retries = Set<UUID>()

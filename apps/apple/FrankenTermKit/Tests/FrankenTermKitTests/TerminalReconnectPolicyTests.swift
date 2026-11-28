@@ -109,6 +109,18 @@ final class TerminalReconnectPolicyTests: XCTestCase {
         XCTAssertTrue(TerminalNetworkPath(usable: true, interfaces: ["pdp_ip0"]).isNewRoute(after: wifi), "Wi-Fi to cellular")
     }
 
+    func testPreferredInterfaceHandoverWithTheSameAvailableInterfaces() {
+        let wifi = TerminalNetworkPath(usable: true, interfacesInPreferenceOrder: ["en0", "pdp_ip0", "utun1"])
+        let cellular = TerminalNetworkPath(usable: true, interfacesInPreferenceOrder: ["pdp_ip0", "en0", "utun1"])
+        XCTAssertTrue(cellular.isNewRoute(after: wifi))
+        XCTAssertTrue(wifi.isNewRoute(after: cellular))
+
+        let reorderedBackups = TerminalNetworkPath(usable: true, interfacesInPreferenceOrder: ["en0", "utun1", "pdp_ip0"])
+        XCTAssertFalse(reorderedBackups.isNewRoute(after: wifi), "backup preference does not replenish retries")
+        let unordered = TerminalNetworkPath(usable: true, interfaces: ["utun1", "pdp_ip0", "en0"])
+        XCTAssertFalse(wifi.isNewRoute(after: unordered), "learning the preference alone does not establish a handover")
+    }
+
     func testMissingOrEarlierLiveTimeCannotReplenishBudget() {
         var policy = TerminalReconnectPolicy()
         XCTAssertTrue(policy.beginRetry())

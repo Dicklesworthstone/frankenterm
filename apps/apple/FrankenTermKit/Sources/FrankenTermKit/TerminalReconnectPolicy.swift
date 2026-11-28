@@ -68,16 +68,27 @@ public struct TerminalReconnectPolicy: Sendable {
 public struct TerminalNetworkPath: Equatable, Sendable {
     public let usable: Bool
     public let interfaces: [String]
+    private var preferredInterface: String?
 
     public init(usable: Bool, interfaces: [String]) {
         self.usable = usable; self.interfaces = Set(interfaces).sorted()
     }
 
-    /// A hint to retry, never proof that a transport survived: usable now,
-    /// and unusable before or through other interfaces. The first path seen
-    /// is only a baseline.
+    /// NWPath supplies all available interfaces in preference order. A change
+    /// of the first choice can strand an SSH connection even when the same
+    /// Wi-Fi and cellular interfaces remain available.
+    public init(usable: Bool, interfacesInPreferenceOrder: [String]) {
+        self.init(usable: usable, interfaces: interfacesInPreferenceOrder)
+        preferredInterface = interfacesInPreferenceOrder.first
+    }
+
+    /// A usable path signals a retry when connectivity returns, the interface
+    /// inventory changes, or a different interface becomes the first choice.
+    /// The initial observation provides a baseline.
     public func isNewRoute(after previous: TerminalNetworkPath?) -> Bool {
         guard usable, let previous else { return false }
-        return !previous.usable || previous.interfaces != interfaces
+        if !previous.usable || previous.interfaces != interfaces { return true }
+        guard let preferredInterface, let previousChoice = previous.preferredInterface else { return false }
+        return previousChoice != preferredInterface
     }
 }

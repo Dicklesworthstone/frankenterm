@@ -201,7 +201,7 @@ final class WorkspaceTerminalScene: TerminalSessionFocus {
             let monitor = NWPathMonitor()
             monitor.pathUpdateHandler = { [weak self] path in
                 let update = TerminalNetworkPath(usable: path.status == .satisfied,
-                                                 interfaces: path.availableInterfaces.map(\.name))
+                                                 interfacesInPreferenceOrder: path.availableInterfaces.map(\.name))
                 MainActor.assumeIsolated { self?.networkPathChanged(update) }
             }
             monitor.start(queue: .main)
