@@ -935,6 +935,7 @@ final class TerminalSessionController {
     @ObservationIgnored private var keyboard: TerminalKeyboardSession?
     @ObservationIgnored private var keyboardRecoveryObservation: (keyboard: TerminalKeyboardSession, token: UUID)?
     @ObservationIgnored private var localInputReset: Task<Void, Never>?
+    @ObservationIgnored private var pasteActivation: Task<Void, Never>?
     @ObservationIgnored private var pointerFocusActivation: Task<Void, Never>?
     @ObservationIgnored private weak var focus: (any TerminalSessionFocus)?
     @ObservationIgnored private var attached = false
@@ -1067,6 +1068,7 @@ final class TerminalSessionController {
         guard overviewBlocking != blocked else { return }
         overviewBlocking = blocked
         if blocked {
+            pasteActivation?.cancel()
             pointerFocusActivation?.cancel()
             localInputReset?.cancel()
             viewAttachment?.cancel()
@@ -1103,42 +1105,55 @@ final class TerminalSessionController {
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil; clipboard?.requestPaste()
     }
-    /// Text from the toolbar's system paste control, which iOS hands over
-    /// without asking for permission. The keyboard need not be up: the
-    /// terminal's input is activated without showing it, then the text is sent.
+    private var canPasteIntoSelection: Bool {
+        !isViewingOnly && !stopped && phase == .live && hasFocusedPresentation
+            && !clipboardIsPresenting && !overviewBlocking && !paneNavigationBusy
+    }
+
+    /// The system paste control may need to activate a hidden keyboard. An
+    /// already-active keyboard owns its paste synchronously, even during redraw.
     func paste(text: String) {
-        guard !text.isEmpty, !isViewingOnly, !stopped, phase == .live, hasFocusedPresentation,
-              !clipboardIsPresenting, !localInputNeedsDecision, !overviewBlocking, !paneNavigationBusy else { return }
+        guard !text.isEmpty, canPasteIntoSelection, pasteActivation == nil,
+              let view = terminal, let source = pump?.source,
+              !view.input.isWaitingForPasteProjection else { return }
         connection?.muxControl?.inputRouting.discardPointers()
         interactionProblem = nil
-        if terminal?.input.canReviewPaste == true { clipboard?.paste(text: text); return }
-        // The text belongs to the pane on screen now. Activating input waits,
-        // and the transport may show another pane meanwhile (a closed pane's
-        // replacement, a new tab); the text never follows it there.
-        let source = pump?.source, view = terminal, destination = displayedMuxDestination
-        Task { [weak self] in
-            await self?.focus?.activateKeyboard(showKeyboard: false, source: source)
-            // Paste needs the caret, which the view places with its next drawn
-            // frame: the first live one, or the redraw after a resize or a new
-            // text size. A paste made just before that waits for it briefly
-            // instead of asking the user to paste again. Switching to View Only
-            // or reaching an input decision meanwhile drops it, as it would
-            // have been refused had it come then.
+        if view.input.canRequestPaste {
+            clipboard?.paste(text: text)
+            return
+        }
+
+        // Activation can suspend. Bound and validate the value before retaining
+        // it for a first frame, using the same policy as the native responder.
+        do {
+            _ = try TerminalPasteReview(text: text, keyboardID: view.input.session.id,
+                                        focus: view.input.session.originalFocus)
+        } catch {
+            interactionProblem = Self.describe(error)
+            return
+        }
+        let destination = displayedMuxDestination
+        pasteActivation = Task { [weak self] in
+            guard let self else { return }
+            defer { self.pasteActivation = nil }
+            @MainActor func stillSelected() -> Bool {
+                !Task.isCancelled && self.canPasteIntoSelection && self.terminal === view
+                    && self.pump?.source == source && self.displayedMuxDestination == destination
+            }
+            guard stillSelected() else { return }
+            await self.focus?.activateKeyboard(showKeyboard: false, source: source)
+            let input = view.input
             for _ in 0..<100 {
-                guard let self, !self.stopped, self.phase == .live, self.pump?.source == source,
-                      !self.isViewingOnly, !self.localInputNeedsDecision,
-                      self.terminal === view, self.displayedMuxDestination == destination,
-                      self.terminal?.input.canReviewPaste != true else { break }
-                try? await Task.sleep(for: .milliseconds(50))
+                guard stillSelected(), view.input === input else { return }
+                if input.canRequestPaste {
+                    self.clipboard?.paste(text: text)
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
             }
-            guard let self, !self.stopped, self.phase == .live, self.pump?.source == source,
-                  !self.isViewingOnly, !self.localInputNeedsDecision else { return }
-            guard self.terminal === view, self.displayedMuxDestination == destination else {
-                self.interactionProblem = "The pane changed before the paste was sent. Paste again."
-                return
+            if stillSelected(), view.input === input {
+                self.interactionProblem = "This terminal is not ready for input yet. Paste again in a moment."
             }
-            if self.terminal?.input.canReviewPaste == true { self.clipboard?.paste(text: text) }
-            else { self.interactionProblem = "This terminal is not ready for input yet. Paste again in a moment." }
         }
     }
     func composeCommand() {
@@ -1686,6 +1701,7 @@ final class TerminalSessionController {
             catch { fail(Self.describe(error)) }
         }
         if !focused {
+            pasteActivation?.cancel()
             pointerFocusActivation?.cancel()
             // A delayed view/focus build must not navigate back to a machine
             // the user has already left. Its owner remains retained to join.
@@ -2477,6 +2493,7 @@ final class TerminalSessionController {
     }
 
     private func sealLocalOwnership() {
+        pasteActivation?.cancel()
         pointerFocusActivation?.cancel()
         presentationVisible = false
         retireKeyboardRecovery()

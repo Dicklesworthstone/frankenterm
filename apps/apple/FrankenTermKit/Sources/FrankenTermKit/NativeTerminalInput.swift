@@ -84,6 +84,8 @@ public final class NativeTerminalInputView: UIView, UITextInput {
     /// Only confirmPaste may use this separate admission while a panel covers
     /// the terminal; a new source/geometry still invalidates the candidate.
     public var canReviewPaste: Bool { !isReadOnly && session.acceptsPaste && hasGeometry && !retiring }
+    /// A deliberate paste already owns this responder until its next live caret.
+    public var isWaitingForPasteProjection: Bool { deferredPaste != nil }
     public var canRequestPaste: Bool {
         !isReadOnly && session.acceptsPaste && !retiring && !ordinaryInputBlocked && onPasteReview != nil
             && (hasGeometry || (geometryRevision > 0 && onPasteAwaitingProjection?() == true))

@@ -1327,6 +1327,35 @@ final class TerminalSessionControllerTests: XCTestCase {
         await assertReleased(session, connections: live.connections)
     }
 
+    func testToolbarPasteDuringRedrawOwnsInputUntilTheCaretReturns() async throws {
+        let live = try await liveScene(), scene = live.scene
+        let session = try await connect(scene, "alpha")
+        let terminal = try shown(session)
+        defer { terminal.removeFromSuperview() }
+        try await type("echo READY-$((40+2))", into: terminal)
+        _ = try await screen(terminal, containing: "READY-42")
+
+        terminal.frame.size.height -= 120
+        terminal.layoutIfNeeded()
+        XCTAssertFalse(terminal.input.canReviewPaste)
+        XCTAssertTrue(terminal.input.canRequestPaste)
+        let tag = "REDRAW-\(UUID().uuidString.prefix(8))"
+        session.paste(text: "echo \(tag)-$((40+2)) > \(live.outPath)")
+        XCTAssertTrue(terminal.input.isWaitingForPasteProjection)
+        // Neither a second tap nor a keystroke can overtake the pending text.
+        session.paste(text: "SECOND")
+        terminal.input.insertText("EXTRA")
+
+        let echoed = try await screen(terminal, containing: tag)
+        XCTAssertTrue(echoed.contains(tag))
+        XCTAssertFalse(echoed.contains("EXTRA"))
+        terminal.input.insertText("\n")
+        let output = try await hostFile(live.outPath, containing: "\(tag)-42")
+        XCTAssertEqual(output.split(separator: "\n").map(String.init), ["\(tag)-42"])
+        await scene.close()
+        await assertReleased(session, connections: live.connections)
+    }
+
     /// The rendered rows once `ready` holds for them (or after ~10 s).
     private func rows(of terminal: NativeTerminalView, until ready: ([String]) -> Bool) async throws -> [String] {
         var rows: [String] = []
