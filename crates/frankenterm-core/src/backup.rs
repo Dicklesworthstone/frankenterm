@@ -1149,6 +1149,7 @@ fn redact_backup_database(db_path: &Path) -> Result<BackupRedactionInfo> {
         })?;
 
     let redactor = crate::redactor::Redactor::new();
+    verify_backup_delivery_payloads(&conn, &redactor)?;
     for table in backup_redaction_tables(&conn)? {
         for column in backup_redaction_columns(&conn, &table)? {
             if backup_redaction_payload_column(&table, &column) {
@@ -1170,6 +1171,91 @@ fn redact_backup_database(db_path: &Path) -> Result<BackupRedactionInfo> {
         catalog_version: backup_redaction_catalog_version(),
         patterns_checked: crate::redactor::secret_pattern_names().count(),
     })
+}
+
+// These envelopes can be replayed after import. The recorder identity hashes
+// its text, and connector dispatch must retain exactly the operation originally
+// admitted. Keep the original bytes or refuse the archive before publication.
+fn verify_backup_delivery_payloads(
+    conn: &Connection,
+    redactor: &crate::redactor::Redactor,
+) -> Result<()> {
+    for (table, column) in [
+        ("recorder_delivery_ledger", "event_json"),
+        ("connector_ingress_delivery", "record_json"),
+        ("connector_outbox", "record_json"),
+    ] {
+        if !backup_sqlite_table_exists(conn, table)? {
+            continue;
+        }
+        let read_error = |_: rusqlite::Error| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Could not inspect delivery records in {table} for backup redaction"
+            )))
+        };
+        let mut stmt = conn
+            .prepare(&format!("SELECT {column} FROM {table}"))
+            .map_err(read_error)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(read_error)?;
+        for row in rows {
+            let raw = row.map_err(read_error)?;
+            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+                Error::Storage(crate::StorageError::Database(format!(
+                    "Invalid JSON in {table}.{column} prevents backup redaction"
+                )))
+            })?;
+            if delivery_contains_secret(&raw, &value, redactor) {
+                return Err(Error::Storage(crate::StorageError::Database(format!(
+                    "Backup refused: {table}.{column} contains sensitive delivery data. \
+                     Rewriting a delivery could change the operation or its replay identity."
+                ))));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delivery_contains_secret(
+    raw: &str,
+    value: &serde_json::Value,
+    redactor: &crate::redactor::Redactor,
+) -> bool {
+    // Ignore the catalog's existing replacement marker when matching assignments.
+    // This lets an already sanitized {"password":"[REDACTED]"} pass unchanged.
+    let matches = |text: &str| {
+        redactor.contains_secrets(text)
+            && (!text.contains(redactor.marker())
+                || redactor.contains_secrets(&text.replace(redactor.marker(), "")))
+    };
+    // Check the original representation as well as decoded keys and values.
+    // JSON escaping and terminal formatting can split a recognizable token.
+    if matches(raw) || matches(&value.to_string()) {
+        return true;
+    }
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(s) => {
+                if matches(&crate::output::normalize_terminal_text_for_redaction(s)) {
+                    return true;
+                }
+            }
+            serde_json::Value::Array(values) => pending.extend(values),
+            serde_json::Value::Object(fields) => {
+                if fields
+                    .keys()
+                    .any(|k| matches(&crate::output::normalize_terminal_text_for_redaction(k)))
+                {
+                    return true;
+                }
+                pending.extend(fields.values());
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn backup_redaction_tables(conn: &Connection) -> Result<Vec<String>> {
@@ -2463,6 +2549,61 @@ mod tests {
         assert!(result.manifest.redaction_applied);
         assert_ne!(result.manifest.redaction_catalog_version, "");
         assert!(result.manifest.redaction_patterns_checked > 0);
+    }
+
+    #[test]
+    fn backup_preserves_safe_delivery_envelopes_and_refuses_sensitive_ones() {
+        for (table, column) in [
+            ("recorder_delivery_ledger", "event_json"),
+            ("connector_ingress_delivery", "record_json"),
+            ("connector_outbox", "record_json"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let db = tmp.path().join("source.db");
+            let source = create_test_db(&db);
+            source
+                .execute_batch(&format!("CREATE TABLE {table} ({column} TEXT NOT NULL)"))
+                .unwrap();
+            let clean = r#"{ "payload": {"password":"[REDACTED]"}, "sequence": 9 }"#;
+            source
+                .execute(&format!("INSERT INTO {table} VALUES (?1)"), [clean])
+                .unwrap();
+            let opts = ExportOptions {
+                output: Some(tmp.path().join("safe")),
+                include_sql_dump: true,
+                verify: true,
+            };
+            let archive = export_backup(&db, tmp.path(), &opts).unwrap();
+            let copy =
+                Connection::open(Path::new(&archive.output_path).join("database.db")).unwrap();
+            let saved: String = copy
+                .query_row(&format!("SELECT {column} FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(saved, clean);
+
+            // The serialized JSON and the unnormalized string each split the
+            // catalog prefix. The decoded, terminal-normalized text exposes it.
+            let obscured = BACKUP_REDACTION_TEST_SECRET.replacen("sk-ant", "sk-\x1b[0mant", 1);
+            let json = serde_json::json!({"payload": [{"text": obscured}]}).to_string();
+            source
+                .execute(&format!("UPDATE {table} SET {column} = ?1"), [&json])
+                .unwrap();
+            let refused = tmp.path().join("refused");
+            let opts = ExportOptions {
+                output: Some(refused.clone()),
+                ..opts
+            };
+            let err = export_backup(&db, tmp.path(), &opts)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(table));
+            assert!(!err.contains(BACKUP_REDACTION_TEST_SECRET));
+            assert!(!refused.exists());
+            let live: String = source
+                .query_row(&format!("SELECT {column} FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(live, json);
+        }
     }
 
     #[test]
