@@ -101,6 +101,36 @@ final class OpticalTests: XCTestCase {
         }
     }
 
+    func testLateLiveReceiverRecoversWithShortSingletonVisits() throws {
+        let envelope = try makeEnvelope(size: 32750)
+        var sender = try OpticalSender(envelope: envelope, using: crypto)
+        let first = try OpticalFrame(text: sender.frame(page: 0, sequence: 1, using: crypto))
+        var late = OpticalReceiver(selecting: first)
+        for _ in 0..<sender.identity.sourcePartCount { _ = try sender.next(using: crypto) }
+
+        let schedule = try OpticalPageSchedule(pageCount: 2)
+        var singletonVisits = 0
+        for _ in 0..<schedule.cycleLength {
+            let frame = try OpticalFrame(text: sender.next(using: crypto))
+            if frame.pageIndex == 1 { singletonVisits += 1 }
+            try late.receive(frame, using: crypto)
+        }
+        // The old schedule spent 18 of 37 emissions on the same 74 bytes.
+        // Both bursts and both padding visits still expose the singleton.
+        XCTAssertEqual(schedule.cycleLength, 37)
+        XCTAssertEqual(singletonVisits, 4)
+        XCTAssertEqual(late.verifiedBytes, 74)
+        for _ in 0..<2000 {
+            let frame = try OpticalFrame(text: sender.next(using: crypto))
+            try late.receive(frame, using: crypto)
+            if late.isComplete { break }
+        }
+        XCTAssertEqual(try late.envelope(using: crypto), envelope)
+        for _ in 0..<8 {
+            XCTAssertEqual(try OpticalFrame(text: sender.next(repairPage: 1, using: crypto)).pageIndex, 1)
+        }
+    }
+
     func testTargetedShortPageDoesNotConsumeOtherPagesFirstPass() throws {
         let envelope = try makeEnvelope(size: 32750)
         var sender = try OpticalSender(envelope: envelope, using: crypto)

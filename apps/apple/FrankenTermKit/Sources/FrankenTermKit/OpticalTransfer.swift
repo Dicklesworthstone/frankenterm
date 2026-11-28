@@ -406,6 +406,19 @@ struct OpticalPageSchedule: Sendable {
         }
         return (position - 16 * pageCount) % pageCount
     }
+
+    /// A singleton tail has no mixed repair equations. After the source tour,
+    /// retain the first symbol of both its bursts and each cadence-padding
+    /// visit. Spend the other burst slots on multipart pages. The mapping
+    /// still repeats at the same prime period and every page remains visible.
+    func repairPage(at emission: Int, singlePartTail: Bool) -> Int {
+        let scheduled = page(at: emission)
+        let tail = pageCount - 1
+        let position = emission % cycleLength
+        guard singlePartTail, tail > 0, scheduled == tail,
+              position < 16 * pageCount, !position.isMultiple(of: 8) else { return scheduled }
+        return position % tail
+    }
 }
 
 public struct OpticalSender: Sendable {
@@ -465,7 +478,7 @@ public struct OpticalSender: Sendable {
             page = candidate
             position = (position + 1) % pageSchedule.cycleLength
         } else {
-            page = pageSchedule.page(at: emitted)
+            page = pageSchedule.repairPage(at: emitted, singlePartTail: pages.last?.fragments.count == 1)
         }
         guard pages.indices.contains(page), emitted < Int.max else { throw FTError.limit("qr.sequence") }
         let sourceCount = pages[page].fragments.count
