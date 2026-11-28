@@ -651,6 +651,7 @@ export function mountPaneOutput({
   const previous = element("pane-output-previous");
   const findStatus = element("pane-output-find-status");
   const canvas = element("terminal");
+  let formPaneUuid = null;
   let matchAt = -1;
   let matchQuery = "";
   let matchText = "";
@@ -726,7 +727,8 @@ export function mountPaneOutput({
   function presentSelection(message, followLive) {
     onOpen();
     transcript.setSelectionRange(0, 0);
-    paneInput.value = output.snapshot().paneId;
+    const state = output.snapshot();
+    fillPaneForm(state.paneId, state.paneUuid);
     hint.textContent = message;
     follow.checked = followLive;
     search.value = "";
@@ -746,6 +748,11 @@ export function mountPaneOutput({
       return;
     }
     presentSelection("Output stays on this pane until you explicitly open another.", true);
+  }
+
+  function fillPaneForm(paneId, paneUuid = null) {
+    paneInput.value = paneId;
+    formPaneUuid = paneUuid;
   }
 
   function openCapture(hit) {
@@ -820,9 +827,10 @@ export function mountPaneOutput({
 
   openButton.disabled = paneInput.disabled = paneSubmit.disabled = false;
   openButton.addEventListener("click", openSelected);
+  paneInput.addEventListener("input", () => { formPaneUuid = null; });
   paneForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    show(paneInput.value.trim());
+    show(paneInput.value.trim(), { paneUuid: formPaneUuid });
   });
   pause.addEventListener("click", () => {
     if (output.snapshot().paused) {
@@ -880,7 +888,7 @@ export function mountPaneOutput({
   });
   render();
   return {
-    render, openSelected, openCapture, close,
+    render, openSelected, openCapture, fillPaneForm, close,
     suspend() { output.suspend(); render(); },
     restore() { output.restore(); render(); },
   };

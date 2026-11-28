@@ -616,7 +616,7 @@ function notificationReady(source) {
   source.message("ready", { schema: "ft.stream.v1", stream: "events", kind: "ready",
     data: { channel: "all", pane_id: null, durable_detections: true, cursor } }, cursor);
 }
-function emitNotificationDetection(source, id = "1", paneUuid = "pane-original", { detectedAt = 1000, severity = "warning", eventType = "usage", sentAt = null } = {}) {
+function emitNotificationDetection(source, id = "1", paneUuid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", { detectedAt = 1000, severity = "warning", eventType = "usage", sentAt = null } = {}) {
   source.emit("event", {
     data: '{"schema":"ft.stream.v1","stream":"events","kind":"event",'
       + (sentAt === null ? "" : '"ts_ms":' + JSON.stringify(sentAt) + ",")
@@ -677,7 +677,7 @@ test("notification click verifies session and exact pane identity without openin
   let verified = 0;
   const f = fixture(t, { notifications: true,
     verifyNotificationSession: async () => { verified += 1; return true; },
-    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}',
   }); await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
   f.get("fleet-notifications-toggle").emit("click"); await flush();
@@ -689,6 +689,24 @@ test("notification click verifies session and exact pane identity without openin
   assert.equal(f.viewers[0].view, "detections");
   assert.equal(f.sources.length, sources, "inspection requires the manual Open output action");
   assert.match(f.get("fleet-notifications-status").textContent, /Choose Open output.*may no longer be live/);
+  f.get("pane-output-form").requestSubmit();
+  const output = f.sources.at(-1);
+  readyPinned(output);
+  pinnedDelta(output, "1", "from a replacement", "1", "b".repeat(32));
+  f.frame();
+  assert.equal(output.closed, true);
+  assert.equal(f.get("pane-output-text").value, "");
+  assert.match(f.get("pane-output-warnings").textContent, /capture/);
+
+  // Typing a numeric ID is a separate operator action.
+  f.get("pane-output-id").value = "8";
+  f.get("pane-output-id").emit("input");
+  f.get("pane-output-form").requestSubmit();
+  const manual = f.sources.at(-1);
+  readyPinned(manual);
+  pinnedDelta(manual, "2", "manual selection");
+  f.frame();
+  assert.equal(f.get("pane-output-text").value, "manual selection");
 });
 
 test("notification clicks cannot resolve a reused pane or outlive session retirement", async (t) => {
@@ -717,7 +735,7 @@ test("notification clicks cannot resolve a reused pane or outlive session retire
 
 test("a notification click leaves pinned focus so its result can be seen", async (t) => {
   const f = fixture(t, { notifications: true,
-    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}',
   }); await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
   f.get("fleet-notifications-toggle").emit("click"); await flush();
@@ -734,7 +752,7 @@ test("notification click refuses a detection the server could not attribute to a
   // ft-ddxotx: durable frames carry pane_uuid null when the detection's
   // segment has no capture provenance (older events, or no segment at all).
   const f = fixture(t, { notifications: true, verifyNotificationSession: async () => true,
-    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}',
   }); await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
   f.get("fleet-notifications-toggle").emit("click"); await flush();
@@ -748,7 +766,7 @@ test("notification click refuses a detection the server could not attribute to a
 test("hidden notification click waits for foreground session admission and pagehide closes it", async (t) => {
   let verified = 0;
   const f = fixture(t, { notifications: true, verifyNotificationSession: async () => { verified += 1; return true; },
-    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}',
   }); await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
   f.get("fleet-notifications-toggle").emit("click"); await flush();
@@ -767,7 +785,7 @@ test("hidden notification click waits for foreground session admission and pageh
 
 test("attention triages admitted warnings and input requests without notification permission", async (t) => {
   let time = 10_000;
-  const f = fixture(t, { now: () => time, paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}' });
+  const f = fixture(t, { now: () => time, paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}' });
   await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed);
   const select = f.get("attention-items"), summary = f.get("attention-summary");
@@ -892,7 +910,7 @@ test("attention evicts a selected item without acting on its replacement", async
 test("a notification state change leaves an attention verification running", async (t) => {
   const verification = deferred();
   const f = fixture(t, { notifications: true, verifyNotificationSession: () => verification.promise,
-    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"pane-original"}]}}',
+    paneSnapshot: '{"ok":true,"data":{"panes":[{"pane_id":18446744073709551615,"pane_uuid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}',
   }); await f.app.ready; await flush();
   const feed = f.fleetSources()[0]; notificationReady(feed); await flush();
   emitNotificationDetection(feed); f.frame();
@@ -924,10 +942,10 @@ function readyPinned(source, after = "0") {
   });
 }
 
-function pinnedDelta(source, id, content, sequence = id) {
+function pinnedDelta(source, id, content, sequence = id, paneUuid = null) {
   const pane = source.url.searchParams.get("pane_id");
   source.emit("delta", {
-    data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":${pane},"segment_id":${id},"seq":${sequence},"content":${JSON.stringify(content)}}}`,
+    data: `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":{"pane_id":${pane},"segment_id":${id},"seq":${sequence},"pane_uuid":${JSON.stringify(paneUuid)},"content":${JSON.stringify(content)}}}`,
     lastEventId: deltaCursor(id, pane),
   });
 }

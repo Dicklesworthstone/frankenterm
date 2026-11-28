@@ -1071,7 +1071,7 @@ export function mountFleetApp({
     inspectPane: (paneId) => {
       // Route the exact captured identity through the same validated native
       // form as a manual Open action, never through the mutable fleet row.
-      element("pane-output-id").value = paneId;
+      inspector.fillPaneForm(paneId);
       element("pane-output-form").requestSubmit();
     },
   });
@@ -1142,8 +1142,8 @@ export function mountFleetApp({
       advance();
       const body = await readSnapshot("panes", apiRoot, fetchImpl, controller.signal, 8 * 1024 * 1024);
       if (!current()) return;
-      if (notificationPaneExists(target, body)) {
-        element("pane-output-id").value = target.paneId;
+      if (/^[0-9a-f]{32}$/.test(target.paneUuid) && notificationPaneExists(target, body)) {
+        inspector.fillPaneForm(target.paneId, target.paneUuid);
         report("The detected pane's stored identity was verified. Choose Open output to inspect retained capture; the pane may no longer be live.");
         element("pane-output-id").focus();
       } else {
