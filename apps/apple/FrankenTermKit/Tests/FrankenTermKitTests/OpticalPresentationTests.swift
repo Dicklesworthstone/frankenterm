@@ -256,6 +256,28 @@ final class OpticalPresentationTests: XCTestCase {
         }
     }
 
+    func testMissedSinglePartTailRecoversDuringTheSameRecording() throws {
+        let envelope = try recordingEnvelope(bytes: 32750)
+        let sender = try OpticalSender(envelope: envelope, using: crypto)
+        let sourceCount = sender.identity.sourcePartCount
+        XCTAssertEqual(try sender.sourcePartCount(page: 1), 1)
+        // The smallest writer budget is the lossless APNG limit. MP4 uses
+        // the same plan at the larger rate-dependent limits.
+        let plan = try OpticalAnimationPlan(sender: sender, maximumFrames: 256)
+        let tailPositions = plan.addresses.indices.filter { plan.addresses[$0].page == 1 }
+        let missed = try XCTUnwrap(tailPositions.first)
+        XCTAssertLessThan(missed, sourceCount)
+        XCTAssertEqual(tailPositions.dropFirst().first, sourceCount)
+        var receiver = OpticalReceiver(selecting: try OpticalFrame(text:
+            sender.frame(page: 0, sequence: 1, using: crypto)))
+        for (offset, address) in plan.addresses.prefix(sourceCount + 1).enumerated() {
+            if offset == missed { continue }
+            let text = try sender.frame(page: address.page, sequence: address.sequence, using: crypto)
+            try receiver.receive(OpticalFrame(text: text), using: crypto)
+        }
+        XCTAssertEqual(try receiver.envelope(using: crypto), envelope)
+    }
+
     func testCadencePaddingPreservesCompleteExportsAtCapacityAndSinglePartPages() throws {
         for bytes in [100, 40000, 131000, 634800] {
             let sender = try OpticalSender(envelope: recordingEnvelope(bytes: bytes), using: crypto)
@@ -267,17 +289,25 @@ final class OpticalPresentationTests: XCTestCase {
             let full = try OpticalAnimationPlan(sender: sender)
             let exact = try OpticalAnimationPlan(sender: sender, maximumFrames: required)
             XCTAssertEqual(exact.addresses.count, required)
-            XCTAssertEqual(exact.addresses, Array(full.addresses.prefix(required)))
+            // Optional singleton replays may be interleaved with the mandatory
+            // repair tour. Removing them recovers the original ordered prefix.
+            func withoutReplays(_ plan: OpticalAnimationPlan) -> [OpticalAnimationPlan.Address] {
+                var seenSingletons = Set<Int>()
+                return plan.addresses.filter { address in
+                    counts[address.page] != 1 || seenSingletons.insert(address.page).inserted
+                }
+            }
+            XCTAssertEqual(exact.addresses, Array(withoutReplays(full).prefix(required)))
             XCTAssertLessThanOrEqual(full.addresses.count, 4096)
             for capacity in required..<full.addresses.count {
                 let bounded = try OpticalAnimationPlan(sender: sender, maximumFrames: capacity)
                 XCTAssertLessThanOrEqual(bounded.addresses.count, capacity)
-                XCTAssertEqual(Array(bounded.addresses.prefix(required)), exact.addresses)
+                XCTAssertEqual(Array(withoutReplays(bounded).prefix(required)), exact.addresses)
             }
             for page in counts.indices {
                 let numbers = full.addresses.filter { $0.page == page }.map(\.sequence)
                 XCTAssertGreaterThanOrEqual(numbers.count, counts[page])
-                if counts[page] == 1 { XCTAssertEqual(numbers, [1], "single-part UR pages are never duplicated for padding") }
+                if counts[page] == 1 { XCTAssertTrue(numbers.allSatisfy { $0 == 1 }, "single-part UR has only one payload") }
                 else { XCTAssertEqual(numbers, Array(UInt32(1)...UInt32(numbers.count))) }
             }
             XCTAssertThrowsError(try OpticalAnimationPlan(sender: sender, maximumFrames: required - 1))

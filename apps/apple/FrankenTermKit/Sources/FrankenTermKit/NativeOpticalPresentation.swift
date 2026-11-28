@@ -104,7 +104,7 @@ public struct OpticalExportSession: Sendable, CustomDebugStringConvertible {
 }
 
 /// Finite recordings contain every source symbol plus the planned repair set.
-/// When the existing frame budget permits, fresh repair symbols extend the
+/// When the existing frame budget permits, extra optical symbols extend the
 /// schedule to a prime loop length, breaking periodic capture aliasing across
 /// loops. When the next prime exceeds the budget, a composite loop can still
 /// break aliasing for common capture strides. Replay cannot overcome arbitrary
@@ -139,8 +139,26 @@ public struct OpticalAnimationPlan: Sendable {
         let total = counts.reduce(0, +)
         guard total <= maximumFrames else { throw FTError.limit("animation.use_live_transfer") }
         let repairPages = counts.indices.filter { counts[$0] > 1 }
-        let paddedTotal = repairPages.isEmpty ? total
-            : Self.recordingLength(required: total, maximum: maximumFrames)
+        let sourceTotal = sources.reduce(0, +)
+        let repairCount = total - sourceTotal
+        // A short final page uses a single-part UR with no fountain repairs.
+        // Give a camera that missed it another opportunity during the repair
+        // pass, roughly once per 64 repair symbols. A complete source pass
+        // and the required fresh repairs always take precedence.
+        let singleton = sources.firstIndex(of: 1)
+        let requestedReplays = singleton == nil ? 0 : (repairCount + 63) / 64
+        let preferred = min(maximumFrames, total + requestedReplays)
+        let paddedTotal: Int
+        if repairPages.isEmpty {
+            paddedTotal = total
+        } else if requestedReplays > 0,
+                  let prime = OpticalCadence.primeLength(atLeast: preferred, atMost: maximumFrames) {
+            paddedTotal = prime
+        } else {
+            // Preserve the best available capture cadence at a tight frame cap.
+            paddedTotal = Self.recordingLength(required: total, maximum: maximumFrames)
+        }
+        let replays = min(requestedReplays, paddedTotal - total)
         var positions = Array(repeating: 0, count: counts.count), result: [Address] = []
         result.reserveCapacity(paddedTotal)
         // A clean capture from the start can finish as soon as every source
@@ -157,7 +175,15 @@ public struct OpticalAnimationPlan: Sendable {
                 }
             }
         }
-        for extra in 0..<(paddedTotal - total) {
+        if let singleton, replays > 0 {
+            // Insert backwards so offsets refer to the original repair tour.
+            // The first replay immediately follows the lossless source prefix.
+            for replay in (0..<replays).reversed() {
+                let offset = sourceTotal + replay * repairCount / replays
+                result.insert(.init(page: singleton, sequence: 1), at: offset)
+            }
+        }
+        for extra in 0..<(paddedTotal - total - replays) {
             let page = repairPages[extra % repairPages.count]
             positions[page] += 1
             result.append(.init(page: page, sequence: UInt32(positions[page])))
