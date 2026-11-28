@@ -92,7 +92,7 @@ function fixture(t, options = {}) {
   class Viewer {
     constructor(cols, rows) {
       this.size = { cols, rows }; this.resizes = []; this.inputs = []; this.pending = [];
-      this.selected = "7"; this.view = "panes"; this.revision = 0; this.dirty = true;
+      this.selectedUuid = "a".repeat(32); this.selected = "7"; this.view = "panes"; this.revision = 0; this.dirty = true;
       this.drains = 0; this.bodies = []; this.refreshRequested = false; viewers.push(this);
     }
     init() { if (options.modelInitFailure) throw new Error("private WASM failure"); }
@@ -114,6 +114,7 @@ function fixture(t, options = {}) {
     }
     screenText() { return this.overrideText ?? `${this.view} frame ${this.revision}\nPane ${this.selected} <not-markup>`; }
     selectedPaneId() { return this.selected; }
+    selectedPaneUuid() { return this.selectedUuid; }
     pushEncodedInput(json) { const input = JSON.parse(json); this.inputs.push(input); this.pending.push(input); this.dirty = true; return true; }
     takeFlatPatches() { this.drains += 1; return { cells: new Uint32Array([0, 1, 65, 0]), spans: new Uint32Array([0, 1]) }; }
     takeRefreshRequest() { const requested = this.refreshRequested; this.refreshRequested = false; return requested; }
@@ -273,6 +274,10 @@ test("renderer import failure leaves one live fleet model with native exact-pane
   assert.equal(source.url.searchParams.get("pane_id"), "18446744073709551615");
   f.get("pane-output-close").emit("click");
   assert.equal(f.doc.activeElement, f.get("screen-text"));
+  f.viewers[0].selectedUuid = undefined;
+  f.key("Enter");
+  assert.equal(f.sources.at(-1), source);
+  assert.match(f.get("pane-output-hint").textContent, /verified capture identity/);
   f.get("fleet-events").emit("click");
   assert.match(f.get("screen-text").textContent, /detections frame/);
   assert.equal(f.fleetSources().length, 1);

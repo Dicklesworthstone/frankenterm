@@ -1057,7 +1057,7 @@ export function mountFleetApp({
       // Apply queued navigation before sampling its identity. Once opened,
       // later row changes never retarget this pane's output subscription.
       advance();
-      return viewer?.selectedPaneId();
+      return { paneId: viewer?.selectedPaneId(), paneUuid: viewer?.selectedPaneUuid() };
     },
   });
   // A directly mounted, initially hidden page must not open manual output

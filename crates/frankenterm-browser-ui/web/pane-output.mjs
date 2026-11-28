@@ -78,8 +78,8 @@ export function createPaneOutput({
   let captureTimer = null;
   let capture = null;
   let followFromSegment = null;
-  // The capture UUID of the admitted historical segment, kept while
-  // following it: a reused pane ID continues seq but gets a new UUID.
+  // A fleet selection and a followed historical segment both name a capture
+  // lifetime. Manual numeric-ID selection intentionally spans lifetimes.
   let captureProvenance = null;
   let capturePending = false;
   let generation = 0;
@@ -320,8 +320,18 @@ export function createPaneOutput({
           // UUID shows that later output came from another terminal. A
           // followed capture always has a known UUID (followCapture refuses
           // an unknown one), so a different or missing UUID is another capture.
-          if (followFromSegment !== null && paneUuid !== captureProvenance) {
-            halt("another capture reused this pane ID after the selected segment");
+          if (captureProvenance !== null && paneUuid !== captureProvenance) {
+            // A bounded recent window or full replay can begin before the
+            // selected registration. Advance past those rows without retaining
+            // their text. Once a matching row arrives, the next lifetime ends
+            // the view, including across reconnects.
+            if ((history || recent) && receivedSequence === null) {
+              received = segment;
+              receivedCursor = incoming;
+              dirty = true;
+              return;
+            }
+            halt("another capture reused this pane ID or the output has no matching capture identity");
             return;
           }
           // Global segment ids interleave panes; only this pane's stored seq
@@ -437,17 +447,17 @@ export function createPaneOutput({
       paneId: pane, status, paused, suspended, history, recent, cursor: received,
       resumeCursor: receivedCursor?.token ?? null, terminal,
       text, discardedChars, gapNotifications: gaps, unanchored, error, capture, followFromSegment,
-      captureIdentified: captureProvenance !== null,
+      captureIdentified: captureProvenance !== null, paneUuid: captureProvenance,
       sequence: receivedSequence, sequenceDiscontinuities, sequenceRestarted, retainedPrefixMissing,
     };
   }
 
-  function startSelection(selected, retainedHistory, target = null, recentHistory = false) {
+  function startSelection(selected, retainedHistory, target = null, recentHistory = false, paneUuid = null) {
     retire();
     pane = selected;
     capture = target;
     followFromSegment = null;
-    captureProvenance = null;
+    captureProvenance = paneUuid;
     capturePending = target !== null;
     history = Boolean(retainedHistory);
     recent = recentHistory;
@@ -475,11 +485,14 @@ export function createPaneOutput({
   return {
     // A new explicit selection is a new identity boundary, even for the same
     // numeric pane. Navigation elsewhere must not silently call this method.
-    select(paneId, { retainedHistory = false, recentHistory = false } = {}) {
+    select(paneId, { retainedHistory = false, recentHistory = false, paneUuid = null } = {}) {
       const selected = unsigned(paneId, U64_MAX);
       if (selected === null) throw new Error("invalid pane id");
       if (retainedHistory && recentHistory) throw new Error("choose one history window");
-      startSelection(selected, retainedHistory, null, recentHistory);
+      if (paneUuid !== null && (typeof paneUuid !== "string" || !/^[0-9a-f]{32}$/.test(paneUuid))) {
+        throw new Error("invalid pane capture identity");
+      }
+      startSelection(selected, retainedHistory, null, recentHistory, paneUuid);
     },
     // Search results identify a capture, not a current pane attachment. Keep
     // every identity as an exact decimal string; validate before retiring the
@@ -747,13 +760,14 @@ export function mountPaneOutput({
   }
 
   function openSelected() {
-    let paneId;
-    try { paneId = getSelectedPane(); } catch (_) { /* finite hint below */ }
-    if (typeof paneId !== "string") {
-      hint.textContent = "Select a pane or detection row first, or enter a pane ID.";
+    let target;
+    try { target = getSelectedPane(); } catch (_) { /* finite hint below */ }
+    if (typeof target?.paneId !== "string" || typeof target.paneUuid !== "string"
+        || !/^[0-9a-f]{32}$/.test(target.paneUuid)) {
+      hint.textContent = "Select a pane with a verified capture identity, search captured history, or enter a numeric pane ID explicitly.";
       return;
     }
-    show(paneId);
+    show(target.paneId, { paneUuid: target.paneUuid });
   }
 
   function close() {
@@ -825,17 +839,17 @@ export function mountPaneOutput({
       follow.checked = true;
       hint.textContent = "Following captured output after the selected segment.";
       render();
-    } else if (state.paneId !== null) show(state.paneId, { retainedHistory: true });
+    } else if (state.paneId !== null) show(state.paneId, { retainedHistory: true, paneUuid: state.paneUuid });
   });
   recentButton.addEventListener("click", () => {
     const state = output.snapshot();
-    if (state.paneId !== null && !recentButton.disabled) show(state.paneId, { recentHistory: true });
+    if (state.paneId !== null && !recentButton.disabled) show(state.paneId, { recentHistory: true, paneUuid: state.paneUuid });
   });
   closeButton.addEventListener("click", close);
   pinButton.addEventListener("click", () => {
     const state = output.snapshot();
     if (state.paneId === null || state.suspended || (state.capture !== null && state.status !== "historical")) return;
-    onPin({ paneId: state.paneId, capture: state.capture });
+    onPin({ paneId: state.paneId, paneUuid: state.paneUuid, capture: state.capture });
   });
   follow.addEventListener("change", () => {
     if (follow.checked) {
@@ -962,14 +976,14 @@ export function mountPinnedOutputs({
     restoreControlFocus();
   });
 
-  function pin({ paneId, capture = null } = {}) {
+  function pin({ paneId, paneUuid = null, capture = null } = {}) {
     if (suspended || disposed) return false;
     const pane = unsigned(paneId, U64_MAX);
     if (pane === null || (capture !== null && capture?.paneId !== pane)) {
       text(status, "Choose a valid captured pane before pinning.");
       return false;
     }
-    const key = capture === null ? `pane:${pane}` : `capture:${capture.captureCursor}`;
+    const key = capture === null ? `pane:${pane}:${paneUuid ?? "all"}` : `capture:${capture.captureCursor}`;
     const existing = cards.get(key);
     if (existing) {
       focused = null;
@@ -998,7 +1012,7 @@ export function mountPinnedOutputs({
     }
     const output = createOutput();
     try {
-      if (capture === null) output.select(pane);
+      if (capture === null) output.select(pane, { paneUuid });
       else output.selectCapture(capture);
     } catch (_) {
       output.close();
@@ -1094,7 +1108,7 @@ export function mountPinnedOutputs({
     function loadHistory(options) {
       if (!current() || suspended || capture !== null) return;
       transcript.setSelectionRange(0, 0);
-      output.select(pane, options);
+      output.select(pane, { ...options, paneUuid });
       follow.checked = true;
       render();
     }

@@ -22,6 +22,7 @@ function fixture(options = {}) {
     constructor(url) {
       this.url = new URL(url);
       this.readyState = 1;
+      this.defaultPaneUuid = options.defaultPaneUuid;
       this.closed = false;
       this.handlers = new Map();
       sources.push(this);
@@ -92,7 +93,7 @@ function paneUuidField(overrides) {
 function delta(source, id, content, pane = "7", overrides = {}) {
   beginDelivery(source);
   const payload = `{"schema":"ft.stream.v1","stream":"deltas","kind":"delta","data":` +
-    `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id}${paneUuidField(overrides)},` +
+    `{"pane_id":${pane},"segment_id":${id},"seq":${overrides.sequence ?? id}${paneUuidField({ paneUuid: source.defaultPaneUuid, ...overrides })},` +
     `"content":${JSON.stringify(content)}}}`;
   source.lastDelta = id;
   source.lastEpoch = overrides.epoch ?? OUTPUT_EPOCH;
@@ -850,7 +851,7 @@ const CONTROL_IDS = [
 ];
 
 function panelFixture(options = {}) {
-  const f = fixture(options);
+  const f = fixture({ defaultPaneUuid: OUTPUT_EPOCH, ...options });
   let focused = null;
   let selected = "7";
   class Element {
@@ -875,7 +876,7 @@ function panelFixture(options = {}) {
   }
   const nodes = Object.fromEntries(CONTROL_IDS.map((id) => [id, new Element(id)]));
   const document = { getElementById: (id) => nodes[id] };
-  const panel = mountPaneOutput({ document, output: f.output, getSelectedPane: () => selected });
+  const panel = mountPaneOutput({ document, output: f.output, getSelectedPane: () => ({ paneId: selected, paneUuid: OUTPUT_EPOCH }) });
   return { ...f, panel, nodes, focused: () => focused, selectRow: (id) => { selected = id; } };
 }
 
@@ -1806,5 +1807,26 @@ test("a delta whose capture UUID is not one is rejected, not treated as unknown"
     assert.equal(source.closed, true, JSON.stringify(paneUuid));
     assert.equal(f.output.snapshot().text, "kept\n");
     assert.equal(f.output.snapshot().cursor, "9");
+  }
+});
+
+test("bound output refuses another pane lifetime before display and retains the boundary on replay", () => {
+  for (const wrongUuid of [undefined, "f".repeat(32)]) {
+    const f = fixture();
+    f.output.select("7", { paneUuid: OUTPUT_EPOCH });
+    delta(f.latest(), "1", "wrong", "7", { paneUuid: wrongUuid });
+    assert.equal(f.output.snapshot().terminal, true);
+    assert.equal(f.output.snapshot().text, "");
+
+    f.output.select("7", { paneUuid: OUTPUT_EPOCH, retainedHistory: true });
+    delta(f.latest(), "1", "previous", "7", { paneUuid: wrongUuid });
+    f.output.pause();
+    f.output.resume();
+    assertResume(f.latest(), "1");
+    delta(f.latest(), "2", "selected", "7", { paneUuid: OUTPUT_EPOCH });
+    delta(f.latest(), "3", "replacement", "7", { paneUuid: wrongUuid });
+    assert.equal(f.output.snapshot().terminal, true);
+    assert.equal(f.output.snapshot().cursor, "2");
+    assert.equal(f.output.snapshot().text, "selected");
   }
 });
