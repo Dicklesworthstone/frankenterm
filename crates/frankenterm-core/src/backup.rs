@@ -79,8 +79,7 @@ fn read_backup_manifest(manifest_path: &Path) -> Option<BackupManifest> {
                 phase = "read_fail",
                 error = %err,
                 manifest_path = %manifest_path.display(),
-                "failed to read backup manifest.json; backup row will report \
-                 created_at=None making it indistinguishable from an unfinalised backup"
+                "failed to read backup manifest.json; excluded from rotation"
             );
             return None;
         }
@@ -96,8 +95,7 @@ fn read_backup_manifest(manifest_path: &Path) -> Option<BackupManifest> {
                 error = %err,
                 manifest_path = %manifest_path.display(),
                 manifest_len = raw.len(),
-                "backup manifest.json failed to deserialize as BackupManifest; \
-                 backup row will report created_at=None"
+                "backup manifest.json failed to deserialize and was excluded from rotation"
             );
             None
         }
@@ -471,9 +469,9 @@ pub struct ScheduledBackupStatus {
 /// - `manifest.json` — metadata, stats, and checksums
 /// - `checksums.sha256` — per-file SHA-256 checksums
 ///
-/// Note: files are written directly to the output directory (not atomic).
-/// A crash mid-export may leave a partial backup. The `verify` option
-/// detects this by checking the database checksum after writing.
+/// Build and redact the copy in a private sibling directory. Publish the
+/// completed archive with a same-filesystem rename. An explicit destination
+/// must be absent or empty; an existing backup is never overwritten.
 pub fn export_backup(
     db_path: &Path,
     workspace_root: &Path,
@@ -487,19 +485,33 @@ pub fn export_backup(
         ))));
     }
 
-    // Determine output path
-    let output_dir = match &opts.output {
-        Some(p) => p.clone(),
-        None => default_backup_path(workspace_root),
-    };
-
-    // Create output directory
-    fs::create_dir_all(&output_dir).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to create backup directory {}: {e}",
-            output_dir.display()
-        )))
-    })?;
+    let destination = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| default_backup_path(workspace_root));
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut stage = tempfile::Builder::new();
+    stage.prefix(".ft-backup-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        stage.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let scratch = stage.tempdir_in(parent)?;
+    // Keep the manifest one level below the temporary sibling so scheduled
+    // retention cannot mistake a verified but unpublished copy for an archive.
+    let output_dir = scratch.path().join("archive");
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(&output_dir)?;
 
     // Step 1: Copy database using rusqlite backup API (safe, consistent snapshot)
     let dest_db_path = output_dir.join("database.db");
@@ -572,11 +584,27 @@ pub fn export_backup(
         verify_backup(&output_dir, &manifest)?;
     }
 
-    // Compute total size
     let total_size = dir_size(&output_dir);
+    // Windows does not allow rename over an existing empty directory. Only
+    // remove a directory that is still empty; a complete archive must win.
+    #[cfg(windows)]
+    if let Ok(meta) = fs::symlink_metadata(&destination) {
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(Error::Storage(crate::StorageError::Database(
+                "Backup destination is not a plain directory".to_string(),
+            )));
+        }
+        fs::remove_dir(&destination)?;
+    }
+    fs::rename(&output_dir, &destination).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to publish completed backup at {} (destination must be absent or empty): {e}",
+            destination.display()
+        )))
+    })?;
 
     Ok(ExportResult {
-        output_path: output_dir.display().to_string(),
+        output_path: destination.display().to_string(),
         manifest,
         total_size_bytes: total_size,
     })
@@ -1998,10 +2026,10 @@ fn default_backup_path(workspace_root: &Path) -> PathBuf {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let ts = format_timestamp_compact(now.as_secs());
-    workspace_root
-        .join(".ft")
-        .join("backups")
-        .join(format!("ft_backup_{ts}"))
+    unique_backup_path(
+        &workspace_root.join(".ft").join("backups"),
+        &format!("ft_backup_{ts}"),
+    )
 }
 
 /// Format epoch seconds as compact timestamp: YYYYMMDD_HHMMSS
@@ -2436,6 +2464,49 @@ mod tests {
         assert!(result.manifest.redaction_applied);
         assert_ne!(result.manifest.redaction_catalog_version, "");
         assert!(result.manifest.redaction_patterns_checked > 0);
+    }
+
+    #[test]
+    fn failed_redaction_never_publishes_the_raw_database() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("source.db");
+        let source = create_test_db_with_backup_secret(&db);
+        source
+            .execute_batch(
+                "CREATE TRIGGER refuse_export_update BEFORE UPDATE OF title ON panes
+                 BEGIN SELECT RAISE(ABORT, 'test redaction failure'); END;",
+            )
+            .unwrap();
+        drop(source);
+        let dest = tmp.path().join("export");
+        let options = ExportOptions {
+            output: Some(dest.clone()),
+            include_sql_dump: true,
+            verify: true,
+        };
+        assert!(export_backup(&db, tmp.path(), &options).is_err());
+        assert!(!dest.exists());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn export_accepts_an_empty_destination_and_preserves_a_completed_archive() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("source.db");
+        drop(create_test_db(&db));
+        let dest = tmp.path().join("export");
+        fs::create_dir(&dest).unwrap();
+        let options = ExportOptions {
+            output: Some(dest.clone()),
+            ..Default::default()
+        };
+        let original = export_backup(&db, tmp.path(), &options).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM panes", [])
+            .unwrap();
+        assert!(export_backup(&db, tmp.path(), &options).is_err());
+        verify_backup(&dest, &original.manifest).unwrap();
     }
 
     #[test]
