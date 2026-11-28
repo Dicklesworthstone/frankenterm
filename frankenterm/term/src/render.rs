@@ -310,9 +310,14 @@ impl PackedMirrorRow {
                     }
                     hyperlink += 1;
                 }
-                while let Some(attachment) = self.images.get(image).filter(|item| item.col == col) {
-                    attrs.attach_image(Box::new(attachment.image.clone()));
-                    image += 1;
+                if cell.has_image() {
+                    let placements: Vec<_> = self.images[image..]
+                        .iter()
+                        .take_while(|item| item.col == col)
+                        .map(|attachment| Box::new(attachment.image.clone()))
+                        .collect();
+                    image += placements.len();
+                    attrs.set_images(placements);
                 }
                 let mut utf8 = [0_u8; 4];
                 let text = if let Some((_, range)) =
@@ -782,14 +787,8 @@ impl MirrorRow {
                 };
             let image_start = self.images.len();
             while let Some(attachment) = packed.images.get(image).filter(|item| item.col == col) {
-                // Match Page::cell_attributes -> attach_image exactly, even
-                // for equal z-indices whose insertion order may be reversed.
-                let at = self.images[image_start..]
-                    .binary_search_by(|known| {
-                        known.image.z_index().cmp(&attachment.image.z_index())
-                    })
-                    .unwrap_or_else(|at| at);
-                self.images.insert(image_start + at, attachment.clone());
+                // Capture already preserved the cell's complete stacking order.
+                self.images.push(attachment.clone());
                 image += 1;
             }
             let has_images = self.images.len() != image_start;
@@ -2380,10 +2379,20 @@ mod tests {
         let mut page = Page::new(8, 1, 1);
         let native = page.grow(1).unwrap();
         assert!(store_line(&mut page, native, &line));
-        let expected = MirrorRow::from_line(0, &line_view(&page, native, 4), 7);
+        let expected = MirrorRow::from_line(0, &line, 7);
+        assert_eq!(
+            MirrorRow::from_line(0, &line_view(&page, native, 4), 7),
+            expected,
+            "a scrollback or checkpoint view must preserve the source placements"
+        );
         let mut packed = PackedMirrorRow::default();
         packed.capture(&page, native, 4);
         let allocation = packed.cells.as_ptr();
+        assert_eq!(
+            MirrorRow::from_line(0, &packed.to_line(false), 7),
+            expected,
+            "the owned shaping fallback must use the same source order"
+        );
         drop(page);
         drop(line);
         drop(data);

@@ -328,9 +328,8 @@ impl Page {
         self.images.get(self.offset(self.header(row).slot(), x))
     }
 
-    /// The cell's legacy attributes. Images are re-attached in stored
-    /// order through `attach_image`, which can reorder images of equal
-    /// z-index; [`Self::cell_images`] has the exact order.
+    /// The cell's legacy attributes, including the original stacking order
+    /// of image placements with the same z-index.
     pub fn cell_attributes(&self, row: u32, x: usize) -> CellAttributes {
         let cell = self.cell(row, x);
         let mut attrs = style_attributes(cell.style(), &self.styles);
@@ -340,8 +339,8 @@ impl Page {
         if let Some(link) = self.hyperlink(row, x) {
             attrs.set_hyperlink(Some(Arc::clone(link)));
         }
-        for image in self.cell_images(row, x).unwrap_or(&[]) {
-            attrs.attach_image(image.clone());
+        if let Some(images) = self.cell_images(row, x) {
+            attrs.set_images(images.to_vec());
         }
         attrs
     }

@@ -141,15 +141,11 @@ impl PageRows {
                     }
                 }
                 if let Some(images) = page.cell_images(row, col) {
-                    // attach_image maintains sorted order by insertion. Include
-                    // boxed placements, the growing pointer vector and the
-                    // worst-case shifts for an equal-z-index stack.
-                    let count = images.len();
-                    let slots = count.checked_mul(2)?.max(4);
-                    let bytes = count.checked_mul(size_of::<ImageCell>())?
-                        .checked_add(slots.checked_mul(size_of::<Box<ImageCell>>())?)?;
+                    // Decoding clones the already-ordered placement slice once.
+                    let per_image = size_of::<ImageCell>() + size_of::<Box<ImageCell>>();
+                    let bytes = images.len().checked_mul(per_image)?;
                     *bytes_left = bytes_left.checked_sub(bytes)?;
-                    *work_left = work_left.checked_sub(count.checked_mul(count)?)?;
+                    *work_left = work_left.checked_sub(images.len())?;
                 }
             }
         }
