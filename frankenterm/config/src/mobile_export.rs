@@ -2652,6 +2652,63 @@ fn glob(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// Prefer the previously published route ID whenever it identifies just one
+/// route in the entire inventory. Group selection cannot change this mapping.
+struct MobileRouteIds {
+    ambiguous: BTreeSet<String>,
+}
+
+impl MobileRouteIds {
+    fn new(inventory: &MachineInventory) -> Self {
+        // Colons separate source components unambiguously: the inventory
+        // grammar excludes them, while the phone's identifier grammar admits them.
+        let mut names = BTreeSet::new();
+        for machine in &inventory.machines {
+            for route in &machine.routes {
+                match route {
+                    MachineRoute::FrankenTermMux { id, via, .. } if via.len() > 1 => {
+                        for alternative in via {
+                            names.insert(Self::qualified(&machine.id, id, Some(alternative)));
+                        }
+                    }
+                    _ => {
+                        names.insert(Self::qualified(&machine.id, route.id(), None));
+                    }
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let ambiguous = names
+            .into_iter()
+            .map(|name| name.replace(':', "."))
+            .filter(|legacy| !seen.insert(legacy.clone()))
+            .collect();
+        Self { ambiguous }
+    }
+
+    fn qualified(machine: &str, route: &str, via: Option<&str>) -> String {
+        let mut id = format!("r:{machine}:{route}");
+        if let Some(via) = via {
+            id.push(':');
+            id.push_str(via);
+        }
+        id
+    }
+
+    fn get(&self, machine: &str, route: &str, via: Option<&str>) -> String {
+        let qualified = Self::qualified(machine, route, via);
+        let legacy = qualified.replace(':', ".");
+        if legacy.len() > 128 {
+            // Three valid 48-byte parts can exceed the phone's ID limit.
+            format!("r-hash.{}", short_digest(&qualified))
+        } else if self.ambiguous.contains(&legacy) {
+            qualified
+        } else {
+            legacy
+        }
+    }
+}
+
 fn short_digest(text: &str) -> String {
     Sha256::digest(text.as_bytes())[..12]
         .iter()
@@ -2920,6 +2977,7 @@ struct ResolvedRoute {
 /// endpoints of a refused graph still contribute their known denials, but a
 /// malformed or unavailable hop cannot produce a direct or partial fallback.
 fn resolve_route(
+    route_names: &MobileRouteIds,
     machine: &Machine,
     route: &str,
     target: &RouteTarget,
@@ -2983,7 +3041,7 @@ fn resolve_route(
     }
     if let Some(endpoint) = resolve_endpoint(machine, route, target, sources, false, None, notes) {
         records.push(ResolvedRoute {
-            id: format!("r.{}.{}", machine.id, route),
+            id: route_names.get(&machine.id, route, None),
             endpoint,
             keys: HostKeys::default(),
             jump_routes: jumps,
@@ -3684,6 +3742,7 @@ impl EndpointRecords {
 /// positions are not identity; exact repeated diagnostics share a stable key.
 fn export_findings(
     inventory: &MachineInventory,
+    route_names: &MobileRouteIds,
     document: &Value,
     notes: &[ExportNote],
 ) -> anyhow::Result<Vec<ExportFinding>> {
@@ -3726,15 +3785,11 @@ fn export_findings(
                 .and_then(|route| machine.routes.iter().find(|value| value.id() == route))
         });
         let route_ids: Vec<String> = match source_route {
-            Some(MachineRoute::Ssh { id, .. }) => vec![format!("r.{}.{}", note.machine, id)],
+            Some(MachineRoute::Ssh { id, .. }) => vec![route_names.get(&note.machine, id, None)],
             Some(MachineRoute::FrankenTermMux { id, via, .. }) => via
                 .iter()
                 .map(|name| {
-                    if via.len() == 1 {
-                        format!("r.{}.{}", note.machine, id)
-                    } else {
-                        format!("r.{}.{}.{}", note.machine, id, name)
-                    }
+                    route_names.get(&note.machine, id, (via.len() > 1).then_some(name.as_str()))
                 })
                 .collect(),
             None => Vec::new(),
@@ -3811,6 +3866,7 @@ pub fn export(
     sources: &SshSources,
     context: &InventoryContext,
 ) -> anyhow::Result<MobileExport> {
+    let route_names = MobileRouteIds::new(inventory);
     let groups: Vec<_> = match group {
         Some(id) => vec![inventory
             .groups
@@ -3881,8 +3937,14 @@ pub fn export(
                 continue;
             };
             let mut route_notes = Vec::new();
-            let (mut family, exportable) =
-                resolve_route(machine, id, target, &endpoint_sources, &mut route_notes);
+            let (mut family, exportable) = resolve_route(
+                &route_names,
+                machine,
+                id,
+                target,
+                &endpoint_sources,
+                &mut route_notes,
+            );
             for resolved in &mut family {
                 let name = if resolved.destination {
                     id.clone()
@@ -4032,15 +4094,21 @@ pub fn export(
                 continue;
             }
             let before = mux_ids.len();
+            let mut emitted_via = BTreeSet::new();
             for via_name in via {
+                // Repeating an SSH alternative cannot create a second route
+                // with the same ID in the phone manifest.
+                if !emitted_via.insert(via_name) {
+                    continue;
+                }
                 let Some(ssh) = exported_ssh.get(via_name) else {
                     continue;
                 };
-                let id = if via.len() == 1 {
-                    format!("r.{}.{}", machine.id, mux_name)
-                } else {
-                    format!("r.{}.{}.{}", machine.id, mux_name, via_name)
-                };
+                let id = route_names.get(
+                    &machine.id,
+                    mux_name,
+                    (via.len() > 1).then_some(via_name.as_str()),
+                );
                 let mut record = ssh.clone();
                 record["id"] = json!(id);
                 record["mode"] = json!("frankenterm_mux");
@@ -4291,7 +4359,7 @@ pub fn export(
         short_digest(&format!("{}:{}:{}", revision, nanos, std::process::id()))
     ));
     document.sort_all_objects();
-    let portability = export_findings(inventory, &document, &notes)?;
+    let portability = export_findings(inventory, &route_names, &document, &notes)?;
     Ok(MobileExport {
         document,
         machines: machine_count,
@@ -4859,6 +4927,116 @@ ssh = "jumped"
 "##;
 
     #[test]
+    fn dotted_route_ids_preserve_endpoints_trust_and_findings_across_group_exports() {
+        let source = r#"
+version = 1
+[groups.first]
+machines = ["a.b"]
+[groups.second]
+machines = ["a"]
+[[machines."a.b".routes]]
+id = "c"
+host = "css.example"
+user = "one"
+[[machines.a.routes]]
+id = "b.c"
+host = "100.91.120.17"
+user = "two"
+"#;
+        let inventory = MachineInventory::parse(source, &context()).unwrap();
+        let ssh = sources(None);
+        let route_names = MobileRouteIds::new(&inventory);
+        let mut unambiguous = inventory.clone();
+        unambiguous.machines.retain(|machine| machine.id == "a.b");
+        assert_eq!(
+            MobileRouteIds::new(&unambiguous).get("a.b", "c", None),
+            "r.a.b.c"
+        );
+        let fleet = export(&inventory, None, &ssh, &context()).unwrap();
+        let workspace = &fleet.document["workspace"];
+        let routes = workspace["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_ne!(routes[0]["id"], routes[1]["id"]);
+        assert_ne!(routes[0]["host_trust_ref"], routes[1]["host_trust_ref"]);
+        for (machine, route, group, user) in
+            [("a.b", "c", "first", "one"), ("a", "b.c", "second", "two")]
+        {
+            let expected = route_names.get(machine, route, None);
+            let single = export(&inventory, Some(group), &ssh, &context()).unwrap();
+            let record = &single.document["workspace"]["routes"][0];
+            assert_eq!(record["id"], expected);
+            assert_eq!(record["user"], user);
+            assert!(routes.contains(record));
+            assert_eq!(
+                single.document["workspace"]["machines"][0]["preferred_route_ref"],
+                expected
+            );
+            let findings = export_findings(
+                &inventory,
+                &route_names,
+                &fleet.document,
+                &[ExportNote {
+                    machine: machine.into(),
+                    route: Some(route.into()),
+                    message: "test finding".into(),
+                }],
+            )
+            .unwrap();
+            assert!(findings.iter().any(|finding| {
+                finding.entity_id == expected && finding.reason.ends_with("test finding")
+            }));
+        }
+    }
+
+    #[test]
+    fn long_mux_route_ids_fit_and_keep_each_ssh_alternative_distinct() {
+        let machine = "m".repeat(48);
+        let mux = "x".repeat(48);
+        let first = "a".repeat(48);
+        let second = "b".repeat(48);
+        let source = format!(
+            r#"
+version = 1
+[[machines.{machine}.routes]]
+id = "{first}"
+host = "css.example"
+user = "one"
+[[machines.{machine}.routes]]
+id = "{second}"
+host = "100.91.120.17"
+user = "two"
+[[machines.{machine}.routes]]
+id = "{mux}"
+kind = "frankenterm_mux"
+via = ["{first}", "{second}", "{first}"]
+socket = "/s"
+"#
+        );
+        let inventory = MachineInventory::parse(&source, &context()).unwrap();
+        let output = export(&inventory, None, &sources(None), &context()).unwrap();
+        let workspace = &output.document["workspace"];
+        let routes = workspace["routes"].as_array().unwrap();
+        let ids: BTreeSet<_> = routes
+            .iter()
+            .map(|route| route["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.iter().all(|id| id.len() <= 128));
+        let refs = workspace["machines"][0]["route_refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 4);
+        let route_names = MobileRouteIds::new(&inventory);
+        for (index, via) in [first.as_str(), second.as_str()]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let id = route_names.get(&machine, &mux, Some(via));
+            assert_eq!(refs[index], id);
+            assert!(ids.contains(id.as_str()));
+        }
+    }
+
+    #[test]
     fn loaded_inventory_is_immutable_and_distinct_sources_are_not_last_call_wins() {
         let inventory = MachineInventory::parse(INVENTORY, &context()).unwrap();
         let mut loaded = LoadedMachineInventories::default();
@@ -5138,28 +5316,30 @@ ssh = "jumped"
             route: Some("tailscale".into()),
             message,
         };
+        let names = MobileRouteIds::new(&inventory);
         let notes = vec![note("one omission".into()), note("second omission".into())];
-        let first = export_findings(&inventory, &exported.document, &notes).unwrap();
+        let first = export_findings(&inventory, &names, &exported.document, &notes).unwrap();
         let repeated = vec![notes[1].clone(), notes[0].clone(), notes[1].clone()];
         assert_eq!(
             first,
-            export_findings(&inventory, &exported.document, &repeated).unwrap()
+            export_findings(&inventory, &names, &exported.document, &repeated).unwrap()
         );
         let exact: Vec<_> = (0..MAX_EXPORT_FINDINGS - 1)
             .map(|index| note(format!("omission {}", index)))
             .collect();
         assert_eq!(
-            export_findings(&inventory, &exported.document, &exact)
+            export_findings(&inventory, &names, &exported.document, &exact)
                 .unwrap()
                 .len(),
             MAX_EXPORT_FINDINGS
         );
         let mut too_many = exact;
         too_many.push(note("one beyond the limit".into()));
-        assert!(export_findings(&inventory, &exported.document, &too_many).is_err());
+        assert!(export_findings(&inventory, &names, &exported.document, &too_many).is_err());
         for invalid in ["control\ntext".into(), "x".repeat(MAX_EXPORT_FINDING_TEXT)] {
             assert!(export_findings(
                 &inventory,
+                &names,
                 &exported.document,
                 &[notes[0].clone(), note(invalid)]
             )
@@ -5168,7 +5348,7 @@ ssh = "jumped"
         let aggregate: Vec<_> = (0..80)
             .map(|index| note(format!("{}{}", index, "x".repeat(4000))))
             .collect();
-        assert!(export_findings(&inventory, &exported.document, &aggregate).is_err());
+        assert!(export_findings(&inventory, &names, &exported.document, &aggregate).is_err());
     }
 
     /// A distinct well-formed Ed25519 public key line for `seed`.
