@@ -1499,7 +1499,21 @@ fn redact_backup_text_column(
             rusqlite::types::ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
             _ => continue,
         };
-        let redacted = redactor.redact(&text);
+        let mut redacted = redactor.redact(&text);
+        if matches!(
+            (table_name, column_name),
+            ("output_segments", "content") | ("panes", "title") | ("events", "matched_text")
+        ) && redacted
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            // A color change in the middle of a credential can hide it from a
+            // raw scan. Keep formatting byte-for-byte when the visible text is clean.
+            let visible = crate::output::normalize_terminal_text_for_redaction(&redacted);
+            if visible != redacted && redactor.contains_secrets(&visible) {
+                redacted = redactor.redact(&visible);
+            }
+        }
         if redacted != text {
             updates.push((
                 rowid,
@@ -2549,6 +2563,54 @@ mod tests {
         assert!(result.manifest.redaction_applied);
         assert_ne!(result.manifest.redaction_catalog_version, "");
         assert!(result.manifest.redaction_patterns_checked > 0);
+    }
+
+    #[test]
+    fn export_redacts_secrets_split_by_terminal_formatting_and_preserves_clean_color() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("source.db");
+        let source = create_test_db_with_backup_secret(&db);
+        let split = BACKUP_REDACTION_TEST_SECRET.replacen("sk-ant", "sk-\x1b[31mant", 1);
+        let clean = "\x1b[32mready\x1b[0m";
+        for (id, content) in [(2, split.as_str()), (3, clean)] {
+            source
+                .execute(
+                    "INSERT INTO output_segments (id, pane_id, seq, content, content_len, content_hash, captured_at)
+                     VALUES (?1, 1, ?1, ?2, length(CAST(?2 AS BLOB)), 'original', 0)",
+                    rusqlite::params![id, content],
+                )
+                .unwrap();
+        }
+        let options = ExportOptions {
+            include_sql_dump: true,
+            verify: true,
+            ..Default::default()
+        };
+        let result = export_backup(&db, tmp.path(), &options).unwrap();
+        let dir = Path::new(&result.output_path);
+        let archive = Connection::open(dir.join("database.db")).unwrap();
+        let read = |id: i64| -> (String, i64, Option<String>) {
+            archive
+                .query_row(
+                    "SELECT content, content_len, content_hash FROM output_segments WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        let marker = crate::redactor::Redactor::new().marker().to_owned();
+        assert_eq!(read(2), (marker.clone(), marker.len() as i64, None));
+        assert_eq!(
+            read(3),
+            (
+                clean.to_owned(),
+                clean.len() as i64,
+                Some("original".into())
+            )
+        );
+        assert!(!fs::read_to_string(dir.join("database.sql"))
+            .unwrap()
+            .contains(&split));
     }
 
     #[test]
