@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::SystemTime;
@@ -603,60 +603,42 @@ pub fn compress_backup_dir(result: &ExportResult) -> Result<ExportResult> {
         ))));
     }
 
-    // Compress with zstd (level 3 is a good balance of speed and ratio)
-    let input = fs::read(&db_path).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to read database for compression: {e}"
-        )))
-    })?;
-    let compressed = zstd::encode_all(input.as_slice(), 3).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "zstd compression failed: {e}"
-        )))
-    })?;
-    fs::write(&compressed_path, &compressed).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to write compressed file: {e}"
-        )))
-    })?;
+    // All large I/O is streamed. Keep the original until both metadata
+    // files point to the complete compressed payload.
+    let input = fs::File::open(&db_path)?;
+    let mut staged_db = tempfile::NamedTempFile::new_in(backup_dir)?;
+    zstd::stream::copy_encode(input, staged_db.as_file_mut(), 3)?;
+    staged_db.as_file().sync_all()?;
+    let checksum = sha256_file(staged_db.path())?;
 
-    // Remove the uncompressed original
-    fs::remove_file(&db_path).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to remove uncompressed database after compression: {e}"
-        )))
-    })?;
-
-    // Update checksum file to cover the compressed artifact
-    let checksum = sha256_file(&compressed_path)?;
-    let checksum_path = backup_dir.join("checksums.sha256");
-    let mut checksum_content = String::new();
-    checksum_content.push_str(&format!("{checksum}  database.db.zst\n"));
-    // Preserve manifest checksum if present
-    let manifest_path = backup_dir.join("manifest.json");
-    if manifest_path.exists() {
-        let manifest_checksum = sha256_file(&manifest_path)?;
-        checksum_content.push_str(&format!("{manifest_checksum}  manifest.json\n"));
-    }
-    fs::write(&checksum_path, &checksum_content).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to update checksums after compression: {e}"
-        )))
-    })?;
-
-    // Update manifest
     let mut manifest = result.manifest.clone();
     manifest.compressed = true;
-    let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
+    let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
-            "Failed to serialize updated manifest: {e}"
+            "Failed to serialize compressed backup manifest: {e}"
         )))
     })?;
-    fs::write(&manifest_path, &manifest_json).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to write updated manifest: {e}"
-        )))
-    })?;
+    let checksums = format!(
+        "{checksum}  database.db.zst\n{}  manifest.json\n",
+        sha256_bytes(&manifest_json)
+    );
+    let mut staged_manifest = tempfile::NamedTempFile::new_in(backup_dir)?;
+    staged_manifest.write_all(&manifest_json)?;
+    staged_manifest.as_file().sync_all()?;
+    let mut staged_checksums = tempfile::NamedTempFile::new_in(backup_dir)?;
+    staged_checksums.write_all(checksums.as_bytes())?;
+    staged_checksums.as_file().sync_all()?;
+
+    staged_db.persist(&compressed_path).map_err(|e| e.error)?;
+    staged_checksums
+        .persist(backup_dir.join("checksums.sha256"))
+        .map_err(|e| e.error)?;
+    staged_manifest
+        .persist(backup_dir.join("manifest.json"))
+        .map_err(|e| e.error)?;
+    #[cfg(unix)]
+    fs::File::open(backup_dir)?.sync_all()?;
+    fs::remove_file(&db_path)?;
 
     let total_size = dir_size(backup_dir);
 
@@ -845,30 +827,12 @@ pub fn prune_backups(
     Ok(PruneSummary { removed, kept })
 }
 
-/// A decompressed-database temp file that removes itself on drop.
-///
-/// Compressed backups (`manifest.compressed`) store the database as
-/// `database.db.zst`; verification and restore both need a real uncompressed
-/// SQLite file to open. We materialise one in the OS temp dir and clean it up
-/// via this RAII guard so the decompressed copy never lingers.
-struct DecompressedDb {
-    path: PathBuf,
-}
-
-impl Drop for DecompressedDb {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-static DECOMPRESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Resolve a readable, uncompressed SQLite file for a backup directory.
 ///
 /// For an uncompressed backup this returns `backup_dir/database.db` directly
 /// (no guard). For a compressed backup (`manifest.compressed == true`) it
 /// decompresses `backup_dir/database.db.zst` into a uniquely-named temp file and
-/// returns a [`DecompressedDb`] guard that deletes it on drop — callers MUST
+/// returns a private temporary-file guard that deletes it on drop — callers MUST
 /// keep the guard alive for as long as they use the returned path.
 ///
 /// Without this, `verify_backup`/`import_backup` only ever looked for
@@ -878,7 +842,7 @@ static DECOMPRESS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn resolve_backup_database(
     backup_dir: &Path,
     manifest: &BackupManifest,
-) -> Result<(PathBuf, Option<DecompressedDb>)> {
+) -> Result<(PathBuf, Option<tempfile::TempPath>)> {
     if manifest.compressed {
         let compressed_path = backup_dir.join("database.db.zst");
         if !compressed_path.exists() {
@@ -886,38 +850,23 @@ fn resolve_backup_database(
                 "Backup database.db.zst not found (manifest marks backup compressed)".to_string(),
             )));
         }
-        let compressed = fs::read(&compressed_path).map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to read compressed backup database.db.zst: {e}"
-            )))
-        })?;
-        let decompressed = zstd::decode_all(compressed.as_slice()).map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to decompress backup database.db.zst: {e}"
-            )))
-        })?;
-        // Integrity guard: the manifest records the *uncompressed* size
-        // (`compress_backup_dir` preserves it), so a mismatch means the
-        // compressed artifact is truncated or corrupt.
-        if decompressed.len() as u64 != manifest.db_size_bytes {
+        let input = fs::File::open(&compressed_path)?;
+        let mut decoder = zstd::stream::read::Decoder::new(input)?;
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        let written = std::io::copy(
+            &mut (&mut decoder).take(manifest.db_size_bytes),
+            tmp.as_file_mut(),
+        )?;
+        // Read at most one byte beyond the declared size to distinguish an
+        // exact match from an oversized frame, without writing the excess.
+        if written != manifest.db_size_bytes || decoder.read(&mut [0; 1])? != 0 {
             return Err(Error::Storage(crate::StorageError::Database(format!(
-                "Backup verification failed: decompressed size {} != manifest db_size_bytes {}",
-                decompressed.len(),
+                "Backup verification failed: decompressed size differs from manifest db_size_bytes {}",
                 manifest.db_size_bytes
             ))));
         }
-        let unique = DECOMPRESS_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!(
-            "ft-backup-restore-{}-{unique}.db",
-            std::process::id()
-        ));
-        fs::write(&tmp, &decompressed).map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to materialise decompressed backup at {}: {e}",
-                tmp.display()
-            )))
-        })?;
-        Ok((tmp.clone(), Some(DecompressedDb { path: tmp })))
+        let guard = tmp.into_temp_path();
+        Ok((guard.to_path_buf(), Some(guard)))
     } else {
         let db_path = backup_dir.join("database.db");
         if !db_path.exists() {
@@ -1650,12 +1599,17 @@ fn gather_stats(db_path: &Path) -> Result<BackupStats> {
 
 /// Compute SHA-256 of a file.
 fn sha256_file(path: &Path) -> Result<String> {
-    let data = fs::read(path).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to read file for checksum: {e}"
-        )))
-    })?;
-    Ok(sha256_bytes(&data))
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Compute SHA-256 of bytes.
@@ -3845,6 +3799,16 @@ mod tests {
 
         let compressed = compress_backup_dir(&result).unwrap();
         assert!(compressed.manifest.compressed);
+        let checksums = fs::read_to_string(output_dir.join("checksums.sha256")).unwrap();
+        for name in ["database.db.zst", "manifest.json"] {
+            let digest = sha256_file(&output_dir.join(name)).unwrap();
+            assert!(checksums.lines().any(|line| line == format!("{digest}  {name}")));
+        }
+        for delta in [-1_i64, 1] {
+            let mut wrong_size = compressed.manifest.clone();
+            wrong_size.db_size_bytes = wrong_size.db_size_bytes.checked_add_signed(delta).unwrap();
+            assert!(verify_backup(&output_dir, &wrong_size).is_err());
+        }
         assert!(output_dir.join("database.db.zst").exists());
         assert!(!output_dir.join("database.db").exists());
 
