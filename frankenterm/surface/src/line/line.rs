@@ -514,19 +514,23 @@ impl Line {
         bytes_left: &mut usize,
         work_left: &mut usize,
     ) -> Option<Vec<Self>> {
+        Self::try_clone_rows_for_snapshot(first.iter().chain(second), bytes_left, work_left)
+    }
+
+    /// Admit every row before taking a snapshot of a repeatable row range.
+    /// The second traversal must yield the same immutable rows as the first.
+    pub fn try_clone_rows_for_snapshot<'a>(
+        rows: impl Iterator<Item = &'a Self> + Clone,
+        bytes_left: &mut usize,
+        work_left: &mut usize,
+    ) -> Option<Vec<Self>> {
         let work_before = *work_left;
-        for line in first.iter().chain(second) {
+        for line in rows.clone() {
             line.charge_snapshot(bytes_left, work_left)?;
         }
         let clone_work = work_before.checked_sub(*work_left)?;
         *work_left = work_left.checked_sub(clone_work)?;
-        Some(
-            first
-                .iter()
-                .chain(second)
-                .map(Self::clone_precharged_snapshot)
-                .collect(),
-        )
+        Some(rows.map(Self::clone_precharged_snapshot).collect())
     }
 
     fn charge_snapshot(&self, bytes_left: &mut usize, work_left: &mut usize) -> Option<()> {

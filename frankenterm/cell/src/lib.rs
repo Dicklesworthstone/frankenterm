@@ -1680,6 +1680,13 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Upper bound for the fixed storage of one cell decoded from a packed
+    /// row, including optional boxed attributes and the long-text header.
+    /// Callers budget variable grapheme bytes and image placements separately.
+    pub const MAX_DECODED_BASE_BYTES: usize = core::mem::size_of::<Self>()
+        + core::mem::size_of::<FatAttributes>()
+        + core::mem::size_of::<TeenyStringHeap>();
+
     /// Create a new cell holding the specified character and with the
     /// specified cell attributes.
     /// All control and movement characters are rewritten as a space.

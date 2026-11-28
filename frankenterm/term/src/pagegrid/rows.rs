@@ -111,6 +111,51 @@ impl PageRows {
             .get_or_init(|| Box::new(self.build_view(index)))
     }
 
+    /// Charge the cell decoding a line snapshot must do before allocating any
+    /// new views. A cached or edited row already owns its legacy storage.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn charge_snapshot_views(
+        &self,
+        range: Range<usize>,
+        bytes_left: &mut usize,
+        work_left: &mut usize,
+    ) -> Option<()> {
+        use super::cell::{Glyph, PackedCell};
+        use frankenterm_cell::{image::ImageCell, Cell};
+
+        for index in range {
+            if self.views[index].line.get().is_some() {
+                continue;
+            }
+            let (page, row) = self.page_row_ref(index)?;
+            let words = page.row_words(row);
+            *work_left = work_left.checked_sub(words.len().max(1))?;
+            let cell_bytes = words.len().checked_mul(Cell::MAX_DECODED_BASE_BYTES)?;
+            *bytes_left = bytes_left.checked_sub(size_of::<Line>().checked_add(cell_bytes)?)?;
+            for (col, &word) in words.iter().enumerate() {
+                let cell = PackedCell::from_bits(word);
+                if cell.has_grapheme() {
+                    if let Glyph::Cluster(text) = page.glyph(row, col) {
+                        *bytes_left = bytes_left.checked_sub(text.len())?;
+                        *work_left = work_left.checked_sub(text.len())?;
+                    }
+                }
+                if let Some(images) = page.cell_images(row, col) {
+                    // attach_image maintains sorted order by insertion. Include
+                    // boxed placements, the growing pointer vector and the
+                    // worst-case shifts for an equal-z-index stack.
+                    let count = images.len();
+                    let slots = count.checked_mul(2)?.max(4);
+                    let bytes = count.checked_mul(size_of::<ImageCell>())?
+                        .checked_add(slots.checked_mul(size_of::<Box<ImageCell>>())?)?;
+                    *bytes_left = bytes_left.checked_sub(bytes)?;
+                    *work_left = work_left.checked_sub(count.checked_mul(count)?)?;
+                }
+            }
+        }
+        Some(())
+    }
+
     /// Row `index` for a legacy edit: its view becomes the row's content.
     pub fn line_mut(&mut self, index: usize) -> &mut Line {
         self.ensure_view(index);

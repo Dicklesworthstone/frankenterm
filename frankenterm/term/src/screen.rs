@@ -4479,7 +4479,8 @@ impl Screen {
             .min(ScreenLineRead::MAX_ROWS - 1);
         let mut budget = LineReadCaptureBudget::default();
         let mut count = None;
-        for (index, line) in self.lines.iter().take(maximum).enumerate() {
+        for index in 0..maximum {
+            let line = self.render_row(index).expect("validated resident range");
             // Vector tail lookup visits visible cells; clustered tail lookup
             // is constant-time. Conservatively charge columns for both before
             // inspecting either, sharing the eventual snapshot work budget.
@@ -4495,18 +4496,9 @@ impl Screen {
         let Some(count) = count else {
             return Ok(None);
         };
-        // Page-engine rows serve this read once B3.5 views reach it.
-        let (first, second) = self
-            .lines
-            .legacy_slices()
-            .ok_or_else(|| anyhow::anyhow!("cold seam reflow unavailable on page-engine rows"))?;
-        let resident = Line::try_clone_batch_for_snapshot(
-            &first[..count.min(first.len())],
-            &second[..count.saturating_sub(first.len())],
-            &mut budget.bytes_left,
-            &mut budget.work_left,
-        )
-        .ok_or_else(|| anyhow::anyhow!("cold seam resident snapshot limit"))?;
+        let resident = self
+            .capture_resident_rows(0..count, &mut budget)
+            .ok_or_else(|| anyhow::anyhow!("cold seam resident snapshot limit"))?;
         Ok(Some(ColdSeamReflow {
             witness: self.capture_coordinate_witness(),
             sink,
@@ -4554,7 +4546,7 @@ impl Screen {
             || prepared.resident.len() > resident_end.min(self.lines.len())
             || !self
                 .lines
-                .iter()
+                .range(0..prepared.resident.len())
                 .zip(&prepared.resident)
                 .all(|(now, before)| now.is_same_reflow_source(before))
         {
@@ -4705,7 +4697,7 @@ impl Screen {
             }
             true
         });
-        for (live, replacement) in self.lines.iter_mut().zip(rows) {
+        for (live, replacement) in self.lines.range_mut(0..rows.len()).zip(rows) {
             replacement.update_last_change_seqno(seqno);
             std::mem::swap(live, replacement);
         }
@@ -4717,6 +4709,26 @@ impl Screen {
         self.finish_selection_anchor_resize(anchors, seqno);
         Ok(true)
     }
+    #[cfg(feature = "use_serde")]
+    fn capture_resident_rows(
+        &self,
+        range: Range<usize>,
+        budget: &mut LineReadCaptureBudget,
+    ) -> Option<Vec<Line>> {
+        if let Some(rows) = self.lines.page() {
+            rows.charge_snapshot_views(
+                range.clone(),
+                &mut budget.bytes_left,
+                &mut budget.work_left,
+            )?;
+        }
+        Line::try_clone_rows_for_snapshot(
+            self.lines.range(range),
+            &mut budget.bytes_left,
+            &mut budget.work_left,
+        )
+    }
+
     /// Capture a bounded request without invoking any blocking sink method.
     #[cfg(feature = "use_serde")]
     pub fn capture_line_read(
@@ -4791,27 +4803,8 @@ impl Screen {
                 .ok_or_else(|| anyhow::anyhow!("resident read unavailable"))?;
             let stop = start + (end - resident_first) as usize;
             anyhow::ensure!(stop <= self.lines.len(), "resident read unavailable");
-            let viewed: Vec<Line>;
-            let (first, second) = match self.lines.legacy_slices() {
-                Some(slices) => slices,
-                None => {
-                    // Page-engine rows: their legacy views, read in order.
-                    viewed = self.lines.range(start..stop).cloned().collect();
-                    (&viewed[..], &[][..])
-                }
-            };
-            let (start, stop) = if self.lines.legacy().is_some() {
-                (start, stop)
-            } else {
-                (0, stop - start)
-            };
-            Line::try_clone_batch_for_snapshot(
-                &first[start.min(first.len())..stop.min(first.len())],
-                &second[start.saturating_sub(first.len())..stop.saturating_sub(first.len())],
-                &mut budget.bytes_left,
-                &mut budget.work_left,
-            )
-            .ok_or_else(|| anyhow::anyhow!("resident snapshot allocation/work limit"))?
+            self.capture_resident_rows(start..stop, budget)
+                .ok_or_else(|| anyhow::anyhow!("resident snapshot allocation/work limit"))?
         } else {
             Vec::new()
         };
@@ -12802,6 +12795,90 @@ pub(crate) mod tests {
             !screen.install_cold_seam_reflow(&mut plan, 4).unwrap(),
             "old authority cannot publish twice"
         );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn page_cold_seam_reflows_only_its_resident_prefix() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let attrs = CellAttributes::blank();
+        let mut cold = Line::from_text("abcd", &attrs, 1, None);
+        cold.set_last_cell_was_wrapped(true, 1);
+        assert!(sink.store_scrollback_line(0, &cold, 32));
+
+        let mut screen = test_screen_with_config(
+            2,
+            3,
+            96,
+            TestTermConfig {
+                grid_engine: Some(GridEngine::Page),
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 1;
+        screen.lines.truncate_for_resize(0);
+        let mut head = Line::from_text("efg", &attrs, 1, None);
+        head.set_last_cell_was_wrapped(true, 1);
+        screen.lines.push_for_resize(head);
+        screen
+            .lines
+            .push_for_resize(Line::from_text("h", &attrs, 1, None));
+        for _ in 0..16 {
+            screen.lines.push_for_resize(Line::new(1));
+        }
+
+        // Refuse the whole range before populating the first packed row's view.
+        let mut budget = LineReadCaptureBudget {
+            bytes_left: usize::MAX,
+            work_left: 3,
+        };
+        assert!(screen
+            .capture_line_read_with_budget(1..3, &mut budget)
+            .is_err());
+        assert_eq!(screen.cached_page_views(), 0);
+        let mut budget = LineReadCaptureBudget {
+            // Enough for the bare Cell array, not its decoded metadata.
+            bytes_left: 4 * size_of::<Cell>(),
+            work_left: usize::MAX,
+        };
+        assert!(screen
+            .capture_line_read_with_budget(1..3, &mut budget)
+            .is_err());
+        assert_eq!(screen.cached_page_views(), 0);
+        let mut stale = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        // An edited view is authoritative even when the packed row is older.
+        screen.lines[1] = Line::from_text("i", &attrs, 2, None);
+        assert!(!screen.install_cold_seam_reflow(&mut stale, 3).unwrap());
+        let mut current = screen
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.install_cold_seam_reflow(&mut current, 3).unwrap());
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        assert_eq!(screen.cached_page_views(), 2);
+        assert_eq!(screen.rows_held_by_views(), 2);
+        let read = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        assert_eq!(
+            read.lines()
+                .map(|line| line.as_str().into_owned())
+                .collect::<Vec<_>>(),
+            ["abc", "def", "gi"]
+        );
+        assert!(screen.capture_cold_seam_reflow().unwrap().is_none());
+        assert_eq!(sink.load_scrollback_line(0).unwrap(), cold);
     }
 
     #[cfg(feature = "use_serde")]
