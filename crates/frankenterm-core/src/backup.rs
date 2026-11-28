@@ -1149,22 +1149,22 @@ fn redact_backup_database(db_path: &Path) -> Result<BackupRedactionInfo> {
         })?;
 
     let redactor = crate::redactor::Redactor::new();
-    let mut redacted_cells = 0_u64;
     for table in backup_redaction_tables(&conn)? {
         for column in backup_redaction_columns(&conn, &table)? {
             if backup_redaction_payload_column(&table, &column) {
-                redacted_cells += redact_backup_text_column(&conn, &redactor, &table, &column)?;
+                redact_backup_text_column(&conn, &redactor, &table, &column)?;
             }
         }
     }
-    let rebuilt_fts = rebuild_backup_output_segments_fts(&conn)?;
-    if redacted_cells > 0 || rebuilt_fts {
-        conn.execute_batch("VACUUM").map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to vacuum redacted backup database: {e}"
-            )))
-        })?;
-    }
+    rebuild_backup_output_segments_fts(&conn)?;
+    // The online backup also copies free pages and unused bytes within live
+    // pages. Enabling secure_delete now cannot erase data deleted before the
+    // snapshot, even when every current row is clean and there is no FTS index.
+    conn.execute_batch("VACUUM").map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to vacuum redacted backup database: {e}"
+        )))
+    })?;
 
     Ok(BackupRedactionInfo {
         catalog_version: backup_redaction_catalog_version(),
@@ -1254,9 +1254,9 @@ fn backup_sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<boo
     })
 }
 
-fn rebuild_backup_output_segments_fts(conn: &Connection) -> Result<bool> {
+fn rebuild_backup_output_segments_fts(conn: &Connection) -> Result<()> {
     if !backup_sqlite_table_exists(conn, "output_segments_fts")? {
-        return Ok(false);
+        return Ok(());
     }
 
     conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')")
@@ -1265,7 +1265,7 @@ fn rebuild_backup_output_segments_fts(conn: &Connection) -> Result<bool> {
                 "Failed to rebuild redacted backup output_segments_fts index: {e}"
             )))
         })?;
-    Ok(true)
+    Ok(())
 }
 
 fn backup_redaction_text_affinity(declared_type: Option<&str>) -> bool {
@@ -1377,7 +1377,7 @@ fn redact_backup_text_column(
     redactor: &crate::redactor::Redactor,
     table_name: &str,
     column_name: &str,
-) -> Result<u64> {
+) -> Result<()> {
     let quoted_table = quote_identifier(table_name);
     let quoted_column = quote_identifier(column_name);
     let select_sql = format!(
@@ -1424,11 +1424,10 @@ fn redact_backup_text_column(
     drop(rows);
     drop(stmt);
 
-    let update_count = u64::try_from(updates.len()).unwrap_or(u64::MAX);
     for (rowid, redacted) in updates {
         update_backup_redacted_cell(conn, table_name, column_name, rowid, &redacted)?;
     }
-    Ok(update_count)
+    Ok(())
 }
 
 fn update_backup_redacted_cell(
@@ -2464,6 +2463,39 @@ mod tests {
         assert!(result.manifest.redaction_applied);
         assert_ne!(result.manifest.redaction_catalog_version, "");
         assert!(result.manifest.redaction_patterns_checked > 0);
+    }
+
+    #[test]
+    fn export_discards_deleted_bytes_even_when_no_live_row_requires_redaction() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("source.db");
+        let source = create_test_db(&db);
+        let marker = "ft-deleted-output-regression";
+        source.execute_batch("PRAGMA secure_delete=OFF").unwrap();
+        source
+            .execute(
+                "INSERT INTO output_segments (data) VALUES (?1)",
+                [marker.repeat(500)],
+            )
+            .unwrap();
+        source
+            .execute(
+                "DELETE FROM output_segments WHERE id = last_insert_rowid()",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let contains_marker = |path: &Path| {
+            fs::read(path)
+                .unwrap()
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        };
+        assert!(contains_marker(&db));
+        let archive = export_backup(&db, tmp.path(), &ExportOptions::default()).unwrap();
+        let archived_db = Path::new(&archive.output_path).join("database.db");
+        assert!(!contains_marker(&archived_db));
+        assert!(contains_marker(&db));
     }
 
     #[test]
