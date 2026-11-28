@@ -718,62 +718,87 @@ pub fn scheduled_backup_output_path(
     unique_backup_path(&base_dir, &format!("ft_backup_{ts}"))
 }
 
-/// List backup directories under the destination root.
+// A rotation destination can be a shared directory. Only a finalized archive
+// consisting entirely of our regular files belongs to the retention policy.
+fn rotation_manifest(path: &Path) -> Result<Option<BackupManifest>> {
+    if !fs::symlink_metadata(path)?.is_dir() {
+        return Ok(None);
+    }
+    let manifest_path = path.join("manifest.json");
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(meta) if meta.is_file() && meta.len() <= 1024 * 1024 => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut db = false;
+    let mut compressed = false;
+    let mut checksums = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Ok(None);
+        }
+        match entry.file_name().to_str() {
+            Some("manifest.json" | "database.sql") => {}
+            Some("checksums.sha256") => checksums = true,
+            Some("database.db") => db = true,
+            Some("database.db.zst") => compressed = true,
+            _ => return Ok(None),
+        }
+    }
+    if !checksums || db == compressed {
+        return Ok(None);
+    }
+    Ok(read_backup_manifest(&manifest_path).filter(|m| {
+        m.compressed == compressed && parse_manifest_timestamp(&m.created_at).is_some()
+    }))
+}
+
+/// List completed backup archives under the configured destination.
 pub fn list_backup_entries(base_dir: &Path) -> Result<Vec<BackupEntry>> {
     if !base_dir.exists() {
         return Ok(Vec::new());
     }
-
     let mut entries = Vec::new();
     for entry in fs::read_dir(base_dir)? {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
-
-        let manifest_path = path.join("manifest.json");
-        let (created_at, created_ts) = if manifest_path.exists() {
-            // br-ft-r3d4e: route through read_backup_manifest so
-            // read-fail and parse-fail bump BACKUP_MANIFEST_PARSE_DROP_COUNT
-            // and emit a phase-tagged structured warn instead of
-            // silently substituting None.
-            match read_backup_manifest(&manifest_path) {
-                Some(manifest) => {
-                    let ts = parse_manifest_timestamp(&manifest.created_at);
-                    (Some(manifest.created_at), ts)
-                }
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
-        let created_ts = created_ts.or_else(|| {
-            entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-        });
-
-        let created_at = created_at.or_else(|| {
-            created_ts
-                .filter(|ts| *ts >= 0)
-                .map(|ts| format_iso8601(ts as u64))
-        });
-
-        let total_size_bytes = dir_size(&path);
-        entries.push(BackupEntry {
-            path,
-            created_at,
-            created_ts,
-            total_size_bytes,
-        });
+        let path = entry.path();
+        if let Some(manifest) = rotation_manifest(&path)? {
+            entries.push(BackupEntry {
+                created_ts: parse_manifest_timestamp(&manifest.created_at),
+                created_at: Some(manifest.created_at),
+                total_size_bytes: dir_size(&path),
+                path,
+            });
+        }
     }
-
     Ok(entries)
+}
+
+// Recheck eligibility immediately before removal. Remove only archive files:
+// a file added after the inspection prevents rmdir and is left intact.
+fn remove_rotation_archive(path: &Path) -> Result<bool> {
+    let Some(manifest) = rotation_manifest(path)? else {
+        return Ok(false);
+    };
+    let database = if manifest.compressed {
+        "database.db.zst"
+    } else {
+        "database.db"
+    };
+    for name in [database, "database.sql", "checksums.sha256", "manifest.json"] {
+        match fs::remove_file(path.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::remove_dir(path)?;
+    Ok(true)
 }
 
 /// Summary of retention/rotation pruning.
@@ -798,45 +823,24 @@ pub fn prune_backups(
         });
     }
 
-    let mut removed = 0_usize;
-    if retention_days > 0 {
-        let cutoff = now - ChronoDuration::days(retention_days as i64);
-        entries.retain(|entry| {
-            let keep = entry
-                .created_ts
-                .map(|ts| ts >= cutoff.timestamp())
-                .unwrap_or(true);
-            if !keep {
-                if let Err(e) = fs::remove_dir_all(&entry.path) {
-                    tracing::warn!(
-                        path = %entry.path.display(),
-                        error = %e,
-                        "Failed to remove expired backup"
-                    );
-                } else {
-                    removed += 1;
-                }
-            }
-            keep
-        });
-    }
-
-    if max_backups > 0 && entries.len() > max_backups as usize {
-        entries.sort_by(compare_backup_entries);
-        let keep_count = max_backups as usize;
-        for entry in entries.drain(0..entries.len().saturating_sub(keep_count)) {
-            if let Err(e) = fs::remove_dir_all(&entry.path) {
-                tracing::warn!(
-                    path = %entry.path.display(),
-                    error = %e,
-                    "Failed to remove rotated backup"
-                );
-            } else {
-                removed += 1;
+    entries.sort_by(compare_backup_entries);
+    let cutoff = (retention_days > 0)
+        .then(|| (now - ChronoDuration::days(i64::from(retention_days))).timestamp());
+    let excess = if max_backups == 0 {
+        0
+    } else {
+        entries.len().saturating_sub(max_backups as usize)
+    };
+    let mut removed = 0;
+    for (index, entry) in entries.iter().enumerate() {
+        if index < excess || cutoff.zip(entry.created_ts).is_some_and(|(cut, ts)| ts < cut) {
+            match remove_rotation_archive(&entry.path) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(path = %entry.path.display(), %error, "Failed to prune backup"),
             }
         }
     }
-
     let kept = list_backup_entries(base_dir)?.len();
     Ok(PruneSummary { removed, kept })
 }
@@ -2966,8 +2970,17 @@ mod tests {
             };
             let data = serde_json::to_string(&manifest).unwrap();
             fs::write(dir.join("manifest.json"), data).unwrap();
+            fs::write(dir.join("database.db"), []).unwrap();
+            fs::write(dir.join("checksums.sha256"), []).unwrap();
         };
 
+        let unrelated = root.join("projects");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep.txt"), "keep").unwrap();
+        create_backup("incomplete", "2025-01-01T00:00:00Z");
+        fs::remove_file(root.join("incomplete/checksums.sha256")).unwrap();
+        create_backup("mixed", "2025-01-01T00:00:00Z");
+        fs::write(root.join("mixed/keep.txt"), "keep").unwrap();
         create_backup("b1", "2026-01-01T00:00:00Z");
         create_backup("b2", "2026-01-10T00:00:00Z");
         create_backup("b3", "2026-01-20T00:00:00Z");
@@ -2978,6 +2991,10 @@ mod tests {
             .unwrap();
         let summary = prune_backups(root, 0, 2, now).unwrap();
         assert_eq!(summary.kept, 2);
+        assert_eq!(summary.removed, 1);
+        assert!(root.join("projects/keep.txt").is_file());
+        assert!(root.join("incomplete/database.db").is_file());
+        assert!(root.join("mixed/keep.txt").is_file());
 
         let entries = list_backup_entries(root).unwrap();
         let names: Vec<String> = entries
@@ -2986,6 +3003,11 @@ mod tests {
             .collect();
         assert!(names.contains(&"b2".to_string()));
         assert!(names.contains(&"b3".to_string()));
+        let expired = prune_backups(root, 1, 0, now).unwrap();
+        assert_eq!(expired.removed, 2);
+        assert!(root.join("projects/keep.txt").is_file());
+        assert!(root.join("incomplete/database.db").is_file());
+        assert!(root.join("mixed/database.db").is_file());
     }
 
     #[test]
