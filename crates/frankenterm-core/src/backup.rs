@@ -1080,25 +1080,9 @@ pub fn import_backup(
         None
     };
 
-    // Step 5: Replace current database with backup copy
-    // Use rusqlite backup API to restore (consistent, handles WAL mode)
-    if target_db_path.exists() {
-        // Remove WAL and journal files if they exist
-        let wal_path = sqlite_sidecar_path(target_db_path, "-wal");
-        let shm_path = sqlite_sidecar_path(target_db_path, "-shm");
-        let journal_path = sqlite_sidecar_path(target_db_path, "-journal");
-        for p in [&wal_path, &shm_path, &journal_path] {
-            if p.exists() {
-                fs::remove_file(p).map_err(|e| {
-                    Error::Storage(crate::StorageError::Database(format!(
-                        "Failed to remove stale SQLite sidecar {} before restore: {e}",
-                        p.display()
-                    )))
-                })?;
-            }
-        }
-    }
-
+    // SQLite must own the destination transaction, including hot-journal
+    // recovery and WAL checkpointing. Other connections can still be reading
+    // the old WAL snapshot or committing to it while a restore is attempted.
     backup_database(&backup_db, target_db_path)?;
 
     Ok(ImportResult {
@@ -1111,12 +1095,6 @@ pub fn import_backup(
 
 // --- Internal helpers ---
 
-fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
-    let mut sidecar = db_path.as_os_str().to_os_string();
-    sidecar.push(suffix);
-    PathBuf::from(sidecar)
-}
-
 fn set_backup_busy_timeout(conn: &Connection, context: &str) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| {
@@ -1128,11 +1106,12 @@ fn set_backup_busy_timeout(conn: &Connection, context: &str) -> Result<()> {
 
 /// Use rusqlite's online backup API for a consistent snapshot.
 fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
-    let src = Connection::open(src_path).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Failed to open source database: {e}"
-        )))
-    })?;
+    let src = Connection::open_with_flags(src_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to open source database: {e}"
+            )))
+        })?;
     // Source is the LIVE production DB. Without busy_timeout, a concurrent
     // writer makes the online-backup read locks fail immediately with
     // SQLITE_BUSY and the backup aborts. Match the standard 5s recipe.
@@ -1144,18 +1123,24 @@ fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
         )))
     })?;
 
+    set_backup_busy_timeout(&dest, "destination database backup")?;
     let backup = rusqlite::backup::Backup::new(&src, &mut dest).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
             "Failed to initialize backup: {e}"
         )))
     })?;
 
-    // Copy all pages in one step (no progress callback needed for now)
-    backup.step(-1).map_err(|e| {
+    // BUSY and LOCKED are successful Rust return values from step(), but
+    // neither commits the destination. Only SQLITE_DONE completes a copy.
+    let outcome = backup.step(-1).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!("Backup failed: {e}")))
     })?;
-
-    Ok(())
+    match outcome {
+        rusqlite::backup::StepResult::Done => Ok(()),
+        other => Err(Error::Storage(crate::StorageError::Database(format!(
+            "SQLite backup did not complete ({other:?}); retry after concurrent writers finish"
+        )))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3066,47 +3051,51 @@ mod tests {
     }
 
     #[test]
-    fn import_removes_sidecars_for_non_db_target_names() {
+    fn import_preserves_wal_transactions_and_requires_a_completed_copy() {
         let tmp = TempDir::new().unwrap();
-        let source_db = tmp.path().join("source.db");
-        let _conn = create_test_db(&source_db);
-        drop(_conn);
+        let source = tmp.path().join("source.db");
+        drop(create_test_db(&source));
+        let archive = tmp.path().join("backup");
+        export_backup(
+            &source,
+            tmp.path(),
+            &ExportOptions {
+                output: Some(archive.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        let backup_dir = tmp.path().join("backup");
-        let export_opts = ExportOptions {
-            output: Some(backup_dir.clone()),
-            verify: true,
+        let target = tmp.path().join("existing.sqlite3");
+        let writer = create_test_db(&target);
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 INSERT INTO panes(name) VALUES ('existing');
+                 BEGIN IMMEDIATE;
+                 INSERT INTO panes(name) VALUES ('pending');",
+            )
+            .unwrap();
+        let opts = ImportOptions {
+            no_safety_backup: true,
             ..Default::default()
         };
-        let _export = export_backup(&source_db, tmp.path(), &export_opts).unwrap();
-
-        let target_db = tmp.path().join("existing.sqlite3");
-        let _existing = create_test_db(&target_db);
-        drop(_existing);
-
-        let wal_path = sqlite_sidecar_path(&target_db, "-wal");
-        let shm_path = sqlite_sidecar_path(&target_db, "-shm");
-        let journal_path = sqlite_sidecar_path(&target_db, "-journal");
-        fs::write(&wal_path, b"wal").unwrap();
-        fs::write(&shm_path, b"shm").unwrap();
-        fs::write(&journal_path, b"journal").unwrap();
-
-        let import_opts = ImportOptions {
-            dry_run: false,
-            yes: true,
-            no_safety_backup: true,
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT count(*) FROM panes", [], |row| row.get(0))
+                .unwrap()
         };
-        import_backup(&backup_dir, &target_db, tmp.path(), &import_opts).unwrap();
+        assert!(import_backup(&archive, &target, tmp.path(), &opts).is_err());
+        writer.execute_batch("COMMIT").unwrap();
 
-        assert!(!wal_path.exists());
-        assert!(!shm_path.exists());
-        assert!(!journal_path.exists());
-
-        let conn = Connection::open(&target_db).unwrap();
-        let pane_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(pane_count, 2);
+        let reader = Connection::open(&target).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(count(&reader), 4);
+        import_backup(&archive, &target, tmp.path(), &opts).unwrap();
+        assert_eq!(count(&reader), 4, "existing WAL reader keeps its snapshot");
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(count(&reader), 2, "new snapshot sees the restored database");
+        assert_eq!(count(&writer), 2);
     }
 
     #[test]
